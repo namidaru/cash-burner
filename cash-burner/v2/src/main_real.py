@@ -6,7 +6,7 @@ import time
 import threading
 from typing import List
 
-from scanner_company_rank import build_watchlist, get_last_build_meta
+from scanner_company_rank import build_watchlist, get_last_build_meta, check_watchlist_integrity, get_last_source_map
 from quote_basic import ensure_prev_close
 from ws_sub_manager import write_watchlist
 from ws_capture_live import WSCapture
@@ -47,9 +47,29 @@ def scanner_loop():
         try:
             watch = build_watchlist()
             _log(f"rank watchlist n={len(watch)} head={watch[:10]}")
+            integ = check_watchlist_integrity(watch)
+            _log(
+                "rank integrity "
+                f"total={integ['total']} unique={integ['unique']} "
+                f"bad_format={integ['bad_format']} dup={integ['dup']} "
+                f"low_price={integ['low_price']} quote_miss={integ['quote_miss']}"
+            )
             detail = get_last_build_meta()
             if detail:
                 _log(f"rank detail {detail}")
+
+            src_map = get_last_source_map()
+            if src_map:
+                c_rank_pref = sum(1 for s in watch if src_map.get(s) == "rank_pref")
+                c_rank_backup = sum(1 for s in watch if src_map.get(s) == "rank_backup")
+                c_strength = sum(1 for s in watch if src_map.get(s) == "strength")
+                c_condition = sum(1 for s in watch if src_map.get(s) == "condition")
+                c_fallback = sum(1 for s in watch if src_map.get(s) == "fallback")
+                _log(
+                    "rank source "
+                    f"rank_pref={c_rank_pref} rank_backup={c_rank_backup} "
+                    f"strength={c_strength} condition={c_condition} fallback={c_fallback}"
+                )
 
             if watch:
                 # prev_close cache needed for +12% block and limitup-gap take

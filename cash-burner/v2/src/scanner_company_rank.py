@@ -14,6 +14,7 @@ STRENGTH_PATH = "/uapi/domestic-stock/v1/ranking/volume-power"
 DEFAULT_TR_IDS = "FHPST01860000,VHPST01860000"
 DEFAULT_STRENGTH_TR_IDS = "FHPST01710000,VHPST01710000"
 _LAST_BUILD_META: str = ""
+_LAST_SOURCE_MAP: Dict[str, str] = {}
 
 
 def _today_yyyymmdd() -> str:
@@ -326,13 +327,74 @@ def get_last_build_meta() -> str:
     return _LAST_BUILD_META
 
 
+def get_last_source_map() -> Dict[str, str]:
+    return dict(_LAST_SOURCE_MAP)
+
+
+def check_watchlist_integrity(symbols: List[str]) -> Dict[str, int]:
+    """watchlist 기본 무결성 점검.
+
+    - 형식(6자리 숫자), 중복, 저가 필터 위반
+    - 가능하면 멀티시세로 현재가 확인하여 저가/미응답 개수도 집계
+    """
+    min_price = float(os.getenv("WATCH_MIN_PRICE", "10000"))
+
+    total = len(symbols)
+    bad_format = 0
+    dup_count = 0
+    seen = set()
+    valid_syms: List[str] = []
+
+    for s in symbols:
+        ss = str(s).strip()
+        if not (len(ss) == 6 and ss.isdigit()):
+            bad_format += 1
+            continue
+        if ss in seen:
+            dup_count += 1
+            continue
+        seen.add(ss)
+        valid_syms.append(ss)
+
+    quote_miss = 0
+    low_price = 0
+    if valid_syms:
+        try:
+            items = multi_quote(valid_syms)
+            by_sym: Dict[str, Dict[str, Any]] = {}
+            for it in items:
+                sym = _parse_sym(it)
+                if sym and sym not in by_sym:
+                    by_sym[sym] = it
+
+            for sym in valid_syms:
+                it = by_sym.get(sym)
+                if not it:
+                    quote_miss += 1
+                    continue
+                px = _parse_price(it)
+                if min_price > 0 and px > 0 and px <= min_price:
+                    low_price += 1
+        except Exception:
+            quote_miss = len(valid_syms)
+
+    return {
+        "total": total,
+        "unique": len(valid_syms),
+        "bad_format": bad_format,
+        "dup": dup_count,
+        "low_price": low_price,
+        "quote_miss": quote_miss,
+    }
+
+
 def build_watchlist() -> List[str]:
     """API 결과로 최대 N개 채움.
     1) 필터 통과 종목 우선
     2) 부족하면 같은 API 결과에서 필터 탈락분으로 보충
     3) 그래도 비면 FALLBACK_SYMBOLS 사용
     """
-    global _LAST_BUILD_META
+    global _LAST_BUILD_META, _LAST_SOURCE_MAP
 
     want_n = int(os.getenv("WATCH_TOP_N", "30"))
     min_tv = float(os.getenv("WATCH_MIN_TR_VALUE", "300000000"))
@@ -372,29 +434,40 @@ def build_watchlist() -> List[str]:
 
     out: List[str] = []
     seen = set()
+    src_map: Dict[str, str] = {}
 
-    for src in (sorted(preferred, reverse=True), sorted(backup, reverse=True)):
+    for src_name, src in (("rank_pref", sorted(preferred, reverse=True)), ("rank_backup", sorted(backup, reverse=True))):
         for _, sym in src:
             if sym in seen:
                 continue
             seen.add(sym)
             out.append(sym)
+            src_map[sym] = src_name
             if len(out) >= want_n:
                 meta.append(f"rank_drop_low_price={drop_low_price}")
                 _LAST_BUILD_META = " | ".join(meta[-24:])
+                _LAST_SOURCE_MAP = src_map
                 return out
 
     if len(out) < want_n:
-        out.extend(_supplement_from_strength(want_n - len(out), seen, min_price, min_tv, block_rise, meta))
+        added = _supplement_from_strength(want_n - len(out), seen, min_price, min_tv, block_rise, meta)
+        out.extend(added)
+        for sym in added:
+            src_map[sym] = "strength"
 
     if len(out) < want_n:
-        out.extend(_supplement_from_conditions(want_n - len(out), seen, min_price, min_tv, block_rise, meta))
+        added = _supplement_from_conditions(want_n - len(out), seen, min_price, min_tv, block_rise, meta)
+        out.extend(added)
+        for sym in added:
+            src_map[sym] = "condition"
 
     if out:
         meta.append(f"rank_drop_low_price={drop_low_price}")
         _LAST_BUILD_META = " | ".join(meta[-24:])
+        _LAST_SOURCE_MAP = src_map
         return out
 
     fb = _fallback_symbols()
     _LAST_BUILD_META = " | ".join(meta[-24:])
+    _LAST_SOURCE_MAP = {sym: "fallback" for sym in fb[:want_n]}
     return fb[:want_n]
