@@ -10,7 +10,10 @@ APP_SECRET = os.getenv("KOREA_INVEST_APP_SECRET", "")
 ACC_NO = os.getenv("KOREA_INVEST_ACC_NO", "")  # 10자리(8+2) 또는 8-02
 USER_ID = os.getenv("KOREA_INVEST_USER_ID", "")  # 조건검색용(HTS ID)
 
-TOKEN_CACHE = os.getenv("KIS_TOKEN_CACHE", r"data\token.json")
+TOKEN_CACHE = os.getenv("KIS_TOKEN_CACHE", os.path.join("data", "token.json"))
+HTTP_TIMEOUT = float(os.getenv("KIS_HTTP_TIMEOUT", "10"))
+HTTP_RETRY = int(os.getenv("KIS_HTTP_RETRY", "2"))
+HTTP_RETRY_SLEEP = float(os.getenv("KIS_HTTP_RETRY_SLEEP", "0.5"))
 
 def _ensure_dir(path: str):
     d = os.path.dirname(path)
@@ -49,7 +52,7 @@ def get_access_token() -> str:
     url = f"{BASE_URL}/oauth2/tokenP"
     headers = {"content-type": "application/json; charset=utf-8"}
     body = {"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET}
-    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=10)
+    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     j = r.json()
     tok = j["access_token"]
@@ -65,27 +68,37 @@ def hashkey(body: Dict[str, Any]) -> str:
         "appKey": APP_KEY,
         "appSecret": APP_SECRET,
     }
-    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=10)
+    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return r.json().get("HASH", "")
 
 def request(method: str, path: str, tr_id: str, params: Dict[str, Any] = None, body: Dict[str, Any] = None) -> Dict[str, Any]:
-    tok = get_access_token()
-    url = f"{BASE_URL}{path}"
-    headers = {
-        "content-type": "application/json; charset=utf-8",
-        "authorization": f"Bearer {tok}",
-        "appKey": APP_KEY,
-        "appSecret": APP_SECRET,
-        "tr_id": tr_id,
-        "custtype": "P",
-    }
-    if body is not None:
-        headers["hashkey"] = hashkey(body)
+    last_err: Exception | None = None
+    for attempt in range(HTTP_RETRY + 1):
+        try:
+            tok = get_access_token()
+            url = f"{BASE_URL}{path}"
+            headers = {
+                "content-type": "application/json; charset=utf-8",
+                "authorization": f"Bearer {tok}",
+                "appKey": APP_KEY,
+                "appSecret": APP_SECRET,
+                "tr_id": tr_id,
+                "custtype": "P",
+            }
+            if body is not None:
+                headers["hashkey"] = hashkey(body)
 
-    if method.upper() == "GET":
-        r = requests.get(url, headers=headers, params=params, timeout=10)
-    else:
-        r = requests.post(url, headers=headers, data=json.dumps(body), timeout=10)
-    r.raise_for_status()
-    return r.json()
+            if method.upper() == "GET":
+                r = requests.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
+            else:
+                r = requests.post(url, headers=headers, data=json.dumps(body), timeout=HTTP_TIMEOUT)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            if attempt >= HTTP_RETRY:
+                raise
+            time.sleep(HTTP_RETRY_SLEEP * (attempt + 1))
+
+    raise RuntimeError(f"request failed without exception: {last_err}")
