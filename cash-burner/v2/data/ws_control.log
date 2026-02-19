@@ -1,0 +1,28 @@
+2026-02-19 11:15:03	OPEN ws://ops.koreainvestment.com:21000
+2026-02-19 11:15:13	{"header":{"tr_id":"PINGPONG","datetime":"20260219111513"}}
+2026-02-19 11:15:23	{"header":{"tr_id":"PINGPONG","datetime":"20260219111523"}}
+2026-02-19 11:15:34	{"header":{"tr_id":"PINGPONG","datetime":"20260219111534"}}
+2026-02-19 11:15:44	{"header":{"tr_id":"PINGPONG","datetime":"20260219111544"}}
+2026-02-19 11:15:54	{"header":{"tr_id":"PINGPONG","datetime":"20260219111554"}}
+2026-02-19 11:16:13	{"header":{"tr_id":"PINGPONG","datetime":"20260219111613"}}
+2026-02-19 11:16:23	{"header":{"tr_id":"PINGPONG","datetime":"20260219111623"}}
+2026-02-19 11:16:43	{"header":{"tr_id":"PINGPONG","datetime":"20260219111643"}}
+2026-02-19 11:16:54	{"header":{"tr_id":"PINGPONG","datetime":"20260219111654"}}
+2026-02-19 11:17:13	{"header":{"tr_id":"PINGPONG","datetime":"20260219111713"}}
+2026-02-19 11:22:30	OPEN ws://ops.koreainvestment.com:21000
+2026-02-19 11:27:13	OPEN ws://ops.koreainvestment.com:21000
+2026-02-19 11:27:23	{"header":{"tr_id":"PINGPONG","datetime":"20260219112723"}}
+2026-02-19 11:27:33	{"header":{"tr_id":"PINGPONG","datetime":"20260219112733"}}
+2026-02-19 11:27:44	{"header":{"tr_id":"PINGPONG","datetime":"20260219112744"}}
+2026-02-19 11:27:54	{"header":{"tr_id":"PINGPONG","datetime":"20260219112754"}}
+2026-02-19 11:28:05	{"header":{"tr_id":"PINGPONG","datetime":"20260219112805"}}
+2026-02-19 11:28:24	{"header":{"tr_id":"PINGPONG","datetime":"20260219112824"}}
+2026-02-19 11:38:30	OPEN ws://ops.koreainvestment.com:21000
+2026-02-19 11:38:41	{"header":{"tr_id":"PINGPONG","datetime":"20260219113841"}}
+2026-02-19 12:27:05	OPEN ws://ops.koreainvestment.com:21000
+2026-02-19 12:27:16	{"header":{"tr_id":"PINGPONG","datetime":"20260219122716"}}
+2026-02-19 12:27:26	{"header":{"tr_id":"PINGPONG","datetime":"20260219122726"}}
+2026-02-19 12:27:37	{"header":{"tr_id":"PINGPONG","datetime":"20260219122737"}}
+2026-02-19 12:27:47	{"header":{"tr_id":"PINGPONG","datetime":"20260219122747"}}
+2026-02-19 12:27:58	{"header":{"tr_id":"PINGPONG","datetime":"20260219122758"}}
+2026-02-19 12:28:15	{"header":{"tr_id":"PINGPONG","datetime":"20260219122815"}}

@@ -1,0 +1,42 @@
+2026-02-19 11:22:30	START scanner_loop AUTO_MODE=True COND_SEQS=[]
+2026-02-19 11:22:30	038 list_conditions -> 0 items
+2026-02-19 11:22:30	WARN no conditions from 038 (maybe USER_ID missing?)
+2026-02-19 11:22:30	SKIP scan: no seqs available; keep previous watchlist
+2026-02-19 11:27:12	START scanner_loop AUTO_MODE=True COND_SEQS=[]
+2026-02-19 11:27:12	038 list_conditions -> 0 items
+2026-02-19 11:27:12	WARN no conditions from 038 (maybe USER_ID missing?)
+2026-02-19 11:27:12	SKIP scan: no seqs available; keep previous watchlist
+2026-02-19 11:27:28	038 list_conditions -> 0 items
+2026-02-19 11:27:28	WARN no conditions from 038 (maybe USER_ID missing?)
+2026-02-19 11:27:28	SKIP scan: no seqs available; keep previous watchlist
+2026-02-19 11:27:44	038 list_conditions -> 0 items
+2026-02-19 11:27:44	WARN no conditions from 038 (maybe USER_ID missing?)
+2026-02-19 11:27:44	SKIP scan: no seqs available; keep previous watchlist
+2026-02-19 11:27:59	038 list_conditions -> 0 items
+2026-02-19 11:27:59	WARN no conditions from 038 (maybe USER_ID missing?)
+2026-02-19 11:27:59	SKIP scan: no seqs available; keep previous watchlist
+2026-02-19 11:28:15	038 list_conditions -> 0 items
+2026-02-19 11:28:15	WARN no conditions from 038 (maybe USER_ID missing?)
+2026-02-19 11:28:15	SKIP scan: no seqs available; keep previous watchlist
+2026-02-19 11:38:29	START scanner_loop AUTO_MODE=True COND_SEQS=[]
+2026-02-19 11:38:30	038 list_conditions -> 0 items
+2026-02-19 11:38:30	WARN no conditions from 038 (maybe USER_ID missing?)
+2026-02-19 11:38:30	SKIP scan: no seqs available; keep previous watchlist
+2026-02-19 11:38:45	038 list_conditions -> 0 items
+2026-02-19 11:38:45	WARN no conditions from 038 (maybe USER_ID missing?)
+2026-02-19 11:38:45	SKIP scan: no seqs available; keep previous watchlist
+2026-02-19 12:27:04	START scanner_company_rank mode
+2026-02-19 12:27:05	rank watchlist n=0 head=[]
+2026-02-19 12:27:05	WARN empty watchlist (rank api returned none) - keep previous
+2026-02-19 12:27:16	rank watchlist n=0 head=[]
+2026-02-19 12:27:16	WARN empty watchlist (rank api returned none) - keep previous
+2026-02-19 12:27:26	rank watchlist n=0 head=[]
+2026-02-19 12:27:26	WARN empty watchlist (rank api returned none) - keep previous
+2026-02-19 12:27:37	rank watchlist n=0 head=[]
+2026-02-19 12:27:37	WARN empty watchlist (rank api returned none) - keep previous
+2026-02-19 12:27:47	rank watchlist n=0 head=[]
+2026-02-19 12:27:47	WARN empty watchlist (rank api returned none) - keep previous
+2026-02-19 12:27:58	rank watchlist n=0 head=[]
+2026-02-19 12:27:58	WARN empty watchlist (rank api returned none) - keep previous
+2026-02-19 12:28:08	rank watchlist n=0 head=[]
+2026-02-19 12:28:08	WARN empty watchlist (rank api returned none) - keep previous

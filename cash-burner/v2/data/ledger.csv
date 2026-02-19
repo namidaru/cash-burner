@@ -1,0 +1,3 @@
+ts,symbol,side,qty,price,fee,tax,slippage,reason
+1771459557.000,005930,BUY,1,190000.0000,0.0000,0.0000,100.0000,"ENTRY surge 0.11%/10s trv=74745000 ticks=2 sumvol=394 imb=0.50 spr=0.053% eq=1000000 target=300000 buys_today=1/50"
+1771460457.000,005930,SELL,1,189200.0000,0.0000,0.0000,100.0000,"EXIT timeout held=900.0s"
