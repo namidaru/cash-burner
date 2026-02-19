@@ -12,10 +12,10 @@ from ws_sub_manager import write_watchlist
 from ws_capture_live import WSCapture
 from runner_live import run_live
 
-IN_FILE = os.getenv("IN_FILE", r"data\ws_dump.log")
+IN_FILE = os.getenv("IN_FILE", os.path.join("data", "ws_dump.log"))
 LIVE_POLL_SEC = float(os.getenv("LIVE_POLL_SEC", "0.2"))
 SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "10"))
-WATCHLIST_DEBUG = os.getenv("WATCHLIST_DEBUG", r"data\watchlist_debug.log")
+WATCHLIST_DEBUG = os.getenv("WATCHLIST_DEBUG", os.path.join("data", "watchlist_debug.log"))
 
 def _log(msg: str):
     try:

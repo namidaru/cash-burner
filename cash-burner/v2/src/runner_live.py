@@ -32,11 +32,17 @@ def run_live(in_file: str, poll: float = 0.2):
                             clen=int(row.get("_cols_len","0"))
                             if vlen!=clen:
                                 continue
-                            if tr_id=="H0STASP0":
-                                eng.on_orderbook(row, ts_epoch)
-                            else:
-                                eng.on_trade(row, ts_epoch)
+                            try:
+                                if tr_id=="H0STASP0":
+                                    eng.on_orderbook(row, ts_epoch)
+                                else:
+                                    eng.on_trade(row, ts_epoch)
+                            except Exception as e:
+                                print(time.strftime("%Y-%m-%d %H:%M:%S"), f"[LIVE][WARN] {tr_id} {type(e).__name__}: {e}")
                     else:
                         time.sleep(poll)
         except FileNotFoundError:
+            time.sleep(1)
+        except Exception as e:
+            print(time.strftime("%Y-%m-%d %H:%M:%S"), f"[LIVE][ERR] {type(e).__name__}: {e}")
             time.sleep(1)
