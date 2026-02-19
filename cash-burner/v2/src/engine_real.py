@@ -1,7 +1,7 @@
 # src/engine_real.py
 from __future__ import annotations
 
-import os, time, math, json
+import os, time, math
 from dataclasses import dataclass
 from collections import defaultdict, deque
 from typing import Dict, Deque, Tuple
@@ -12,9 +12,6 @@ from quote_basic import load_cache
 def _f(x, d=0.0) -> float:
     try: return float(x)
     except: return d
-
-def _ts() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
 
 @dataclass
 class Position:
@@ -42,8 +39,8 @@ class EngineReal:
         self.entry_block_dayrise_pct = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT","12.0"))
         self.limitup_gap_take_pct = float(os.getenv("LIMITUP_GAP_TAKE_PCT","0.85"))  # 85% of 30% gap
 
-        self.kill_switch_file = os.getenv("KILL_SWITCH_FILE", r"data\kill.switch")
-        self.ledger_file = os.getenv("LEDGER_FILE", r"data\ledger_real.csv")
+        self.kill_switch_file = os.getenv("KILL_SWITCH_FILE", os.path.join("data", "kill.switch"))
+        self.ledger_file = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
 
         self.prev_close_cache = load_cache()  # {sym: prev_close}
 
@@ -58,7 +55,7 @@ class EngineReal:
         if d: os.makedirs(d, exist_ok=True)
         if not os.path.exists(self.ledger_file):
             with open(self.ledger_file,"w",encoding="utf-8") as f:
-                f.write("ts,action,symbol,qty,price,reason,rt_cd,msg")
+                f.write("ts,action,symbol,qty,price,reason,rt_cd,msg\n")
 
     def _kill_active(self) -> bool:
         try: return os.path.exists(self.kill_switch_file)
@@ -68,6 +65,15 @@ class EngineReal:
         safe = (msg or "").replace('"','')[:200]
         with open(self.ledger_file,"a",encoding="utf-8") as f:
             f.write(f"{ts_epoch:.3f},{action},{sym},{qty},{price:.4f},\"{reason}\",{rt_cd},\"{safe}\"\n")
+
+    def _safe_order(self, side: str, sym: str, qty: int, ts_epoch: float, price: float, reason: str):
+        try:
+            j = order_cash(side, sym, qty, ord_dvsn="01", ord_unpr="0")
+            self._log(ts_epoch, side, sym, qty, price, reason, j.get("rt_cd", ""), j.get("msg1", ""))
+            return j
+        except Exception as e:
+            self._log(ts_epoch, side, sym, qty, price, reason, "EX", f"order_err:{type(e).__name__}:{e}")
+            return {"rt_cd": "EX", "msg1": str(e)}
 
     def on_orderbook(self, row: Dict[str,str], ts_epoch: float):
         sym = row.get("MKSC_SHRN_ISCD","")
@@ -107,8 +113,8 @@ class EngineReal:
             qty_sell = sellable_qty(sym)
             if qty_sell <= 0:
                 return
-            j = order_cash("SELL", sym, min(qty_sell, p.qty), ord_dvsn="01", ord_unpr="0")
-            self._log(ts_epoch, "SELL", sym, min(qty_sell,p.qty), price, f"limitup_gap_take {self.limitup_gap_take_pct}", j.get("rt_cd",""), j.get("msg1",""))
+            qty_ord = min(qty_sell, p.qty)
+            j = self._safe_order("SELL", sym, qty_ord, ts_epoch, price, f"limitup_gap_take {self.limitup_gap_take_pct}")
             if j.get("rt_cd")=="0":
                 self.pos.pop(sym, None)
             return
@@ -118,8 +124,8 @@ class EngineReal:
             qty_sell = sellable_qty(sym)
             if qty_sell <= 0:
                 return
-            j = order_cash("SELL", sym, min(qty_sell, p.qty), ord_dvsn="01", ord_unpr="0")
-            self._log(ts_epoch, "SELL", sym, min(qty_sell,p.qty), price, f"hard_stop {self.hard_stop_pct}", j.get("rt_cd",""), j.get("msg1",""))
+            qty_ord = min(qty_sell, p.qty)
+            j = self._safe_order("SELL", sym, qty_ord, ts_epoch, price, f"hard_stop {self.hard_stop_pct}")
             if j.get("rt_cd")=="0":
                 self.pos.pop(sym, None)
             return
@@ -131,8 +137,8 @@ class EngineReal:
                 qty_sell = sellable_qty(sym)
                 if qty_sell <= 0:
                     return
-                j = order_cash("SELL", sym, min(qty_sell, p.qty), ord_dvsn="01", ord_unpr="0")
-                self._log(ts_epoch, "SELL", sym, min(qty_sell,p.qty), price, f"trail_stop drop={self.trail_drop_pct}", j.get("rt_cd",""), j.get("msg1",""))
+                qty_ord = min(qty_sell, p.qty)
+                j = self._safe_order("SELL", sym, qty_ord, ts_epoch, price, f"trail_stop drop={self.trail_drop_pct}")
                 if j.get("rt_cd")=="0":
                     self.pos.pop(sym, None)
                 return
@@ -198,13 +204,16 @@ class EngineReal:
         if imb < self.min_imb or spread > self.max_spread_pct:
             return
 
-        cash = buyable_cash(sym, ord_dvsn="01", price="0")
+        try:
+            cash = buyable_cash(sym, ord_dvsn="01", price="0")
+        except Exception as e:
+            self._log(ts_epoch, "BUY", sym, 0, price, "buyable_cash_error", "EX", f"{type(e).__name__}:{e}")
+            return
         target = cash * self.position_pct
         qty = int(math.floor(target / price))
         if qty <= 0:
             return
 
-        j = order_cash("BUY", sym, qty, ord_dvsn="01", ord_unpr="0")
-        self._log(ts_epoch, "BUY", sym, qty, price, f"signal ret={ret:.2f} imb={imb:.2f} spr={spread:.2f} dayrise={dayrise:.2f}", j.get("rt_cd",""), j.get("msg1",""))
+        j = self._safe_order("BUY", sym, qty, ts_epoch, price, f"signal ret={ret:.2f} imb={imb:.2f} spr={spread:.2f} dayrise={dayrise:.2f}")
         if j.get("rt_cd")=="0":
             self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, trail_armed=False)
