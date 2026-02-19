@@ -1,10 +1,10 @@
 # src/ws_sub_manager.py
 from __future__ import annotations
 
-import os, time
+import os
 from typing import List
 
-WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", r"data\watchlist.txt")
+WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
 
 def _ensure_dir(path: str):
     d=os.path.dirname(path)

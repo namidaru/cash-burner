@@ -1,4 +1,6 @@
 @echo off
+cd /d %~dp0
+set PYTHONPATH=%CD%\src;%PYTHONPATH%
 REM === AUTO (RANKING API v1_국내주식-104) + WS TRACK + REAL ORDER ===
 REM required env:
 REM   KOREA_INVEST_APP_KEY
@@ -17,6 +19,8 @@ set FID_COND_SCR_DIV_CODE=20186
 set FID_RANK_SORT_CLS_CODE=1
 set FID_INPUT_ISCD=0000
 
+REM emergency fallback symbols when ranking API returns empty
+set FALLBACK_SYMBOLS=005930,000660,035420,207940,051910
 REM watchlist filters
 set ENTRY_BLOCK_DAYRISE_PCT=12.0
 set WATCH_MIN_TR_VALUE=300000000
