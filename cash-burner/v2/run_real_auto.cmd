@@ -8,7 +8,7 @@ REM   KOREA_INVEST_APP_SECRET
 REM   KOREA_INVEST_ACC_NO   (10 digits or 8-02)
 
 REM use ranking markets: J (KRX), NX (NXT). You can do: set RANK_MARKETS=J,NX
-set RANK_MARKETS=J
+set RANK_MARKETS=J,NX
 
 REM how often to refresh ranking/watchlist (seconds)
 set SCAN_INTERVAL_SEC=15
