@@ -272,9 +272,7 @@ class EngineReal:
 
         p = self._params(ts_epoch)
         min_ret_pct = float(p.get("min_ret_pct", self.min_ret_pct))
-        min_tr_value = float(p.get("min_tr_value", self.min_tr_value))
         min_tick_count = int(p.get("min_tick_count", self.min_tick_count))
-        min_imb = float(p.get("min_imb", self.min_imb))
         max_spread_pct = float(p.get("max_spread_pct", self.max_spread_pct))
         confirm_sec = float(p.get("confirm_sec", self.confirm_sec))
         cooldown_sec = float(p.get("cooldown_sec", self.cooldown_sec))
@@ -326,27 +324,19 @@ class EngineReal:
         vi_std = _f(row.get("VI_STND_PRC"))
         vi_gap = abs(price - vi_std) / vi_std * 100.0 if vi_std > 0 else 999.0
 
-        fail = []
+        # 1) Trigger gate: fast/entry signal only (ret + tick_count + spread)
+        trigger_fail = []
         if ret < min_ret_pct:
-            fail.append(f"ret {ret:.2f}/{min_ret_pct:.2f}")
-        if trv < min_tr_value:
-            fail.append(f"trv {trv:.0f}/{min_tr_value:.0f}")
+            trigger_fail.append(f"ret {ret:.2f}/{min_ret_pct:.2f}")
         if tick_count < min_tick_count:
-            fail.append(f"ticks {tick_count}/{min_tick_count}")
-        if ob_stale:
-            fail.append(f"orderbook stale>{self.orderbook_max_age_sec:.1f}s")
-        else:
-            if imb < min_imb:
-                fail.append(f"imb {imb:.2f}/{min_imb:.2f}")
-            if spread > max_spread_pct:
-                fail.append(f"spread {spread:.2f}>{max_spread_pct:.2f}")
-            if vi_std > 0 and vi_gap <= self.vi_guard_pct:
-                fail.append(f"vi_guard gap {vi_gap:.2f}<={self.vi_guard_pct:.2f}")
+            trigger_fail.append(f"ticks {tick_count}/{min_tick_count}")
+        if spread > max_spread_pct:
+            trigger_fail.append(f"spread {spread:.2f}>{max_spread_pct:.2f}")
 
-        if fail:
+        if trigger_fail:
             self.candidate_since.pop(sym, None)
             self._log_signal_diag(
-                ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", " | ".join(fail)
+                ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", " | ".join(trigger_fail)
             )
             return
 
@@ -356,6 +346,18 @@ class EngineReal:
             self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", f"confirm_wait {confirm_sec:.1f}s")
             return
         if ts_epoch - c0 < confirm_sec:
+            return
+
+        # 2) Guard gate: order-right-before safety checks only
+        guard_fail = []
+        if ob_stale:
+            guard_fail.append(f"orderbook stale>{self.orderbook_max_age_sec:.1f}s")
+        if vi_std > 0 and vi_gap <= self.vi_guard_pct:
+            guard_fail.append(f"vi_guard gap {vi_gap:.2f}<={self.vi_guard_pct:.2f}")
+        if guard_fail:
+            self._log_signal_diag(
+                ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", " | ".join(guard_fail)
+            )
             return
 
         try:
