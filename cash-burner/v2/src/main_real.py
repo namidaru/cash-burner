@@ -16,6 +16,7 @@ IN_FILE = os.getenv("IN_FILE", os.path.join("data", "ws_dump.log"))
 LIVE_POLL_SEC = float(os.getenv("LIVE_POLL_SEC", "0.2"))
 SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "10"))
 WATCHLIST_DEBUG = os.getenv("WATCHLIST_DEBUG", os.path.join("data", "watchlist_debug.log"))
+PREVCLOSE_WARMUP = os.getenv("PREVCLOSE_WARMUP", "0") == "1"
 
 def _log(msg: str):
     try:
@@ -52,7 +53,7 @@ def scanner_loop():
                 "rank integrity "
                 f"total={integ['total']} unique={integ['unique']} "
                 f"bad_format={integ['bad_format']} dup={integ['dup']} "
-                f"low_price={integ['low_price']} quote_miss={integ['quote_miss']}"
+                f"low_price={integ['low_price']} quote_miss={'off' if integ['quote_miss'] < 0 else integ['quote_miss']}"
             )
             detail = get_last_build_meta()
             if detail:
@@ -62,18 +63,21 @@ def scanner_loop():
             if src_map:
                 c_rank_pref = sum(1 for s in watch if src_map.get(s) == "rank_pref")
                 c_rank_backup = sum(1 for s in watch if src_map.get(s) == "rank_backup")
+                c_volume_rank = sum(1 for s in watch if src_map.get(s) == "volume_rank")
                 c_strength = sum(1 for s in watch if src_map.get(s) == "strength")
                 c_condition = sum(1 for s in watch if src_map.get(s) == "condition")
                 c_fallback = sum(1 for s in watch if src_map.get(s) == "fallback")
                 _log(
                     "rank source "
                     f"rank_pref={c_rank_pref} rank_backup={c_rank_backup} "
-                    f"strength={c_strength} condition={c_condition} fallback={c_fallback}"
+                    f"volume_rank={c_volume_rank} strength={c_strength} "
+                    f"condition={c_condition} fallback={c_fallback}"
                 )
 
             if watch:
                 # prev_close cache needed for +12% block and limitup-gap take
-                ensure_prev_close(watch)
+                if PREVCLOSE_WARMUP:
+                    ensure_prev_close(watch)
                 if watch != last_watch:
                     write_watchlist(watch)
                     last_watch = watch

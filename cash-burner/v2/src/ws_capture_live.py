@@ -9,7 +9,18 @@ APP_SECRET = os.getenv("KOREA_INVEST_APP_SECRET","")
 WS_URL = os.getenv("KIS_WS_URL", "ws://ops.koreainvestment.com:21000")
 BASE_URL = os.getenv("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443")
 
-OUT_FILE = os.getenv("OUT_FILE", os.path.join("data", "ws_dump.log"))
+def _dated_out_file() -> str:
+    raw = os.getenv("OUT_FILE", os.path.join("data", "ws_dump.log"))
+    ymd = time.strftime("%Y%m%d")
+    if "{date}" in raw:
+        return raw.replace("{date}", ymd)
+    base, ext = os.path.splitext(raw)
+    if not ext:
+        ext = ".log"
+    return f"{base}_{ymd}{ext}"
+
+
+OUT_FILE = _dated_out_file()
 CONTROL_FILE = os.getenv("CONTROL_FILE", os.path.join("data", "ws_control.log"))
 WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
 
@@ -64,7 +75,9 @@ class WSCapture:
     def __init__(self):
         self.approval_key = None
         self.ws = None
+        self.ws_thread = None
         self.stop_evt = threading.Event()
+        self.reconnect_evt = threading.Event()
         self.subscribed = set()
         self.lock = threading.Lock()
 
@@ -87,6 +100,14 @@ class WSCapture:
                     pass
                 return
             if s.startswith("{"):
+                try:
+                    j = json.loads(s)
+                    if str(j.get("header", {}).get("tr_id", "")).upper() == "PINGPONG":
+                        ws.send("PINGPONG")
+                        _append(CONTROL_FILE, f"{_ts()}\tPING_ACK json")
+                        return
+                except Exception:
+                    pass
                 _append(CONTROL_FILE, f"{_ts()}\t{s[:2000]}")
                 return
             if s.startswith("0|") or s.startswith("1|"):
@@ -94,25 +115,41 @@ class WSCapture:
 
         def on_error(ws, err):
             _append(CONTROL_FILE, f"{_ts()}\tERR {err}")
+            self.reconnect_evt.set()
 
         def on_close(ws, code, msg):
             _append(CONTROL_FILE, f"{_ts()}\tCLOSE {code} {msg}")
+            self.reconnect_evt.set()
 
-        self.ws = websocket.WebSocketApp(
-            WS_URL,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close,
-        )
+        def _spawn_ws():
+            self.ws = websocket.WebSocketApp(
+                WS_URL,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            self.ws_thread = threading.Thread(target=lambda: self.ws.run_forever(ping_interval=30, ping_timeout=10), daemon=True)
+            self.ws_thread.start()
 
-        t = threading.Thread(target=lambda: self.ws.run_forever(ping_interval=30, ping_timeout=10), daemon=True)
-        t.start()
+        _spawn_ws()
 
         while not self.stop_evt.is_set():
             time.sleep(POLL_WATCH_SEC)
             if self.ws:
                 self._sync_subscriptions(self.ws, read_watchlist())
+
+            dead = (self.ws_thread is not None) and (not self.ws_thread.is_alive())
+            if self.reconnect_evt.is_set() or dead:
+                self.reconnect_evt.clear()
+                self.subscribed.clear()
+                _append(CONTROL_FILE, f"{_ts()}\tRECONNECT start")
+                try:
+                    self.approval_key = get_approval_key()
+                except Exception as e:
+                    _append(CONTROL_FILE, f"{_ts()}\tRECONNECT approval_err {type(e).__name__}: {e}")
+                    continue
+                _spawn_ws()
 
     def stop(self):
         self.stop_evt.set()

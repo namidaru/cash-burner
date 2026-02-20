@@ -11,10 +11,28 @@ from quote_multi import multi_quote, score_item
 
 PATH = "/uapi/domestic-stock/v1/ranking/traded-by-company"
 STRENGTH_PATH = "/uapi/domestic-stock/v1/ranking/volume-power"
+VOLUME_RANK_PATH = "/uapi/domestic-stock/v1/quotations/volume-rank"
 DEFAULT_TR_IDS = "FHPST01860000,VHPST01860000"
 DEFAULT_STRENGTH_TR_IDS = "FHPST01710000,VHPST01710000"
+DEFAULT_VOLUME_TR_IDS = "FHPST01710000,VHPST01710000"
 _LAST_BUILD_META: str = ""
 _LAST_SOURCE_MAP: Dict[str, str] = {}
+
+
+def _time_hhmm() -> int:
+    return int(_dt.datetime.now().strftime("%H%M"))
+
+
+def _selection_profile() -> Tuple[float, float]:
+    """장구간별 추천치: (min_vol_percentile, max_spread_pct)."""
+    hhmm = _time_hhmm()
+    if 900 <= hhmm < 920:   # 장초
+        return 0.95, 0.50
+    if 1030 <= hhmm < 1330:  # 장중
+        return 0.90, 0.60
+    if 1400 <= hhmm <= 1520:  # 장후반
+        return 0.85, 0.80
+    return 0.90, 0.60
 
 
 def _today_yyyymmdd() -> str:
@@ -132,6 +150,43 @@ def fetch_strength_rank(market: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     return all_rows[:limit_n], debug_meta
 
 
+def fetch_volume_rank(market: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    tr_ids = [x.strip() for x in os.getenv("VOLUME_RANK_TR_IDS", DEFAULT_VOLUME_TR_IDS).split(",") if x.strip()]
+    limit_n = int(os.getenv("VOLUME_RANK_TOPK", "120"))
+    all_rows: List[Dict[str, Any]] = []
+    debug_meta: List[str] = []
+
+    for tr_id in tr_ids:
+        params = {
+            "fid_cond_mrkt_div_code": market,
+            "fid_cond_scr_div_code": os.getenv("VOLUME_RANK_SCR", "20171"),
+            "fid_input_iscd": os.getenv("VOLUME_RANK_INPUT_ISCD", "0000"),
+            "fid_div_cls_code": os.getenv("VOLUME_RANK_DIV", "0"),
+            "fid_blng_cls_code": os.getenv("VOLUME_RANK_BLNG", "0"),
+            "fid_trgt_cls_code": os.getenv("VOLUME_RANK_TRGT", "111111111"),
+            "fid_trgt_exls_cls_code": os.getenv("VOLUME_RANK_EXLS", "000000"),
+            "fid_input_price_1": os.getenv("VOLUME_RANK_P1", ""),
+            "fid_input_price_2": os.getenv("VOLUME_RANK_P2", ""),
+            "fid_vol_cnt": os.getenv("VOLUME_RANK_VOL_CNT", ""),
+            "fid_input_date_1": os.getenv("VOLUME_RANK_DATE1", ""),
+        }
+        try:
+            j = request("GET", VOLUME_RANK_PATH, tr_id, params=params)
+            rows = _normalize_rank_rows(j)
+            if rows:
+                all_rows.extend(rows)
+                debug_meta.append(f"v-ok m={market} tr={tr_id} rows={len(rows)}")
+            else:
+                debug_meta.append(f"v-empty m={market} tr={tr_id} rt_cd={j.get('rt_cd','?')} msg1={j.get('msg1','')[:40]}")
+        except Exception as e:
+            debug_meta.append(f"v-err m={market} tr={tr_id} ex={type(e).__name__}")
+
+        if len(all_rows) >= limit_n:
+            return all_rows[:limit_n], debug_meta
+
+    return all_rows[:limit_n], debug_meta
+
+
 def _fallback_symbols() -> List[str]:
     raw = os.getenv("FALLBACK_SYMBOLS", "")
     if not raw:
@@ -191,6 +246,142 @@ def _parse_strength(item: Dict[str, Any]) -> float:
         if v >= 0:
             return v
     return 0.0
+
+
+def _parse_spread_pct(item: Dict[str, Any], default_spread: float) -> float:
+    ask1 = _parse_float(item, "askp1", 0.0)
+    if ask1 <= 0:
+        ask1 = _parse_float(item, "ASKP1", 0.0)
+    bid1 = _parse_float(item, "bidp1", 0.0)
+    if bid1 <= 0:
+        bid1 = _parse_float(item, "BIDP1", 0.0)
+    if ask1 > 0 and bid1 > 0 and ask1 >= bid1:
+        mid = (ask1 + bid1) / 2.0
+        if mid > 0:
+            return ((ask1 - bid1) / mid) * 100.0
+    return default_spread
+
+
+def _passes_quality(item: Dict[str, Any], min_price: float, max_price: float, min_chg: float, max_chg: float, min_strength: float, max_strength: float) -> bool:
+    px = _parse_price(item)
+    if min_price > 0 and px > 0 and px <= min_price:
+        return False
+    if max_price > 0 and px > max_price:
+        return False
+
+    chg = _parse_float(item, "prdy_ctrt", 0.0)
+    if chg < min_chg or chg > max_chg:
+        return False
+
+    st = _parse_strength(item)
+    if st > 0 and (st < min_strength or st > max_strength):
+        return False
+
+    return True
+
+
+def _supplement_from_volume_rank(
+    need_n: int,
+    seen: set[str],
+    min_price: float,
+    min_tv: float,
+    block_rise: float,
+    meta: List[str],
+    max_price: float,
+    min_chg: float,
+    max_chg: float,
+    min_strength: float,
+    max_strength: float,
+) -> List[str]:
+    if need_n <= 0:
+        return []
+    if os.getenv("WATCH_FILL_FROM_VOLUME_RANK", "1") != "1":
+        return []
+
+    markets = [m.strip() for m in os.getenv("VOLUME_RANK_MARKETS", os.getenv("RANK_MARKETS", "J,NX")).split(",") if m.strip()]
+    rows: List[Dict[str, Any]] = []
+    for m in markets:
+        part, dbg = fetch_volume_rank(m)
+        meta.extend(dbg)
+        rows.extend(part)
+
+    if not rows:
+        meta.append("volume_rank empty")
+        return []
+
+    min_vol_pct, max_spread_pct = _selection_profile()
+
+    candidates: List[Tuple[str, Dict[str, Any], float, float, float]] = []  # sym, raw, roc, tv, spread_pct
+    for it in rows:
+        sym = _parse_sym(it)
+        if not sym or sym in seen:
+            continue
+        if not _passes_quality(it, min_price, max_price, min_chg, max_chg, min_strength, max_strength):
+            continue
+        r = _parse_float(it, "prdy_ctrt", 0.0)
+        tv = _parse_float(it, "acml_tr_pbmn", 0.0)
+        spread_pct = _parse_spread_pct(it, max_spread_pct * 0.8)
+        if r >= block_rise:
+            continue
+        if tv > 0 and tv < min_tv:
+            continue
+
+        candidates.append((sym, it, r, tv, spread_pct))
+
+    if not candidates:
+        meta.append(f"volume_rank fill=0/{need_n} pool={len(rows)}")
+        return []
+
+    rocs = sorted([x[2] for x in candidates])
+    tvs = sorted([x[3] for x in candidates])
+    sp_is = sorted([(1.0 / max(x[4], 0.001)) for x in candidates])
+
+    def _pct(arr: List[float], v: float) -> float:
+        if not arr:
+            return 0.0
+        lo = 0
+        hi = len(arr)
+        while lo < hi:
+            md = (lo + hi) // 2
+            if arr[md] <= v:
+                lo = md + 1
+            else:
+                hi = md
+        return max(0.0, min(1.0, lo / len(arr)))
+
+    scored: List[Tuple[float, str]] = []
+    for sym, _, roc, tv, spread_pct in candidates:
+        roc_pct = _pct(rocs, roc)
+        tv_pct = _pct(tvs, tv)
+        spread_score_pct = _pct(sp_is, 1.0 / max(spread_pct, 0.001))
+
+        # 추천식 반영:
+        # Score = 0.40*rank_pct(ROC) + 0.30*rank_pct(LiquiditySpread) + 0.30*rank_pct(Vol_Breakout)
+        liquidity_spread_score = (0.5 * tv_pct) + (0.5 * spread_score_pct)
+        vol_breakout_pct = tv_pct  # 120일 퍼센타일 대체로 당일 cross-section 퍼센타일 사용
+
+        if vol_breakout_pct < min_vol_pct:
+            continue
+        if spread_pct > max_spread_pct:
+            continue
+
+        score = (0.40 * roc_pct) + (0.30 * liquidity_spread_score) + (0.30 * vol_breakout_pct)
+        scored.append((score, sym))
+
+    scored.sort(reverse=True)
+    out: List[str] = []
+    for _, sym in scored:
+        if sym in seen:
+            continue
+        seen.add(sym)
+        out.append(sym)
+        if len(out) >= need_n:
+            break
+    meta.append(
+        f"volume_rank fill={len(out)}/{need_n} pool={len(rows)} "
+        f"formula=0.40*roc_pct+0.30*liqspr_pct+0.30*vol_pct vol>={min_vol_pct:.2f} spread<={max_spread_pct:.2f}"
+    )
+    return out
 
 
 def _supplement_from_strength(
@@ -358,7 +549,8 @@ def check_watchlist_integrity(symbols: List[str]) -> Dict[str, int]:
 
     quote_miss = 0
     low_price = 0
-    if valid_syms:
+    use_quote = os.getenv("WATCH_INTEGRITY_WITH_QUOTE", "0") == "1"
+    if valid_syms and use_quote:
         try:
             items = multi_quote(valid_syms)
             by_sym: Dict[str, Dict[str, Any]] = {}
@@ -377,6 +569,8 @@ def check_watchlist_integrity(symbols: List[str]) -> Dict[str, int]:
                     low_price += 1
         except Exception:
             quote_miss = len(valid_syms)
+    elif valid_syms:
+        quote_miss = -1
 
     return {
         "total": total,
@@ -400,22 +594,49 @@ def build_watchlist() -> List[str]:
     min_tv = float(os.getenv("WATCH_MIN_TR_VALUE", "300000000"))
     block_rise = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "12.0"))
     min_price = float(os.getenv("WATCH_MIN_PRICE", "10000"))
+    max_price = float(os.getenv("WATCH_MAX_PRICE", "500000"))
+    min_chg = float(os.getenv("WATCH_MIN_CHANGE_PCT", "2.0"))
+    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "18.0"))
+    min_strength = float(os.getenv("WATCH_MIN_STRENGTH", "110"))
+    max_strength = float(os.getenv("WATCH_MAX_STRENGTH", "300"))
 
     markets = [m.strip() for m in os.getenv("RANK_MARKETS", "J,NX").split(",") if m.strip()]
     sort_codes = [s.strip() for s in os.getenv("RANK_SORT_CODES", "1,0").split(",") if s.strip()]
+
+    out: List[str] = []
+    seen = set()
+    src_map: Dict[str, str] = {}
 
     preferred: List[Tuple[float, str]] = []
     backup: List[Tuple[float, str]] = []
     meta: List[str] = []
     drop_low_price = 0
 
+    # 1) 거래량 상위(legacy-style)로 우선 30개를 채운다.
+    vol_first = _supplement_from_volume_rank(
+        want_n, seen, min_price, min_tv, block_rise, meta,
+        max_price, min_chg, max_chg, min_strength, max_strength,
+    )
+    out.extend(vol_first)
+    for sym in vol_first:
+        src_map[sym] = "volume_rank"
+
+    if len(out) >= want_n:
+        meta.append("primary=volume_rank")
+        _LAST_BUILD_META = " | ".join(meta[-24:])
+        _LAST_SOURCE_MAP = src_map
+        return out[:want_n]
+
+    meta.append(f"volume_rank_short={len(out)}/{want_n}")
+
+    # 2) 부족분은 기존 rank 소스에서 보충
     for m in markets:
         for sc in sort_codes:
             rows, dbg = fetch_rank(m, sc)
             meta.extend(dbg)
             for it in rows:
                 sym = _parse_sym(it)
-                if not sym:
+                if not sym or sym in seen:
                     continue
 
                 r = _parse_float(it, "prdy_ctrt", 0.0)
@@ -426,15 +647,13 @@ def build_watchlist() -> List[str]:
                 if min_price > 0 and px > 0 and px <= min_price:
                     drop_low_price += 1
                     continue
+                if not _passes_quality(it, min_price, max_price, min_chg, max_chg, min_strength, max_strength):
+                    continue
 
                 if r < block_rise and (tv <= 0 or tv >= min_tv):
                     preferred.append((score, sym))
                 else:
                     backup.append((score, sym))
-
-    out: List[str] = []
-    seen = set()
-    src_map: Dict[str, str] = {}
 
     for src_name, src in (("rank_pref", sorted(preferred, reverse=True)), ("rank_backup", sorted(backup, reverse=True))):
         for _, sym in src:
@@ -448,6 +667,15 @@ def build_watchlist() -> List[str]:
                 _LAST_BUILD_META = " | ".join(meta[-24:])
                 _LAST_SOURCE_MAP = src_map
                 return out
+
+    if len(out) < want_n:
+        added = _supplement_from_volume_rank(
+            want_n - len(out), seen, min_price, min_tv, block_rise, meta,
+            max_price, min_chg, max_chg, min_strength, max_strength,
+        )
+        out.extend(added)
+        for sym in added:
+            src_map[sym] = "volume_rank"
 
     if len(out) < want_n:
         added = _supplement_from_strength(want_n - len(out), seen, min_price, min_tv, block_rise, meta)
