@@ -1,4 +1,3 @@
-# src/ws_capture_live.py
 from __future__ import annotations
 
 import os, json, time, threading
@@ -10,73 +9,105 @@ APP_SECRET = os.getenv("KOREA_INVEST_APP_SECRET","")
 WS_URL = os.getenv("KIS_WS_URL", "ws://ops.koreainvestment.com:21000")
 BASE_URL = os.getenv("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443")
 
-OUT_FILE = os.getenv("OUT_FILE", r"data\ws_dump.log")
-CONTROL_FILE = os.getenv("CONTROL_FILE", r"data\ws_control.log")
-WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", r"data\watchlist.txt")
+def _dated_out_file() -> str:
+    raw = os.getenv("OUT_FILE", os.path.join("data", "ws_dump.log"))
+    ymd = time.strftime("%Y%m%d")
+    if "{date}" in raw:
+        return raw.replace("{date}", ymd)
+    base, ext = os.path.splitext(raw)
+    if not ext:
+        ext = ".log"
+    return f"{base}_{ymd}{ext}"
 
-TR_IDS = [t.strip() for t in os.getenv("TR_IDS","H0STCNT0,H0STASP0").split(",") if t.strip()]
-POLL_WATCH_SEC = float(os.getenv("WATCH_POLL_SEC","2.0"))
+
+OUT_FILE = _dated_out_file()
+CONTROL_FILE = os.getenv("CONTROL_FILE", os.path.join("data", "ws_control.log"))
+WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
+
+TR_IDS = [t.strip() for t in os.getenv("TR_IDS", "H0STCNT0,H0STASP0").split(",") if t.strip()]
+POLL_WATCH_SEC = float(os.getenv("WATCH_POLL_SEC", "2.0"))
+
 
 def _ensure_dir(path: str):
-    d=os.path.dirname(path)
+    d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
+
 
 def _ts():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
+
 def _append(path: str, line: str):
     _ensure_dir(path)
-    with open(path,"a",encoding="utf-8") as f:
-        f.write(line+"\n")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
 
 def get_approval_key() -> str:
     url = f"{BASE_URL}/oauth2/Approval"
-    headers = {"content-type":"application/json; charset=utf-8"}
-    body = {"grant_type":"client_credentials","appkey":APP_KEY,"secretkey":APP_SECRET}
+    headers = {"content-type": "application/json; charset=utf-8"}
+    body = {"grant_type": "client_credentials", "appkey": APP_KEY, "secretkey": APP_SECRET}
     r = requests.post(url, headers=headers, data=json.dumps(body), timeout=10)
     r.raise_for_status()
     return r.json()["approval_key"]
 
+
 def build_msg(approval_key: str, tr_id: str, sym: str, tr_type: str) -> str:
-    return json.dumps({
-        "header": {"approval_key": approval_key, "custtype":"P", "tr_type": tr_type, "content-type":"utf-8"},
-        "body": {"input": {"tr_id": tr_id, "tr_key": sym}}
-    })
+    return json.dumps(
+        {
+            "header": {"approval_key": approval_key, "custtype": "P", "tr_type": tr_type, "content-type": "utf-8"},
+            "body": {"input": {"tr_id": tr_id, "tr_key": sym}},
+        }
+    )
+
 
 def read_watchlist() -> set[str]:
     try:
-        with open(WATCHLIST_FILE,"r",encoding="utf-8") as f:
-            syms=[ln.strip() for ln in f if ln.strip()]
+        with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
+            syms = [ln.strip() for ln in f if ln.strip()]
         return set(syms)
     except Exception:
         return set()
+
 
 class WSCapture:
     def __init__(self):
         self.approval_key = None
         self.ws = None
+        self.ws_thread = None
         self.stop_evt = threading.Event()
-        self.subscribed = set()  # symbols
+        self.reconnect_evt = threading.Event()
+        self.subscribed = set()
         self.lock = threading.Lock()
 
     def start(self):
         _ensure_dir(OUT_FILE)
         _append(OUT_FILE, f"# ---- session start {_ts()} mode=real tr_ids={TR_IDS} ----")
+        _append(CONTROL_FILE, f"{_ts()}\tBOOT watchlist_file={WATCHLIST_FILE}")
         self.approval_key = get_approval_key()
 
         def on_open(ws):
             _append(CONTROL_FILE, f"{_ts()}\tOPEN {WS_URL}")
-            # initial subscribe from watchlist
             self._sync_subscriptions(ws, read_watchlist(), force=True)
 
         def on_message(ws, message):
-            s = message if isinstance(message,str) else message.decode("utf-8","ignore")
+            s = message if isinstance(message, str) else message.decode("utf-8", "ignore")
             if s == "PINGPONG":
-                try: ws.send("PINGPONG")
-                except Exception: pass
+                try:
+                    ws.send("PINGPONG")
+                except Exception:
+                    pass
                 return
             if s.startswith("{"):
+                try:
+                    j = json.loads(s)
+                    if str(j.get("header", {}).get("tr_id", "")).upper() == "PINGPONG":
+                        ws.send("PINGPONG")
+                        _append(CONTROL_FILE, f"{_ts()}\tPING_ACK json")
+                        return
+                except Exception:
+                    pass
                 _append(CONTROL_FILE, f"{_ts()}\t{s[:2000]}")
                 return
             if s.startswith("0|") or s.startswith("1|"):
@@ -84,26 +115,41 @@ class WSCapture:
 
         def on_error(ws, err):
             _append(CONTROL_FILE, f"{_ts()}\tERR {err}")
+            self.reconnect_evt.set()
 
         def on_close(ws, code, msg):
             _append(CONTROL_FILE, f"{_ts()}\tCLOSE {code} {msg}")
+            self.reconnect_evt.set()
 
-        self.ws = websocket.WebSocketApp(
-            WS_URL,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close
-        )
+        def _spawn_ws():
+            self.ws = websocket.WebSocketApp(
+                WS_URL,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            self.ws_thread = threading.Thread(target=lambda: self.ws.run_forever(ping_interval=30, ping_timeout=10), daemon=True)
+            self.ws_thread.start()
 
-        t = threading.Thread(target=lambda: self.ws.run_forever(ping_interval=30,ping_timeout=10), daemon=True)
-        t.start()
+        _spawn_ws()
 
-        # watchlist loop
         while not self.stop_evt.is_set():
             time.sleep(POLL_WATCH_SEC)
             if self.ws:
                 self._sync_subscriptions(self.ws, read_watchlist())
+
+            dead = (self.ws_thread is not None) and (not self.ws_thread.is_alive())
+            if self.reconnect_evt.is_set() or dead:
+                self.reconnect_evt.clear()
+                self.subscribed.clear()
+                _append(CONTROL_FILE, f"{_ts()}\tRECONNECT start")
+                try:
+                    self.approval_key = get_approval_key()
+                except Exception as e:
+                    _append(CONTROL_FILE, f"{_ts()}\tRECONNECT approval_err {type(e).__name__}: {e}")
+                    continue
+                _spawn_ws()
 
     def stop(self):
         self.stop_evt.set()
@@ -113,7 +159,7 @@ class WSCapture:
         except Exception:
             pass
 
-    def _sync_subscriptions(self, ws, desired: set[str], force: bool=False):
+    def _sync_subscriptions(self, ws, desired: set[str], force: bool = False):
         with self.lock:
             add = desired - self.subscribed
             rem = self.subscribed - desired
@@ -123,12 +169,22 @@ class WSCapture:
 
             for sym in sorted(add):
                 for tr in TR_IDS:
-                    try: ws.send(build_msg(self.approval_key, tr, sym, "1"))
-                    except Exception: pass
+                    try:
+                        ws.send(build_msg(self.approval_key, tr, sym, "1"))
+                    except Exception:
+                        pass
                 self.subscribed.add(sym)
 
             for sym in sorted(rem):
                 for tr in TR_IDS:
-                    try: ws.send(build_msg(self.approval_key, tr, sym, "0"))
-                    except Exception: pass
+                    try:
+                        ws.send(build_msg(self.approval_key, tr, sym, "0"))
+                    except Exception:
+                        pass
                 self.subscribed.discard(sym)
+
+            if add or rem or force:
+                _append(
+                    CONTROL_FILE,
+                    f"{_ts()}\tSYNC desired={len(desired)} add={len(add)} rem={len(rem)} subscribed={len(self.subscribed)}",
+                )
