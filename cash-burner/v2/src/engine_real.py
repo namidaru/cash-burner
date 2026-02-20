@@ -29,7 +29,7 @@ class Position:
 
 class EngineReal:
     def __init__(self):
-        self.window_sec = int(os.getenv("WINDOW_SEC", "10"))
+        self.window_sec = int(os.getenv("WINDOW_SEC", "20"))
         self.orderbook_max_age_sec = float(os.getenv("ORDERBOOK_MAX_AGE_SEC", "1.0"))
         self.min_ticks_for_calc = int(os.getenv("MIN_TICKS_FOR_CALC", "2"))
 
@@ -80,6 +80,11 @@ class EngineReal:
         self.vi_cooldown_sec = float(os.getenv("VI_COOLDOWN_SEC", "120"))
 
         self.position_pct = float(os.getenv("POSITION_PCT", "0.30"))
+        self.entry_score_min = float(os.getenv("ENTRY_SCORE_MIN", "80"))
+        self.entry_pick_window_sec = float(os.getenv("ENTRY_PICK_WINDOW_SEC", "1.2"))
+        self.spike_10s_min_pct = float(os.getenv("SPIKE_10S_MIN_PCT", "1.0"))
+        self.burst_ratio_min = float(os.getenv("BURST_RATIO_MIN", "2.2"))
+        self.orderbook_ratio_min = float(os.getenv("ORDERBOOK_RATIO_MIN", "1.2"))
 
         self.hard_stop_pct = float(os.getenv("HARD_STOP_PCT", "3.5"))
         self.trail_arm_pct = float(os.getenv("TRAIL_ARM_PCT", "4.0"))
@@ -130,6 +135,8 @@ class EngineReal:
         self.last_entry_ts: Dict[str, float] = {}
         self.candidate_since: Dict[str, float] = {}
         self.vi_last_ts: Dict[str, float] = {}
+        self._score_pick_bucket_start = 0.0
+        self._score_pick_best: Dict[str, Any] | None = None
 
         self._init_ledger()
         self._init_diag()
@@ -244,6 +251,32 @@ class EngineReal:
             return 0.0
         return pc * (1.0 + 0.30 * self.limitup_gap_take_pct)
 
+
+    def _window_stats(self, dq: Deque[Tuple[float, float, float]], ts_epoch: float, sec: float) -> tuple[float, float, int]:
+        st = ts_epoch - sec
+        arr = [(t, p, v) for (t, p, v) in dq if t >= st]
+        if len(arr) < 2:
+            return 0.0, 0.0, len(arr)
+        base = arr[0][1]
+        last = arr[-1][1]
+        ret = ((last - base) / base * 100.0) if base > 0 else 0.0
+        trv = sum(p * v for _, p, v in arr)
+        return ret, trv, len(arr)
+
+    def _depth3_ratio(self, ob: Dict[str, str] | None) -> float:
+        if not ob:
+            return 0.0
+        bid = (
+            _f(ob.get("BIDP_RSQN1")) + _f(ob.get("BIDP_RSQN2")) + _f(ob.get("BIDP_RSQN3"))
+            + _f(ob.get("bidp_rsqn1")) + _f(ob.get("bidp_rsqn2")) + _f(ob.get("bidp_rsqn3"))
+        )
+        ask = (
+            _f(ob.get("ASKP_RSQN1")) + _f(ob.get("ASKP_RSQN2")) + _f(ob.get("ASKP_RSQN3"))
+            + _f(ob.get("askp_rsqn1")) + _f(ob.get("askp_rsqn2")) + _f(ob.get("askp_rsqn3"))
+        )
+        if ask <= 0:
+            return 0.0
+        return bid / ask
 
     def _entry_score(self, ret: float, tick_count: int, trv: float, imb: float, spread: float, max_spread_pct: float) -> float:
         spread_room = max(0.0, max_spread_pct - spread)
@@ -423,6 +456,49 @@ class EngineReal:
             self._send_day_close_summary(ts_epoch)
         self._send_health_check(ts_epoch)
 
+    def _score_pick_update(self, ts_epoch: float, sym: str, score: float, price: float, ret: float, tick_count: int, trv: float, imb: float, spread: float, dayrise: float):
+        if self._score_pick_bucket_start <= 0:
+            self._score_pick_bucket_start = ts_epoch
+            self._score_pick_best = {
+                "sym": sym,
+                "score": score,
+                "price": price,
+                "ret": ret,
+                "tick_count": tick_count,
+                "trv": trv,
+                "imb": imb,
+                "spread": spread,
+                "dayrise": dayrise,
+                "ts": ts_epoch,
+            }
+            return
+
+        best = self._score_pick_best
+        if (best is None) or (score > float(best.get("score", -1e18))):
+            self._score_pick_best = {
+                "sym": sym,
+                "score": score,
+                "price": price,
+                "ret": ret,
+                "tick_count": tick_count,
+                "trv": trv,
+                "imb": imb,
+                "spread": spread,
+                "dayrise": dayrise,
+                "ts": ts_epoch,
+            }
+
+    def _score_pick_ready(self, ts_epoch: float) -> bool:
+        if self._score_pick_bucket_start <= 0:
+            return False
+        return (ts_epoch - self._score_pick_bucket_start) >= self.entry_pick_window_sec
+
+    def _score_pick_take(self) -> Dict[str, Any] | None:
+        best = self._score_pick_best
+        self._score_pick_best = None
+        self._score_pick_bucket_start = 0.0
+        return best
+
     def _maybe_exit(self, sym: str, price: float, ts_epoch: float):
         p = self.pos.get(sym)
         if not p:
@@ -496,16 +572,11 @@ class EngineReal:
         max_spread_pct = float(p.get("max_spread_pct", self.max_spread_pct))
         confirm_sec = float(p.get("confirm_sec", self.confirm_sec))
         cooldown_sec = float(p.get("cooldown_sec", self.cooldown_sec))
-        vi_like_ret_pct = float(p.get("vi_like_ret_pct", 2.0))
-
         if ts_epoch - self.last_entry_ts.get(sym, 0.0) < cooldown_sec:
             self._log_signal_diag(ts_epoch, sym, price, 0, 0, 0, 0, 0, 0, "NO_BUY", f"cooldown<{cooldown_sec:.0f}s")
             return
 
         dayrise = self._day_rise_pct(sym, price)
-        if self._prev_close(sym) > 0 and dayrise >= self.entry_block_dayrise_pct:
-            self._log_signal_diag(ts_epoch, sym, price, 0.0, 0, 0.0, 0.0, 0.0, dayrise, "NO_BUY", f"dayrise_block need<{self.entry_block_dayrise_pct:.2f}")
-            return
 
         dq = self.ticks[sym]
         dq.append((ts_epoch, price, vol))
@@ -519,13 +590,8 @@ class EngineReal:
         trv = sum(px * vv for _, px, vv in dq)
         tick_count = len(dq)
 
-        if ret >= vi_like_ret_pct:
-            self.vi_last_ts[sym] = ts_epoch
-            self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, 0, 0, dayrise, "NO_BUY", f"vi_like_ret {ret:.2f}>={vi_like_ret_pct:.2f}")
-            return
-        if ts_epoch - self.vi_last_ts.get(sym, 0.0) < self.vi_cooldown_sec:
-            self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, 0, 0, dayrise, "NO_BUY", f"vi_cooldown<{self.vi_cooldown_sec:.0f}s")
-            return
+        ret10, trv10, ticks10 = self._window_stats(dq, ts_epoch, 10.0)
+        _, trv_prev, ticks_prev = self._window_stats(dq, ts_epoch - 10.0, 10.0)
 
         ob = self.book.get(sym)
         ob_age = ts_epoch - self.book_ts.get(sym, 0.0)
@@ -544,7 +610,7 @@ class EngineReal:
         vi_std = _f(row.get("VI_STND_PRC"))
         vi_gap = abs(price - vi_std) / vi_std * 100.0 if vi_std > 0 else 999.0
 
-        # 1) Trigger gate: fast/entry signal only (ret + tick_count + spread)
+        # 1) Trigger gate: ret/tick/spread + confirm
         trigger_fail = []
         if ret < min_ret_pct:
             trigger_fail.append(f"ret {ret:.2f}/{min_ret_pct:.2f}")
@@ -552,6 +618,12 @@ class EngineReal:
             trigger_fail.append(f"ticks {tick_count}/{min_tick_count}")
         if spread > max_spread_pct:
             trigger_fail.append(f"spread {spread:.2f}>{max_spread_pct:.2f}")
+        if ret10 < self.spike_10s_min_pct:
+            trigger_fail.append(f"ret10 {ret10:.2f}/{self.spike_10s_min_pct:.2f}")
+        if trv_prev > 0 and trv10 < trv_prev * self.burst_ratio_min:
+            trigger_fail.append(f"trv_burst {trv10:.0f}/{trv_prev*self.burst_ratio_min:.0f}")
+        if ticks_prev > 0 and ticks10 < int(ticks_prev * self.burst_ratio_min):
+            trigger_fail.append(f"tick_burst {ticks10}/{int(ticks_prev*self.burst_ratio_min)}")
 
         if trigger_fail:
             self.candidate_since.pop(sym, None)
@@ -571,10 +643,11 @@ class EngineReal:
 
         # 2) Guard gate: order-right-before safety checks only
         guard_fail = []
-        if ob_stale:
-            guard_fail.append(f"orderbook stale>{self.orderbook_max_age_sec:.1f}s")
         if vi_std > 0 and vi_gap <= self.vi_guard_pct:
             guard_fail.append(f"vi_guard gap {vi_gap:.2f}<={self.vi_guard_pct:.2f}")
+        depth_ratio = self._depth3_ratio(ob if (ob and not ob_stale) else None)
+        if depth_ratio > 0 and depth_ratio < self.orderbook_ratio_min:
+            guard_fail.append(f"depth_ratio {depth_ratio:.2f}<{self.orderbook_ratio_min:.2f}")
         if guard_fail:
             self._log_signal_diag(
                 ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", " | ".join(guard_fail)
@@ -597,6 +670,51 @@ class EngineReal:
             return
 
         score = self._entry_score(ret, tick_count, trv, imb, spread, max_spread_pct)
+        if score < self.entry_score_min:
+            self._log_signal_diag(
+                ts_epoch,
+                sym,
+                price,
+                ret,
+                tick_count,
+                trv,
+                imb,
+                spread,
+                dayrise,
+                "NO_BUY",
+                f"score {score:.1f}<{self.entry_score_min:.1f}",
+            )
+            return
+
+        self._score_pick_update(ts_epoch, sym, score, price, ret, tick_count, trv, imb, spread, dayrise)
+        if not self._score_pick_ready(ts_epoch):
+            return
+        best = self._score_pick_take()
+        if not best:
+            return
+        sym = str(best.get("sym", sym))
+        if sym in self.pos:
+            return
+        price = float(best.get("price", price))
+        ret = float(best.get("ret", ret))
+        tick_count = int(best.get("tick_count", tick_count))
+        trv = float(best.get("trv", trv))
+        imb = float(best.get("imb", imb))
+        spread = float(best.get("spread", spread))
+        dayrise = float(best.get("dayrise", dayrise))
+        score = float(best.get("score", score))
+        try:
+            cash = buyable_cash(sym, ord_dvsn="01", price="0")
+        except Exception as e:
+            self._log(ts_epoch, "BUY", sym, 0, price, "buyable_cash_error", "EX", f"{type(e).__name__}:{e}")
+            self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", "buyable_cash_error")
+            return
+        target = cash * self.position_pct
+        qty = int(math.floor(target / price))
+        if qty <= 0:
+            self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", f"qty=0 cash={cash:.0f} target={target:.0f}")
+            return
+
         j = self._safe_order("BUY", sym, qty, ts_epoch, price, f"signal ret={ret:.2f} imb={imb:.2f} spr={spread:.2f} dayrise={dayrise:.2f} score={score:.1f}")
         if j.get("rt_cd") == "0":
             self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, trail_armed=False)

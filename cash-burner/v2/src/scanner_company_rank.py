@@ -35,6 +35,116 @@ def _selection_profile() -> Tuple[float, float]:
     return 0.90, 0.60
 
 
+def _in_preopen_window() -> bool:
+    start_hhmm = int(os.getenv("SCAN_PREOPEN_START_HHMM", "900"))
+    track_min = int(os.getenv("SCAN_PREOPEN_TRACK_MIN", "15"))
+    hhmm = _time_hhmm()
+    start_min = (start_hhmm // 100) * 60 + (start_hhmm % 100)
+    now_min = (hhmm // 100) * 60 + (hhmm % 100)
+    return start_min <= now_min < (start_min + track_min)
+
+
+def _preopen_combo_seed(
+    seen: set[str],
+    meta: List[str],
+    src_map: Dict[str, str],
+    min_price: float,
+    max_price: float,
+    min_chg: float,
+    max_chg: float,
+    min_strength: float,
+    max_strength: float,
+    min_tv: float,
+    block_rise: float,
+) -> List[str]:
+    if os.getenv("SCAN_PREOPEN_COMBO_ENABLE", "1") != "1":
+        return []
+    if not _in_preopen_window():
+        return []
+
+    preopen_n = int(os.getenv("PREOPEN_GOOD_TOP_N", "15"))
+    volume_n = int(os.getenv("PREOPEN_VOLUME_TOP_N", "15"))
+
+    scored_by_sym: Dict[str, Tuple[float, str]] = {}
+
+    seqs = [x.strip() for x in os.getenv("WATCH_COND_SEQS", "").split(",") if x.strip()]
+    if seqs and preopen_n > 0:
+        try:
+            cond_syms = scan_conditions(seqs)[: max(preopen_n * 4, preopen_n)]
+            cond_items = multi_quote(cond_syms) if cond_syms else []
+        except Exception as e:
+            meta.append(f"preopen cond err({type(e).__name__})")
+            cond_items = []
+
+        cond_scored: List[Tuple[float, str]] = []
+        for it in cond_items:
+            sym = _parse_sym(it)
+            if not sym:
+                continue
+            if not _passes_quality(it, min_price, max_price, min_chg, max_chg, min_strength, max_strength):
+                continue
+            r = _parse_float(it, "prdy_ctrt", 0.0)
+            tv = _parse_float(it, "acml_tr_pbmn", 0.0)
+            if r >= block_rise:
+                continue
+            if tv > 0 and tv < min_tv:
+                continue
+            cond_scored.append((score_item(it), sym))
+
+        cond_scored.sort(reverse=True)
+        for score, sym in cond_scored[:preopen_n]:
+            old = scored_by_sym.get(sym)
+            if old is None or score > old[0]:
+                scored_by_sym[sym] = (score, "preopen_good")
+
+    if volume_n > 0:
+        markets = [m.strip() for m in os.getenv("VOLUME_RANK_MARKETS", os.getenv("RANK_MARKETS", "J,NX")).split(",") if m.strip()]
+        rows: List[Dict[str, Any]] = []
+        for m in markets:
+            part, dbg = fetch_volume_rank(m)
+            meta.extend(dbg)
+            rows.extend(part)
+
+        vol_scored: List[Tuple[float, str]] = []
+        for it in rows:
+            sym = _parse_sym(it)
+            if not sym:
+                continue
+            if not _passes_quality(it, min_price, max_price, min_chg, max_chg, min_strength, max_strength):
+                continue
+            r = _parse_float(it, "prdy_ctrt", 0.0)
+            tv = _parse_float(it, "acml_tr_pbmn", 0.0)
+            if r >= block_rise:
+                continue
+            if tv > 0 and tv < min_tv:
+                continue
+            vol_scored.append((score_item(it), sym))
+
+        vol_scored.sort(reverse=True)
+        for score, sym in vol_scored[:volume_n]:
+            old = scored_by_sym.get(sym)
+            if old is None or score > old[0]:
+                scored_by_sym[sym] = (score, "volume_rank")
+
+    min_score = float(os.getenv("PREOPEN_SCORE_MIN", "0"))
+    merged = sorted(((sc, sym, src) for sym, (sc, src) in scored_by_sym.items()), reverse=True)
+
+    out: List[str] = []
+    for score, sym, src in merged:
+        if score < min_score:
+            continue
+        if sym in seen:
+            continue
+        seen.add(sym)
+        src_map[sym] = src
+        out.append(sym)
+
+    meta.append(
+        f"preopen_combo pick={len(out)} cond_top={preopen_n} vol_top={volume_n} min_score={min_score:.1f}"
+    )
+    return out
+
+
 def _today_yyyymmdd() -> str:
     return _dt.datetime.now().strftime("%Y%m%d")
 
@@ -583,119 +693,139 @@ def check_watchlist_integrity(symbols: List[str]) -> Dict[str, int]:
 
 
 def build_watchlist() -> List[str]:
-    """API 결과로 최대 N개 채움.
-    1) 필터 통과 종목 우선
-    2) 부족하면 같은 API 결과에서 필터 탈락분으로 보충
-    3) 그래도 비면 FALLBACK_SYMBOLS 사용
+    """REST 데이터로 1차 선별 후 점수 상위 종목만 워치리스트에 반영.
+
+    단순화 원칙:
+    - 소스: 거래량 랭크 + 체결강도 + 조건검색(있을 때)
+    - 필터: 가격/등락/거래대금/스프레드 최소한만 적용
+    - 정렬: score_item 기반 + 거래대금 보너스
     """
     global _LAST_BUILD_META, _LAST_SOURCE_MAP
 
     want_n = int(os.getenv("WATCH_TOP_N", "30"))
-    min_tv = float(os.getenv("WATCH_MIN_TR_VALUE", "300000000"))
-    block_rise = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "12.0"))
     min_price = float(os.getenv("WATCH_MIN_PRICE", "10000"))
     max_price = float(os.getenv("WATCH_MAX_PRICE", "500000"))
     min_chg = float(os.getenv("WATCH_MIN_CHANGE_PCT", "2.0"))
-    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "18.0"))
-    min_strength = float(os.getenv("WATCH_MIN_STRENGTH", "110"))
-    max_strength = float(os.getenv("WATCH_MAX_STRENGTH", "300"))
+    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "24.0"))
+    min_tv = float(os.getenv("WATCH_MIN_TR_VALUE", "300000000"))
+    max_spread_pct = float(os.getenv("WATCH_MAX_SPREAD_PCT", "0.45"))
 
     markets = [m.strip() for m in os.getenv("RANK_MARKETS", "J,NX").split(",") if m.strip()]
-    sort_codes = [s.strip() for s in os.getenv("RANK_SORT_CODES", "1,0").split(",") if s.strip()]
+    seqs = [x.strip() for x in os.getenv("WATCH_COND_SEQS", "").split(",") if x.strip()]
+
+    src_map: Dict[str, str] = {}
+    meta: List[str] = []
+    raw_by_sym: Dict[str, Dict[str, Any]] = {}
+
+    for m in markets:
+        rows, dbg = fetch_volume_rank(m)
+        meta.extend(dbg)
+        for it in rows:
+            sym = _parse_sym(it)
+            if sym and sym not in raw_by_sym:
+                raw_by_sym[sym] = it
+                src_map[sym] = "volume_rank"
+
+    for m in markets:
+        rows, dbg = fetch_strength_rank(m)
+        meta.extend(dbg)
+        for it in rows:
+            sym = _parse_sym(it)
+            if sym and sym not in raw_by_sym:
+                raw_by_sym[sym] = it
+                src_map[sym] = "strength"
+
+    if seqs:
+        try:
+            cond_syms = scan_conditions(seqs)
+            items = multi_quote(cond_syms) if cond_syms else []
+        except Exception as e:
+            meta.append(f"cond err({type(e).__name__})")
+            items = []
+        for it in items:
+            sym = _parse_sym(it)
+            if sym and sym not in raw_by_sym:
+                raw_by_sym[sym] = it
+                src_map[sym] = "condition"
+
+    if not raw_by_sym:
+        fb = _fallback_symbols()[:want_n]
+        _LAST_BUILD_META = "empty_pool -> fallback"
+        _LAST_SOURCE_MAP = {sym: "fallback" for sym in fb}
+        return fb
+
+    syms = list(raw_by_sym.keys())
+    try:
+        q_items = multi_quote(syms)
+    except Exception:
+        q_items = []
+
+    by_sym_q: Dict[str, Dict[str, Any]] = {}
+    for it in q_items:
+        sym = _parse_sym(it)
+        if sym and sym not in by_sym_q:
+            by_sym_q[sym] = it
+
+    scored: List[Tuple[float, str]] = []
+    dropped = {"price": 0, "chg": 0, "tv": 0, "spread": 0, "score": 0}
+
+    for sym in syms:
+        it = by_sym_q.get(sym) or raw_by_sym.get(sym) or {}
+
+        px = _parse_price(it)
+        if (min_price > 0 and px > 0 and px < min_price) or (max_price > 0 and px > max_price):
+            dropped["price"] += 1
+            continue
+
+        chg = _parse_float(it, "prdy_ctrt", 0.0)
+        if chg < min_chg or chg > max_chg:
+            dropped["chg"] += 1
+            continue
+
+        tv = _parse_float(it, "acml_tr_pbmn", 0.0)
+        if tv > 0 and tv < min_tv:
+            dropped["tv"] += 1
+            continue
+
+        spread = _parse_spread_pct(it, max_spread_pct * 0.8)
+        if spread > max_spread_pct:
+            dropped["spread"] += 1
+            continue
+
+        base = score_item(it)
+        if base == float("-inf"):
+            dropped["score"] += 1
+            continue
+
+        score = base + min(3.0, tv / 50000000000.0)
+        scored.append((score, sym))
+
+    scored.sort(reverse=True)
 
     out: List[str] = []
-    seen = set()
-    src_map: Dict[str, str] = {}
+    for _, sym in scored:
+        out.append(sym)
+        if len(out) >= want_n:
+            break
 
-    preferred: List[Tuple[float, str]] = []
-    backup: List[Tuple[float, str]] = []
-    meta: List[str] = []
-    drop_low_price = 0
+    if not out:
+        fb = _fallback_symbols()[:want_n]
+        _LAST_BUILD_META = f"all_filtered drop={dropped} -> fallback"
+        _LAST_SOURCE_MAP = {sym: "fallback" for sym in fb}
+        return fb
 
-    # 1) 거래량 상위(legacy-style)로 우선 30개를 채운다.
-    vol_first = _supplement_from_volume_rank(
-        want_n, seen, min_price, min_tv, block_rise, meta,
-        max_price, min_chg, max_chg, min_strength, max_strength,
+    _LAST_BUILD_META = (
+        f"simple_rest pool={len(raw_by_sym)} quote={len(by_sym_q)} selected={len(out)} "
+        f"drop_price={dropped['price']} drop_chg={dropped['chg']} "
+        f"drop_tv={dropped['tv']} drop_spread={dropped['spread']} drop_score={dropped['score']}"
     )
-    out.extend(vol_first)
-    for sym in vol_first:
-        src_map[sym] = "volume_rank"
+    _LAST_SOURCE_MAP = {sym: src_map.get(sym, "rest") for sym in out}
+    return out
 
-    if len(out) >= want_n:
-        meta.append("primary=volume_rank")
-        _LAST_BUILD_META = " | ".join(meta[-24:])
-        _LAST_SOURCE_MAP = src_map
-        return out[:want_n]
 
-    meta.append(f"volume_rank_short={len(out)}/{want_n}")
+def get_last_build_meta() -> str:
+    return _LAST_BUILD_META
 
-    # 2) 부족분은 기존 rank 소스에서 보충
-    for m in markets:
-        for sc in sort_codes:
-            rows, dbg = fetch_rank(m, sc)
-            meta.extend(dbg)
-            for it in rows:
-                sym = _parse_sym(it)
-                if not sym or sym in seen:
-                    continue
 
-                r = _parse_float(it, "prdy_ctrt", 0.0)
-                tv = _parse_float(it, "acml_tr_pbmn", 0.0)
-                px = _parse_price(it)
-                score = tv + (r * 1e7)
-
-                if min_price > 0 and px > 0 and px <= min_price:
-                    drop_low_price += 1
-                    continue
-                if not _passes_quality(it, min_price, max_price, min_chg, max_chg, min_strength, max_strength):
-                    continue
-
-                if r < block_rise and (tv <= 0 or tv >= min_tv):
-                    preferred.append((score, sym))
-                else:
-                    backup.append((score, sym))
-
-    for src_name, src in (("rank_pref", sorted(preferred, reverse=True)), ("rank_backup", sorted(backup, reverse=True))):
-        for _, sym in src:
-            if sym in seen:
-                continue
-            seen.add(sym)
-            out.append(sym)
-            src_map[sym] = src_name
-            if len(out) >= want_n:
-                meta.append(f"rank_drop_low_price={drop_low_price}")
-                _LAST_BUILD_META = " | ".join(meta[-24:])
-                _LAST_SOURCE_MAP = src_map
-                return out
-
-    if len(out) < want_n:
-        added = _supplement_from_volume_rank(
-            want_n - len(out), seen, min_price, min_tv, block_rise, meta,
-            max_price, min_chg, max_chg, min_strength, max_strength,
-        )
-        out.extend(added)
-        for sym in added:
-            src_map[sym] = "volume_rank"
-
-    if len(out) < want_n:
-        added = _supplement_from_strength(want_n - len(out), seen, min_price, min_tv, block_rise, meta)
-        out.extend(added)
-        for sym in added:
-            src_map[sym] = "strength"
-
-    if len(out) < want_n:
-        added = _supplement_from_conditions(want_n - len(out), seen, min_price, min_tv, block_rise, meta)
-        out.extend(added)
-        for sym in added:
-            src_map[sym] = "condition"
-
-    if out:
-        meta.append(f"rank_drop_low_price={drop_low_price}")
-        _LAST_BUILD_META = " | ".join(meta[-24:])
-        _LAST_SOURCE_MAP = src_map
-        return out
-
-    fb = _fallback_symbols()
-    _LAST_BUILD_META = " | ".join(meta[-24:])
-    _LAST_SOURCE_MAP = {sym: "fallback" for sym in fb[:want_n]}
-    return fb[:want_n]
+def get_last_source_map() -> Dict[str, str]:
+    return dict(_LAST_SOURCE_MAP)

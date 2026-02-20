@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os, json, time, threading
+import os, json, time, threading, csv
 import requests, websocket
 
 APP_KEY = os.getenv("KOREA_INVEST_APP_KEY","")
@@ -23,6 +23,9 @@ def _dated_out_file() -> str:
 OUT_FILE = _dated_out_file()
 CONTROL_FILE = os.getenv("CONTROL_FILE", os.path.join("data", "ws_control.log"))
 WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
+LEDGER_FILE = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
+PREOPEN_TRACK_MIN = int(os.getenv("PREOPEN_TRACK_MIN", "15"))
+PREOPEN_START_HHMM = int(os.getenv("PREOPEN_START_HHMM", "900"))
 
 TR_IDS = [t.strip() for t in os.getenv("TR_IDS", "H0STCNT0,H0STASP0").split(",") if t.strip()]
 POLL_WATCH_SEC = float(os.getenv("WATCH_POLL_SEC", "2.0"))
@@ -71,6 +74,40 @@ def read_watchlist() -> set[str]:
         return set()
 
 
+def _hhmm_now(ts_epoch: float | None = None) -> int:
+    if ts_epoch is None:
+        ts_epoch = time.time()
+    return int(time.strftime("%H%M", time.localtime(ts_epoch)))
+
+
+def _held_symbols_from_ledger() -> set[str]:
+    qty_by_symbol: dict[str, int] = {}
+    try:
+        with open(LEDGER_FILE, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) < 4:
+                    continue
+                action = str(row[1]).strip().upper()
+                symbol = str(row[2]).strip()
+                if not symbol:
+                    continue
+                try:
+                    qty = int(float(row[3]))
+                except Exception:
+                    continue
+                if qty <= 0:
+                    continue
+                prev = qty_by_symbol.get(symbol, 0)
+                if action == "BUY":
+                    qty_by_symbol[symbol] = prev + qty
+                elif action == "SELL":
+                    qty_by_symbol[symbol] = max(0, prev - qty)
+    except Exception:
+        return set()
+    return {sym for sym, qty in qty_by_symbol.items() if qty > 0}
+
+
 class WSCapture:
     def __init__(self):
         self.approval_key = None
@@ -80,6 +117,39 @@ class WSCapture:
         self.reconnect_evt = threading.Event()
         self.subscribed = set()
         self.lock = threading.Lock()
+        self.preopen_day = ""
+        self.preopen_snapshot: set[str] = set()
+        self.last_held_symbols: set[str] = set()
+
+    def _in_preopen_window(self, ts_epoch: float | None = None) -> bool:
+        hhmm = _hhmm_now(ts_epoch)
+        start_h = PREOPEN_START_HHMM // 100
+        start_m = PREOPEN_START_HHMM % 100
+        start_min = start_h * 60 + start_m
+        now_min = (hhmm // 100) * 60 + (hhmm % 100)
+        return start_min <= now_min < (start_min + PREOPEN_TRACK_MIN)
+
+    def _desired_symbols(self) -> set[str]:
+        today = time.strftime("%Y%m%d")
+        current_watchlist = read_watchlist()
+
+        if self.preopen_day != today:
+            self.preopen_day = today
+            self.preopen_snapshot = set()
+
+        if self._in_preopen_window():
+            if not self.preopen_snapshot and current_watchlist:
+                self.preopen_snapshot = set(current_watchlist)
+                _append(CONTROL_FILE, f"{_ts()}\tPREOPEN snapshot n={len(self.preopen_snapshot)}")
+            base = self.preopen_snapshot or current_watchlist
+        else:
+            base = current_watchlist
+
+        held = _held_symbols_from_ledger()
+        if held != self.last_held_symbols:
+            _append(CONTROL_FILE, f"{_ts()}\tHELD merge n={len(held)}")
+            self.last_held_symbols = set(held)
+        return set(base) | held
 
     def start(self):
         _ensure_dir(OUT_FILE)
@@ -89,7 +159,7 @@ class WSCapture:
 
         def on_open(ws):
             _append(CONTROL_FILE, f"{_ts()}\tOPEN {WS_URL}")
-            self._sync_subscriptions(ws, read_watchlist(), force=True)
+            self._sync_subscriptions(ws, self._desired_symbols(), force=True)
 
         def on_message(ws, message):
             s = message if isinstance(message, str) else message.decode("utf-8", "ignore")
@@ -137,7 +207,7 @@ class WSCapture:
         while not self.stop_evt.is_set():
             time.sleep(POLL_WATCH_SEC)
             if self.ws:
-                self._sync_subscriptions(self.ws, read_watchlist())
+                self._sync_subscriptions(self.ws, self._desired_symbols())
 
             dead = (self.ws_thread is not None) and (not self.ws_thread.is_alive())
             if self.reconnect_evt.is_set() or dead:
