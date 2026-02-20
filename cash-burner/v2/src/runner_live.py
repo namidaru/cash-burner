@@ -40,6 +40,10 @@ def run_live(in_file: str, poll: float = 0.2):
                             except Exception as e:
                                 print(time.strftime("%Y-%m-%d %H:%M:%S"), f"[LIVE][WARN] {tr_id} {type(e).__name__}: {e}")
                     else:
+                        try:
+                            eng.on_timer(time.time())
+                        except Exception as e:
+                            print(time.strftime("%Y-%m-%d %H:%M:%S"), f"[LIVE][WARN] timer {type(e).__name__}: {e}")
                         time.sleep(poll)
         except FileNotFoundError:
             time.sleep(1)

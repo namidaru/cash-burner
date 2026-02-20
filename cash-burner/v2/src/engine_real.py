@@ -1,13 +1,14 @@
 # src/engine_real.py
 from __future__ import annotations
 
-import os, time, math
+import os, time, math, resource
 from dataclasses import dataclass
 from collections import defaultdict, deque
 from typing import Dict, Deque, Tuple, Any
 
 from kis_orders import buyable_cash, sellable_qty, order_cash
 from quote_basic import load_cache
+from notifier import DiscordNotifier
 
 
 def _f(x, d=0.0) -> float:
@@ -95,6 +96,32 @@ class EngineReal:
         self._last_diag_ts: Dict[str, float] = {}
 
         self.prev_close_cache = load_cache()
+        self.notifier = DiscordNotifier()
+
+        self.health_check_sec = float(os.getenv("HEALTH_CHECK_SEC", "1800"))
+        self.ws_stale_sec = float(os.getenv("WS_STALE_SEC", "20"))
+        self._last_health_ts = 0.0
+        self._health_signal_hits = 0
+        self._health_order_tries = 0
+        self._health_failures = 0
+        self._lat_sum = 0.0
+        self._lat_cnt = 0
+        self._lat_max = 0.0
+
+        self.day_key = ""
+        self.day_started = False
+        self.day_closed = False
+        self.day_buy_count = 0
+        self.day_sell_count = 0
+        self.day_win_count = 0
+        self.day_loss_count = 0
+        self.day_realized_pnl = 0.0
+        self.day_cum_pnl = 0.0
+        self.day_peak_pnl = 0.0
+        self.day_mdd = 0.0
+        self.day_best = None
+        self.day_worst = None
+        self.ws_last_event_ts = 0.0
 
         self.book: Dict[str, Dict[str, str]] = {}
         self.book_ts: Dict[str, float] = {}
@@ -171,11 +198,15 @@ class EngineReal:
             )
 
     def _safe_order(self, side: str, sym: str, qty: int, ts_epoch: float, price: float, reason: str):
+        self._health_order_tries += 1
         try:
             j = order_cash(side, sym, qty, ord_dvsn="01", ord_unpr="0")
             self._log(ts_epoch, side, sym, qty, price, reason, j.get("rt_cd", ""), j.get("msg1", ""))
+            if j.get("rt_cd") != "0":
+                self._health_failures += 1
             return j
         except Exception as e:
+            self._health_failures += 1
             self._log(ts_epoch, side, sym, qty, price, reason, "EX", f"order_err:{type(e).__name__}:{e}")
             return {"rt_cd": "EX", "msg1": str(e)}
 
@@ -190,6 +221,9 @@ class EngineReal:
         self.ticks.pop(sym, None)
 
     def on_orderbook(self, row: Dict[str, str], ts_epoch: float):
+        self._ensure_day_roll(ts_epoch)
+        self.ws_last_event_ts = ts_epoch
+        self._event_latency_update(ts_epoch)
         sym = row.get("MKSC_SHRN_ISCD", "")
         if sym:
             self.book[sym] = row
@@ -210,6 +244,185 @@ class EngineReal:
             return 0.0
         return pc * (1.0 + 0.30 * self.limitup_gap_take_pct)
 
+
+    def _entry_score(self, ret: float, tick_count: int, trv: float, imb: float, spread: float, max_spread_pct: float) -> float:
+        spread_room = max(0.0, max_spread_pct - spread)
+        spread_component = spread_room * 35.0
+        tick_component = min(tick_count, 20) * 2.0
+        trv_component = min(trv / 10000000.0, 60.0)
+        imb_component = max(0.0, imb - 0.5) * 120.0
+        ret_component = ret * 45.0
+        return ret_component + tick_component + trv_component + imb_component + spread_component
+
+    def _notify_buy(
+        self,
+        sym: str,
+        qty: int,
+        price: float,
+        ret: float,
+        tick_count: int,
+        trv: float,
+        imb: float,
+        spread: float,
+        dayrise: float,
+        score: float,
+        ts_epoch: float,
+    ):
+        kst = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_epoch))
+        self.notifier.send(
+            title=f"✅ 매수 체결 {sym}",
+            color=0x2ECC71,
+            lines=[
+                f"시간: {kst}",
+                f"수량/단가: {qty}주 @ {price:,.0f}",
+                f"진입 종합점수: {score:.1f}",
+                f"근거: ret={ret:.3f}% | ticks={tick_count} | trv={trv:,.0f}",
+                f"호가: imb={imb:.3f} | spread={spread:.3f}%",
+                f"당일등락: {dayrise:.3f}%",
+            ],
+        )
+
+    def _notify_sell(self, sym: str, qty: int, price: float, reason: str, detail: str, p: Position, ts_epoch: float):
+        pnl_pct = (price / p.entry_price - 1.0) * 100.0 if p.entry_price > 0 else 0.0
+        pnl_amt = (price - p.entry_price) * qty
+        self.day_sell_count += 1
+        self.day_realized_pnl += pnl_amt
+        self.day_cum_pnl += pnl_amt
+        self.day_peak_pnl = max(self.day_peak_pnl, self.day_cum_pnl)
+        self.day_mdd = max(self.day_mdd, self.day_peak_pnl - self.day_cum_pnl)
+        if pnl_amt >= 0:
+            self.day_win_count += 1
+        else:
+            self.day_loss_count += 1
+        if (self.day_best is None) or (pnl_amt > self.day_best[1]):
+            self.day_best = (sym, pnl_amt, pnl_pct)
+        if (self.day_worst is None) or (pnl_amt < self.day_worst[1]):
+            self.day_worst = (sym, pnl_amt, pnl_pct)
+        hold_sec = max(0.0, ts_epoch - p.entry_ts)
+        hold_min = hold_sec / 60.0
+        icon = "💰" if pnl_amt >= 0 else "🩸"
+        color = 0x3498DB if pnl_amt >= 0 else 0xE74C3C
+        kst = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_epoch))
+        self.notifier.send(
+            title=f"{icon} 매도 체결 {sym} ({reason})",
+            color=color,
+            lines=[
+                f"시간: {kst}",
+                f"수량/단가: {qty}주 @ {price:,.0f}",
+                f"진입가: {p.entry_price:,.0f}",
+                f"손익: {pnl_amt:,.0f}원 ({pnl_pct:+.3f}%)",
+                f"보유시간: {hold_min:.1f}분",
+                f"청산사유: {detail}",
+            ],
+        )
+    def _ensure_day_roll(self, ts_epoch: float):
+        dk = time.strftime("%Y%m%d", time.localtime(ts_epoch))
+        if self.day_key == dk:
+            return
+        self.day_key = dk
+        self.day_started = False
+        self.day_closed = False
+        self.day_buy_count = 0
+        self.day_sell_count = 0
+        self.day_win_count = 0
+        self.day_loss_count = 0
+        self.day_realized_pnl = 0.0
+        self.day_cum_pnl = 0.0
+        self.day_peak_pnl = 0.0
+        self.day_mdd = 0.0
+        self.day_best = None
+        self.day_worst = None
+        self._health_signal_hits = 0
+        self._health_order_tries = 0
+        self._health_failures = 0
+        self._lat_sum = 0.0
+        self._lat_cnt = 0
+        self._lat_max = 0.0
+
+    def _event_latency_update(self, ts_epoch: float):
+        lag = max(0.0, time.time() - ts_epoch)
+        self._lat_sum += lag
+        self._lat_cnt += 1
+        if lag > self._lat_max:
+            self._lat_max = lag
+
+    def _memory_mb(self) -> float:
+        try:
+            return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
+        except Exception:
+            return 0.0
+
+    def _day_summary_lines(self) -> list[str]:
+        total = self.day_sell_count
+        win_rate = (self.day_win_count / total * 100.0) if total > 0 else 0.0
+        best = self.day_best or ("-", 0.0, 0.0)
+        worst = self.day_worst or ("-", 0.0, 0.0)
+        return [
+            f"오늘 거래: 매수 {self.day_buy_count} / 매도 {self.day_sell_count}",
+            f"승률: {win_rate:.1f}% ({self.day_win_count}승 {self.day_loss_count}패)",
+            f"실현손익: {self.day_realized_pnl:,.0f}원",
+            f"MDD(실현기준): -{self.day_mdd:,.0f}원",
+            f"최대 수익 1건: {best[0]} {best[1]:,.0f}원 ({best[2]:+.2f}%)",
+            f"최대 손실 1건: {worst[0]} {worst[1]:,.0f}원 ({worst[2]:+.2f}%)",
+        ]
+
+    def _send_day_start_summary(self, ts_epoch: float):
+        if self.day_started:
+            return
+        self.day_started = True
+        kst = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_epoch))
+        self.notifier.send(
+            title="✅ 매매 시작 요약",
+            color=0x2ECC71,
+            lines=[f"시간: {kst}"] + self._day_summary_lines(),
+        )
+
+    def _send_day_close_summary(self, ts_epoch: float):
+        if self.day_closed:
+            return
+        self.day_closed = True
+        kst = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_epoch))
+        self.notifier.send(
+            title="📌 장 마감 요약",
+            color=0xF1C40F,
+            lines=[f"시간: {kst}"] + self._day_summary_lines(),
+        )
+
+    def _send_health_check(self, ts_epoch: float):
+        if self.health_check_sec <= 0:
+            return
+        if (ts_epoch - self._last_health_ts) < self.health_check_sec:
+            return
+        self._last_health_ts = ts_epoch
+        ws_gap = ts_epoch - self.ws_last_event_ts if self.ws_last_event_ts > 0 else 999.0
+        ws_state = "정상" if ws_gap <= self.ws_stale_sec else f"지연({ws_gap:.1f}s)"
+        lat_avg = (self._lat_sum / self._lat_cnt) if self._lat_cnt else 0.0
+        self.notifier.send(
+            title="🩺 정기 헬스체크",
+            color=0x5865F2,
+            lines=[
+                f"WS 상태: {ws_state}",
+                f"최근 이벤트: 신호 {self._health_signal_hits} / 주문 {self._health_order_tries} / 실패 {self._health_failures}",
+                f"지연: avg {lat_avg:.3f}s / max {self._lat_max:.3f}s",
+                f"메모리(RSS): {self._memory_mb():.1f} MB",
+            ],
+        )
+        self._health_signal_hits = 0
+        self._health_order_tries = 0
+        self._health_failures = 0
+        self._lat_sum = 0.0
+        self._lat_cnt = 0
+        self._lat_max = 0.0
+
+    def on_timer(self, ts_epoch: float):
+        self._ensure_day_roll(ts_epoch)
+        hhmm = int(time.strftime("%H%M", time.localtime(ts_epoch)))
+        if 900 <= hhmm <= 910:
+            self._send_day_start_summary(ts_epoch)
+        if hhmm >= 1530:
+            self._send_day_close_summary(ts_epoch)
+        self._send_health_check(ts_epoch)
+
     def _maybe_exit(self, sym: str, price: float, ts_epoch: float):
         p = self.pos.get(sym)
         if not p:
@@ -228,6 +441,7 @@ class EngineReal:
             qty_ord = min(qty_sell, p.qty)
             j = self._safe_order("SELL", sym, qty_ord, ts_epoch, price, f"limitup_gap_take {self.limitup_gap_take_pct}")
             if j.get("rt_cd") == "0":
+                self._notify_sell(sym, qty_ord, price, "LIMITUP", f"limitup_gap_take={self.limitup_gap_take_pct}", p, ts_epoch)
                 self._cleanup_symbol_state(sym)
             return
 
@@ -238,6 +452,7 @@ class EngineReal:
             qty_ord = min(qty_sell, p.qty)
             j = self._safe_order("SELL", sym, qty_ord, ts_epoch, price, f"hard_stop {self.hard_stop_pct}")
             if j.get("rt_cd") == "0":
+                self._notify_sell(sym, qty_ord, price, "HARD_STOP", f"hard_stop={self.hard_stop_pct}%", p, ts_epoch)
                 self._cleanup_symbol_state(sym)
             return
 
@@ -250,10 +465,15 @@ class EngineReal:
                 qty_ord = min(qty_sell, p.qty)
                 j = self._safe_order("SELL", sym, qty_ord, ts_epoch, price, f"trail_stop drop={self.trail_drop_pct}")
                 if j.get("rt_cd") == "0":
+                    self._notify_sell(sym, qty_ord, price, "TRAIL_STOP", f"trail_drop={self.trail_drop_pct}% stop={stop:.2f}", p, ts_epoch)
                     self._cleanup_symbol_state(sym)
                 return
 
     def on_trade(self, row: Dict[str, str], ts_epoch: float):
+        self._ensure_day_roll(ts_epoch)
+        self.ws_last_event_ts = ts_epoch
+        self._event_latency_update(ts_epoch)
+        self._send_health_check(ts_epoch)
         if self._kill_active():
             return
 
@@ -343,6 +563,7 @@ class EngineReal:
         c0 = self.candidate_since.get(sym)
         if c0 is None:
             self.candidate_since[sym] = ts_epoch
+            self._health_signal_hits += 1
             self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", f"confirm_wait {confirm_sec:.1f}s")
             return
         if ts_epoch - c0 < confirm_sec:
@@ -375,11 +596,15 @@ class EngineReal:
             )
             return
 
-        j = self._safe_order("BUY", sym, qty, ts_epoch, price, f"signal ret={ret:.2f} imb={imb:.2f} spr={spread:.2f} dayrise={dayrise:.2f}")
+        score = self._entry_score(ret, tick_count, trv, imb, spread, max_spread_pct)
+        j = self._safe_order("BUY", sym, qty, ts_epoch, price, f"signal ret={ret:.2f} imb={imb:.2f} spr={spread:.2f} dayrise={dayrise:.2f} score={score:.1f}")
         if j.get("rt_cd") == "0":
             self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, trail_armed=False)
             self.last_entry_ts[sym] = ts_epoch
+            self.day_buy_count += 1
+            self._send_day_start_summary(ts_epoch)
             self.candidate_since.pop(sym, None)
-            self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "BUY_TRY", f"qty={qty}")
+            self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "BUY_TRY", f"qty={qty} score={score:.1f}")
+            self._notify_buy(sym, qty, price, ret, tick_count, trv, imb, spread, dayrise, score, ts_epoch)
         else:
             self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "BUY_FAIL", j.get("msg1", ""))
