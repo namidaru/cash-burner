@@ -1,7 +1,7 @@
 # src/engine_real.py
 from __future__ import annotations
 
-import os, time, math, resource
+import os, time, math
 from dataclasses import dataclass
 from collections import defaultdict, deque
 from typing import Dict, Deque, Tuple, Any
@@ -380,10 +380,17 @@ class EngineReal:
             self._lat_max = lag
 
     def _memory_mb(self) -> float:
-        try:
-            return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
-        except Exception:
+        if os.name != "posix":
             return 0.0
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        kb = float(line.split()[1])
+                        return kb / 1024.0
+        except Exception:
+            pass
+        return 0.0
 
     def _day_summary_lines(self) -> list[str]:
         total = self.day_sell_count
