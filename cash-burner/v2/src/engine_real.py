@@ -1,7 +1,7 @@
 # src/engine_real.py
 from __future__ import annotations
 
-import os, time, math
+import os, time, math, sys
 from dataclasses import dataclass
 from collections import defaultdict, deque
 from typing import Dict, Deque, Tuple, Any
@@ -112,6 +112,7 @@ class EngineReal:
         self._lat_sum = 0.0
         self._lat_cnt = 0
         self._lat_max = 0.0
+        self._nobuy_reason_counts: Dict[str, int] = defaultdict(int)
 
         self.day_key = ""
         self.day_started = False
@@ -203,6 +204,11 @@ class EngineReal:
             f.write(
                 f"{ts_epoch:.3f},{sym},{ses},{price:.4f},{ret:.3f},{tick_count},{trv:.0f},{imb:.3f},{spread:.3f},{dayrise:.3f},{status},{detail}\n"
             )
+
+    def _note_no_buy(self, ts_epoch: float, sym: str, price: float, ret: float, tick_count: int, trv: float, imb: float, spread: float, dayrise: float, detail: str):
+        key = (detail or "unknown").split(" | ", 1)[0]
+        self._nobuy_reason_counts[key] += 1
+        self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", detail)
 
     def _safe_order(self, side: str, sym: str, qty: int, ts_epoch: float, price: float, reason: str):
         self._health_order_tries += 1
@@ -371,6 +377,7 @@ class EngineReal:
         self._lat_sum = 0.0
         self._lat_cnt = 0
         self._lat_max = 0.0
+        self._nobuy_reason_counts.clear()
 
     def _event_latency_update(self, ts_epoch: float):
         lag = max(0.0, time.time() - ts_epoch)
@@ -380,8 +387,46 @@ class EngineReal:
             self._lat_max = lag
 
     def _memory_mb(self) -> float:
-        if os.name != "posix":
-            return 0.0
+        # 1) Try psutil first when available (cross-platform, current RSS)
+        try:
+            import psutil  # type: ignore
+
+            return float(psutil.Process(os.getpid()).memory_info().rss) / (1024.0 * 1024.0)
+        except Exception:
+            pass
+
+        # 2) Windows fallback via ctypes (no extra dependency)
+        if os.name == "nt":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                    _fields_ = [
+                        ("cb", wintypes.DWORD),
+                        ("PageFaultCount", wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t),
+                        ("PeakPagefileUsage", ctypes.c_size_t),
+                    ]
+
+                GetCurrentProcess = ctypes.windll.kernel32.GetCurrentProcess
+                GetProcessMemoryInfo = ctypes.windll.psapi.GetProcessMemoryInfo
+
+                counters = PROCESS_MEMORY_COUNTERS()
+                counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+                ok = GetProcessMemoryInfo(GetCurrentProcess(), ctypes.byref(counters), counters.cb)
+                if ok:
+                    return float(counters.WorkingSetSize) / (1024.0 * 1024.0)
+            except Exception:
+                pass
+
+        # 3) Linux /proc fallback
         try:
             with open("/proc/self/status", "r", encoding="utf-8") as f:
                 for line in f:
@@ -390,6 +435,20 @@ class EngineReal:
                         return kb / 1024.0
         except Exception:
             pass
+
+        # 4) Generic POSIX fallback
+        try:
+            import resource
+
+            rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            if sys.platform == "darwin":
+                # macOS reports bytes
+                return rss / (1024.0 * 1024.0)
+            # Linux and many Unix variants report KiB
+            return rss / 1024.0
+        except Exception:
+            pass
+
         return 0.0
 
     def _day_summary_lines(self) -> list[str]:
@@ -441,12 +500,17 @@ class EngineReal:
             ws_gap = 0.0
             ws_state = "초기화중(이벤트 대기)"
         lat_avg = (self._lat_sum / self._lat_cnt) if self._lat_cnt else 0.0
+        top_reason = "-"
+        top_cnt = 0
+        if self._nobuy_reason_counts:
+            top_reason, top_cnt = max(self._nobuy_reason_counts.items(), key=lambda kv: kv[1])
         self.notifier.send(
             title="🩺 정기 헬스체크",
             color=0x5865F2,
             lines=[
                 f"WS 상태: {ws_state}",
                 f"최근 이벤트: 신호 {self._health_signal_hits} / 주문 {self._health_order_tries} / 실패 {self._health_failures}",
+                f"미체결 주원인: {top_reason} ({top_cnt}회)",
                 f"지연: avg {lat_avg:.3f}s / max {self._lat_max:.3f}s",
                 f"메모리(RSS): {self._memory_mb():.1f} MB",
             ],
@@ -457,6 +521,7 @@ class EngineReal:
         self._lat_sum = 0.0
         self._lat_cnt = 0
         self._lat_max = 0.0
+        self._nobuy_reason_counts.clear()
 
     def on_timer(self, ts_epoch: float):
         self._ensure_day_roll(ts_epoch)
@@ -584,7 +649,7 @@ class EngineReal:
         confirm_sec = float(p.get("confirm_sec", self.confirm_sec))
         cooldown_sec = float(p.get("cooldown_sec", self.cooldown_sec))
         if ts_epoch - self.last_entry_ts.get(sym, 0.0) < cooldown_sec:
-            self._log_signal_diag(ts_epoch, sym, price, 0, 0, 0, 0, 0, 0, "NO_BUY", f"cooldown<{cooldown_sec:.0f}s")
+            self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, 0, f"cooldown<{cooldown_sec:.0f}s")
             return
 
         dayrise = self._day_rise_pct(sym, price)
@@ -638,8 +703,8 @@ class EngineReal:
 
         if trigger_fail:
             self.candidate_since.pop(sym, None)
-            self._log_signal_diag(
-                ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", " | ".join(trigger_fail)
+            self._note_no_buy(
+                ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, " | ".join(trigger_fail)
             )
             return
 
@@ -647,7 +712,7 @@ class EngineReal:
         if c0 is None:
             self.candidate_since[sym] = ts_epoch
             self._health_signal_hits += 1
-            self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", f"confirm_wait {confirm_sec:.1f}s")
+            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"confirm_wait {confirm_sec:.1f}s")
             return
         if ts_epoch - c0 < confirm_sec:
             return
@@ -660,8 +725,8 @@ class EngineReal:
         if depth_ratio > 0 and depth_ratio < self.orderbook_ratio_min:
             guard_fail.append(f"depth_ratio {depth_ratio:.2f}<{self.orderbook_ratio_min:.2f}")
         if guard_fail:
-            self._log_signal_diag(
-                ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", " | ".join(guard_fail)
+            self._note_no_buy(
+                ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, " | ".join(guard_fail)
             )
             return
 
@@ -669,20 +734,20 @@ class EngineReal:
             cash = buyable_cash(sym, ord_dvsn="01", price="0")
         except Exception as e:
             self._log(ts_epoch, "BUY", sym, 0, price, "buyable_cash_error", "EX", f"{type(e).__name__}:{e}")
-            self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", "buyable_cash_error")
+            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "buyable_cash_error")
             return
 
         target = cash * self.position_pct
         qty = int(math.floor(target / price))
         if qty <= 0:
-            self._log_signal_diag(
-                ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", f"qty=0 cash={cash:.0f} target={target:.0f}"
+            self._note_no_buy(
+                ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"qty=0 cash={cash:.0f} target={target:.0f}"
             )
             return
 
         score = self._entry_score(ret, tick_count, trv, imb, spread, max_spread_pct)
         if score < self.entry_score_min:
-            self._log_signal_diag(
+            self._note_no_buy(
                 ts_epoch,
                 sym,
                 price,
@@ -692,7 +757,6 @@ class EngineReal:
                 imb,
                 spread,
                 dayrise,
-                "NO_BUY",
                 f"score {score:.1f}<{self.entry_score_min:.1f}",
             )
             return
@@ -718,12 +782,12 @@ class EngineReal:
             cash = buyable_cash(sym, ord_dvsn="01", price="0")
         except Exception as e:
             self._log(ts_epoch, "BUY", sym, 0, price, "buyable_cash_error", "EX", f"{type(e).__name__}:{e}")
-            self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", "buyable_cash_error")
+            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "buyable_cash_error")
             return
         target = cash * self.position_pct
         qty = int(math.floor(target / price))
         if qty <= 0:
-            self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", f"qty=0 cash={cash:.0f} target={target:.0f}")
+            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"qty=0 cash={cash:.0f} target={target:.0f}")
             return
 
         j = self._safe_order("BUY", sym, qty, ts_epoch, price, f"signal ret={ret:.2f} imb={imb:.2f} spr={spread:.2f} dayrise={dayrise:.2f} score={score:.1f}")
