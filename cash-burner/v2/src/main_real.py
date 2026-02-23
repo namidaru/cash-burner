@@ -12,7 +12,19 @@ from ws_sub_manager import write_watchlist
 from ws_capture_live import WSCapture
 from runner_live import run_live
 
-IN_FILE = os.getenv("IN_FILE", os.path.join("data", "ws_dump.log"))
+def _resolve_in_file() -> str:
+    explicit = (os.getenv("IN_FILE", "") or "").strip()
+    if explicit:
+        return explicit
+
+    raw = os.getenv("OUT_FILE", os.path.join("data", "ws_dump.log"))
+    ymd = time.strftime("%Y%m%d")
+    if "{date}" in raw:
+        return raw.replace("{date}", ymd)
+    return raw
+
+
+IN_FILE = _resolve_in_file()
 LIVE_POLL_SEC = float(os.getenv("LIVE_POLL_SEC", "0.2"))
 SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "10"))
 WATCHLIST_DEBUG = os.getenv("WATCHLIST_DEBUG", os.path.join("data", "watchlist_debug.log"))
