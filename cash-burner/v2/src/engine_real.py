@@ -434,8 +434,12 @@ class EngineReal:
         if (ts_epoch - self._last_health_ts) < self.health_check_sec:
             return
         self._last_health_ts = ts_epoch
-        ws_gap = ts_epoch - self.ws_last_event_ts if self.ws_last_event_ts > 0 else 999.0
-        ws_state = "정상" if ws_gap <= self.ws_stale_sec else f"지연({ws_gap:.1f}s)"
+        if self.ws_last_event_ts > 0:
+            ws_gap = max(0.0, ts_epoch - self.ws_last_event_ts)
+            ws_state = "정상" if ws_gap <= self.ws_stale_sec else f"지연({ws_gap:.1f}s)"
+        else:
+            ws_gap = 0.0
+            ws_state = "초기화중(이벤트 대기)"
         lat_avg = (self._lat_sum / self._lat_cnt) if self._lat_cnt else 0.0
         self.notifier.send(
             title="🩺 정기 헬스체크",
