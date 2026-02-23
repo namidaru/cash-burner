@@ -1,4 +1,6 @@
 @echo off
+chcp 65001 >nul
+set PYTHONUTF8=1
 cd /d %~dp0
 set PYTHONPATH=%CD%\src;%PYTHONPATH%
 REM === AUTO (RANKING API v1_국내주식-104) + WS TRACK + REAL ORDER ===
@@ -111,7 +113,8 @@ set PREVCLOSE_CACHE=data\prev_close.json
 
 REM discord alerts
 set DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/1469014857276850290/qvex_AKK19cczgRE7QDu-YoxrMaQu1dQkIy8_vRHJ16o61W4PkipAZ4NfV24Nim2Rk43
-set DISCORD_BOT_NAME=파세경보기
+set DISCORD_BOT_NAME=파쇄기
+set DISCORD_USE_ENV_BOT_NAME=0
 set DISCORD_TIMEOUT_SEC=4
 set HEALTH_CHECK_SEC=1800
 set WS_STALE_SEC=20
