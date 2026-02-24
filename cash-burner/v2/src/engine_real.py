@@ -665,13 +665,10 @@ class EngineReal:
         dq.append((ts_epoch, price, vol))
         while dq and ts_epoch - dq[0][0] > self.tick_history_sec:
             dq.popleft()
-        if len(dq) < self.min_ticks_for_calc:
-            return
 
-        base = dq[0][1]
-        ret = (price - base) / base * 100.0
-        trv = sum(px * vv for _, px, vv in dq)
-        tick_count = len(dq)
+        ret, trv, tick_count = self._window_stats(dq, ts_epoch, float(self.window_sec))
+        if tick_count < self.min_ticks_for_calc:
+            return
 
         ret10, trv10, ticks10 = self._window_stats(dq, ts_epoch, 10.0)
         baseline_start = ts_epoch - (self.burst_baseline_sec + 10.0)
