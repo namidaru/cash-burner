@@ -181,6 +181,9 @@ class EngineReal:
         s = self._session_name(ts_epoch)
         return self.session_cfg.get(s, {})
 
+    def _normalize_pct_input(self, v: float) -> float:
+        return (v / 100.0) if v >= 10.0 else v
+
     def _init_ledger(self):
         d = os.path.dirname(self.ledger_file)
         if d:
@@ -741,7 +744,7 @@ class EngineReal:
         min_tick_count = int(p.get("min_tick_count", self.min_tick_count))
         min_tr_value = float(p.get("min_tr_value", self.min_tr_value))
         max_spread_pct = float(p.get("max_spread_pct", self.max_spread_pct))
-        spike_10s_min_pct = float(p.get("spike_10s_min_pct", self.spike_10s_min_pct))
+        spike_10s_min_pct = self._normalize_pct_input(float(p.get("spike_10s_min_pct", self.spike_10s_min_pct)))
         orderbook_ratio_min = float(p.get("orderbook_ratio_min", self.orderbook_ratio_min))
         confirm_sec = float(p.get("confirm_sec", self.confirm_sec))
         cooldown_sec = float(p.get("cooldown_sec", self.cooldown_sec))
@@ -842,7 +845,7 @@ class EngineReal:
         if vi_std > 0 and vi_gap <= self.vi_guard_pct:
             guard_fail.append(f"vi_guard cur={vi_gap:.2f} min={self.vi_guard_pct:.2f} margin={vi_gap-self.vi_guard_pct:.2f}")
         depth_ratio = self._depth3_ratio(ob if (ob and not ob_stale) else None)
-        if depth_ratio > 0 and depth_ratio < orderbook_ratio_min:
+        if (not ob_stale) and depth_ratio > 0 and depth_ratio < orderbook_ratio_min:
             guard_fail.append(f"depth_ratio cur={depth_ratio:.2f} min={orderbook_ratio_min:.2f} margin={depth_ratio-orderbook_ratio_min:.2f}")
         if guard_fail:
             primary = guard_fail[0]
