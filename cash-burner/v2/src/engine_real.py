@@ -45,32 +45,32 @@ class EngineReal:
         # session presets
         self.session_cfg = {
             "OPEN": {
-                "min_ret_pct": float(os.getenv("OPEN_MIN_RET_PCT", "0.90")),
-                "min_tr_value": float(os.getenv("OPEN_MIN_TR_VALUE", "120000000")),
-                "min_tick_count": int(os.getenv("OPEN_MIN_TICK_COUNT", "16")),
+                "min_ret_pct": float(os.getenv("OPEN_MIN_RET_PCT", "0.35")),
+                "min_tr_value": float(os.getenv("OPEN_MIN_TR_VALUE", "90000000")),
+                "min_tick_count": int(os.getenv("OPEN_MIN_TICK_COUNT", "12")),
                 "min_imb": float(os.getenv("OPEN_MIN_IMB", "0.64")),
-                "max_spread_pct": float(os.getenv("OPEN_MAX_SPREAD_PCT", "0.22")),
-                "confirm_sec": float(os.getenv("OPEN_CONFIRM_SEC", "1.2")),
+                "max_spread_pct": float(os.getenv("OPEN_MAX_SPREAD_PCT", "0.28")),
+                "confirm_sec": float(os.getenv("OPEN_CONFIRM_SEC", "0.9")),
                 "cooldown_sec": float(os.getenv("OPEN_COOLDOWN_SEC", "180")),
                 "vi_like_ret_pct": float(os.getenv("VI_LIKE_RET_PCT_OPEN", "2.5")),
             },
             "MID": {
-                "min_ret_pct": float(os.getenv("MID_MIN_RET_PCT", "0.08")),
+                "min_ret_pct": float(os.getenv("MID_MIN_RET_PCT", "0.10")),
                 "min_tr_value": float(os.getenv("MID_MIN_TR_VALUE", "50000000")),
                 "min_tick_count": int(os.getenv("MID_MIN_TICK_COUNT", "10")),
                 "min_imb": float(os.getenv("MID_MIN_IMB", "0.62")),
                 "max_spread_pct": float(os.getenv("MID_MAX_SPREAD_PCT", "0.25")),
-                "confirm_sec": float(os.getenv("MID_CONFIRM_SEC", "1.0")),
+                "confirm_sec": float(os.getenv("MID_CONFIRM_SEC", "0.9")),
                 "cooldown_sec": float(os.getenv("MID_COOLDOWN_SEC", "120")),
                 "vi_like_ret_pct": float(os.getenv("VI_LIKE_RET_PCT_MID", "2.0")),
             },
             "CLOSE": {
-                "min_ret_pct": float(os.getenv("CLOSE_MIN_RET_PCT", "0.60")),
-                "min_tr_value": float(os.getenv("CLOSE_MIN_TR_VALUE", "80000000")),
-                "min_tick_count": int(os.getenv("CLOSE_MIN_TICK_COUNT", "10")),
+                "min_ret_pct": float(os.getenv("CLOSE_MIN_RET_PCT", "0.12")),
+                "min_tr_value": float(os.getenv("CLOSE_MIN_TR_VALUE", "40000000")),
+                "min_tick_count": int(os.getenv("CLOSE_MIN_TICK_COUNT", "8")),
                 "min_imb": float(os.getenv("CLOSE_MIN_IMB", "0.60")),
-                "max_spread_pct": float(os.getenv("CLOSE_MAX_SPREAD_PCT", "0.20")),
-                "confirm_sec": float(os.getenv("CLOSE_CONFIRM_SEC", "1.2")),
+                "max_spread_pct": float(os.getenv("CLOSE_MAX_SPREAD_PCT", "0.28")),
+                "confirm_sec": float(os.getenv("CLOSE_CONFIRM_SEC", "0.9")),
                 "cooldown_sec": float(os.getenv("CLOSE_COOLDOWN_SEC", "180")),
                 "vi_like_ret_pct": float(os.getenv("VI_LIKE_RET_PCT_CLOSE", "1.6")),
             },
@@ -82,9 +82,9 @@ class EngineReal:
         self.position_pct = float(os.getenv("POSITION_PCT", "0.30"))
         self.entry_score_min = float(os.getenv("ENTRY_SCORE_MIN", "80"))
         self.entry_pick_window_sec = float(os.getenv("ENTRY_PICK_WINDOW_SEC", "1.2"))
-        self.open_entry_pick_window_sec = float(os.getenv("OPEN_ENTRY_PICK_WINDOW_SEC", str(self.entry_pick_window_sec)))
-        self.mid_entry_pick_window_sec = float(os.getenv("MID_ENTRY_PICK_WINDOW_SEC", str(self.entry_pick_window_sec)))
-        self.close_entry_pick_window_sec = float(os.getenv("CLOSE_ENTRY_PICK_WINDOW_SEC", str(self.entry_pick_window_sec)))
+        self.open_entry_pick_window_sec = float(os.getenv("OPEN_ENTRY_PICK_WINDOW_SEC", "0.6"))
+        self.mid_entry_pick_window_sec = float(os.getenv("MID_ENTRY_PICK_WINDOW_SEC", "0.9"))
+        self.close_entry_pick_window_sec = float(os.getenv("CLOSE_ENTRY_PICK_WINDOW_SEC", "0.8"))
         spike_raw = float(os.getenv("SPIKE_10S_MIN_PCT", "0.30"))
         self.spike_10s_min_pct = (spike_raw / 100.0) if spike_raw >= 10.0 else spike_raw
         self.burst_ratio_min = float(os.getenv("BURST_RATIO_MIN", "1.25"))
