@@ -45,7 +45,7 @@ class EngineReal:
         # session presets
         self.session_cfg = {
             "OPEN": {
-                "min_ret_pct": float(os.getenv("OPEN_MIN_RET_PCT", "0.35")),
+                "min_ret_pct": float(os.getenv("OPEN_MIN_RET_PCT", "0.28")),
                 "min_tr_value": float(os.getenv("OPEN_MIN_TR_VALUE", "90000000")),
                 "min_tick_count": int(os.getenv("OPEN_MIN_TICK_COUNT", "12")),
                 "min_imb": float(os.getenv("OPEN_MIN_IMB", "0.64")),
@@ -56,7 +56,7 @@ class EngineReal:
             },
             "MID": {
                 "min_ret_pct": float(os.getenv("MID_MIN_RET_PCT", "0.10")),
-                "min_tr_value": float(os.getenv("MID_MIN_TR_VALUE", "50000000")),
+                "min_tr_value": float(os.getenv("MID_MIN_TR_VALUE", "30000000")),
                 "min_tick_count": int(os.getenv("MID_MIN_TICK_COUNT", "10")),
                 "min_imb": float(os.getenv("MID_MIN_IMB", "0.62")),
                 "max_spread_pct": float(os.getenv("MID_MAX_SPREAD_PCT", "0.25")),
@@ -69,7 +69,7 @@ class EngineReal:
                 "min_tr_value": float(os.getenv("CLOSE_MIN_TR_VALUE", "40000000")),
                 "min_tick_count": int(os.getenv("CLOSE_MIN_TICK_COUNT", "8")),
                 "min_imb": float(os.getenv("CLOSE_MIN_IMB", "0.60")),
-                "max_spread_pct": float(os.getenv("CLOSE_MAX_SPREAD_PCT", "0.28")),
+                "max_spread_pct": float(os.getenv("CLOSE_MAX_SPREAD_PCT", "0.24")),
                 "confirm_sec": float(os.getenv("CLOSE_CONFIRM_SEC", "0.9")),
                 "cooldown_sec": float(os.getenv("CLOSE_COOLDOWN_SEC", "180")),
                 "vi_like_ret_pct": float(os.getenv("VI_LIKE_RET_PCT_CLOSE", "1.6")),
@@ -89,7 +89,7 @@ class EngineReal:
         self.spike_10s_min_pct = (spike_raw / 100.0) if spike_raw >= 10.0 else spike_raw
         self.burst_ratio_min = float(os.getenv("BURST_RATIO_MIN", "1.25"))
         self.burst_baseline_sec = float(os.getenv("BURST_BASELINE_SEC", "120"))
-        self.burst_min_ticks = int(os.getenv("BURST_MIN_TICKS", "6"))
+        self.burst_min_ticks = int(os.getenv("BURST_MIN_TICKS", "10"))
         self.burst_require_baseline = os.getenv("BURST_REQUIRE_BASELINE", "1") == "1"
         self.baseline_ready_bin_ratio = float(os.getenv("BASELINE_READY_BIN_RATIO", "0.5"))
         # Legacy knob kept for backward compatibility; burst baseline now uses bucket history.
