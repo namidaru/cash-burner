@@ -82,8 +82,11 @@ class EngineReal:
         self.position_pct = float(os.getenv("POSITION_PCT", "0.30"))
         self.entry_score_min = float(os.getenv("ENTRY_SCORE_MIN", "80"))
         self.entry_pick_window_sec = float(os.getenv("ENTRY_PICK_WINDOW_SEC", "1.2"))
-        self.spike_10s_min_pct = float(os.getenv("SPIKE_10S_MIN_PCT", "1.0"))
-        self.burst_ratio_min = float(os.getenv("BURST_RATIO_MIN", "2.2"))
+        self.spike_10s_min_pct = float(os.getenv("SPIKE_10S_MIN_PCT", "0.8"))
+        self.burst_ratio_min = float(os.getenv("BURST_RATIO_MIN", "1.4"))
+        self.burst_baseline_sec = float(os.getenv("BURST_BASELINE_SEC", "120"))
+        self.burst_min_ticks = int(os.getenv("BURST_MIN_TICKS", "6"))
+        self.tick_history_sec = float(os.getenv("TICK_HISTORY_SEC", str(max(self.window_sec, self.burst_baseline_sec + 20.0))))
         self.orderbook_ratio_min = float(os.getenv("ORDERBOOK_RATIO_MIN", "1.2"))
 
         self.hard_stop_pct = float(os.getenv("HARD_STOP_PCT", "3.5"))
@@ -258,9 +261,8 @@ class EngineReal:
         return pc * (1.0 + 0.30 * self.limitup_gap_take_pct)
 
 
-    def _window_stats(self, dq: Deque[Tuple[float, float, float]], ts_epoch: float, sec: float) -> tuple[float, float, int]:
-        st = ts_epoch - sec
-        arr = [(t, p, v) for (t, p, v) in dq if t >= st]
+    def _window_stats_between(self, dq: Deque[Tuple[float, float, float]], start_ts: float, end_ts: float) -> tuple[float, float, int]:
+        arr = [(t, p, v) for (t, p, v) in dq if (start_ts <= t <= end_ts)]
         if len(arr) < 2:
             return 0.0, 0.0, len(arr)
         base = arr[0][1]
@@ -268,6 +270,10 @@ class EngineReal:
         ret = ((last - base) / base * 100.0) if base > 0 else 0.0
         trv = sum(p * v for _, p, v in arr)
         return ret, trv, len(arr)
+
+    def _window_stats(self, dq: Deque[Tuple[float, float, float]], ts_epoch: float, sec: float) -> tuple[float, float, int]:
+        st = ts_epoch - sec
+        return self._window_stats_between(dq, st, ts_epoch)
 
     def _depth3_ratio(self, ob: Dict[str, str] | None) -> float:
         if not ob:
@@ -645,6 +651,7 @@ class EngineReal:
         p = self._params(ts_epoch)
         min_ret_pct = float(p.get("min_ret_pct", self.min_ret_pct))
         min_tick_count = int(p.get("min_tick_count", self.min_tick_count))
+        min_tr_value = float(p.get("min_tr_value", self.min_tr_value))
         max_spread_pct = float(p.get("max_spread_pct", self.max_spread_pct))
         confirm_sec = float(p.get("confirm_sec", self.confirm_sec))
         cooldown_sec = float(p.get("cooldown_sec", self.cooldown_sec))
@@ -656,7 +663,7 @@ class EngineReal:
 
         dq = self.ticks[sym]
         dq.append((ts_epoch, price, vol))
-        while dq and ts_epoch - dq[0][0] > self.window_sec:
+        while dq and ts_epoch - dq[0][0] > self.tick_history_sec:
             dq.popleft()
         if len(dq) < self.min_ticks_for_calc:
             return
@@ -667,7 +674,12 @@ class EngineReal:
         tick_count = len(dq)
 
         ret10, trv10, ticks10 = self._window_stats(dq, ts_epoch, 10.0)
-        _, trv_prev, ticks_prev = self._window_stats(dq, ts_epoch - 10.0, 10.0)
+        baseline_start = ts_epoch - (self.burst_baseline_sec + 10.0)
+        baseline_end = ts_epoch - 10.0
+        _, trv_hist, ticks_hist = self._window_stats_between(dq, baseline_start, baseline_end)
+        baseline_scale = (self.burst_baseline_sec / 10.0) if self.burst_baseline_sec > 0 else 0.0
+        trv_prev = (trv_hist / baseline_scale) if baseline_scale > 0 else 0.0
+        ticks_prev = (ticks_hist / baseline_scale) if baseline_scale > 0 else 0.0
 
         ob = self.book.get(sym)
         ob_age = ts_epoch - self.book_ts.get(sym, 0.0)
@@ -692,14 +704,17 @@ class EngineReal:
             trigger_fail.append(f"ret {ret:.2f}/{min_ret_pct:.2f}")
         if tick_count < min_tick_count:
             trigger_fail.append(f"ticks {tick_count}/{min_tick_count}")
+        if trv < min_tr_value:
+            trigger_fail.append(f"trv {trv:.0f}/{min_tr_value:.0f}")
         if spread > max_spread_pct:
             trigger_fail.append(f"spread {spread:.2f}>{max_spread_pct:.2f}")
         if ret10 < self.spike_10s_min_pct:
             trigger_fail.append(f"ret10 {ret10:.2f}/{self.spike_10s_min_pct:.2f}")
-        if trv_prev > 0 and trv10 < trv_prev * self.burst_ratio_min:
-            trigger_fail.append(f"trv_burst {trv10:.0f}/{trv_prev*self.burst_ratio_min:.0f}")
-        if ticks_prev > 0 and ticks10 < int(ticks_prev * self.burst_ratio_min):
-            trigger_fail.append(f"tick_burst {ticks10}/{int(ticks_prev*self.burst_ratio_min)}")
+        if ticks_hist >= self.burst_min_ticks:
+            if trv_prev > 0 and trv10 < trv_prev * self.burst_ratio_min:
+                trigger_fail.append(f"trv_burst {trv10:.0f}/{trv_prev*self.burst_ratio_min:.0f}")
+            if ticks_prev > 0 and ticks10 < math.ceil(ticks_prev * self.burst_ratio_min):
+                trigger_fail.append(f"tick_burst {ticks10}/{math.ceil(ticks_prev*self.burst_ratio_min)}")
 
         if trigger_fail:
             self.candidate_since.pop(sym, None)
