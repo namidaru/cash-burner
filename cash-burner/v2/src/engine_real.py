@@ -35,7 +35,7 @@ class EngineReal:
 
         # fallback/base
         self.min_ret_pct = float(os.getenv("MIN_RET_PCT", "0.6"))
-        self.min_tick_count = int(os.getenv("MIN_TICK_COUNT", "10"))
+        self.min_tick_count = int(os.getenv("MIN_TICK_COUNT", "8"))
         self.min_tr_value = float(os.getenv("MIN_TR_VALUE", "0"))
         self.min_imb = float(os.getenv("MIN_IMB", "0.60"))
         self.max_spread_pct = float(os.getenv("MAX_SPREAD_PCT", "0.30"))
@@ -45,34 +45,40 @@ class EngineReal:
         # session presets
         self.session_cfg = {
             "OPEN": {
-                "min_ret_pct": float(os.getenv("OPEN_MIN_RET_PCT", "0.90")),
-                "min_tr_value": float(os.getenv("OPEN_MIN_TR_VALUE", "120000000")),
-                "min_tick_count": int(os.getenv("OPEN_MIN_TICK_COUNT", "16")),
+                "min_ret_pct": float(os.getenv("OPEN_MIN_RET_PCT", "0.28")),
+                "min_tr_value": float(os.getenv("OPEN_MIN_TR_VALUE", "90000000")),
+                "min_tick_count": int(os.getenv("OPEN_MIN_TICK_COUNT", "12")),
                 "min_imb": float(os.getenv("OPEN_MIN_IMB", "0.64")),
-                "max_spread_pct": float(os.getenv("OPEN_MAX_SPREAD_PCT", "0.22")),
-                "confirm_sec": float(os.getenv("OPEN_CONFIRM_SEC", "1.2")),
+                "max_spread_pct": float(os.getenv("OPEN_MAX_SPREAD_PCT", "0.28")),
+                "confirm_sec": float(os.getenv("OPEN_CONFIRM_SEC", "0.9")),
                 "cooldown_sec": float(os.getenv("OPEN_COOLDOWN_SEC", "180")),
                 "vi_like_ret_pct": float(os.getenv("VI_LIKE_RET_PCT_OPEN", "2.5")),
+                "spike_10s_min_pct": float(os.getenv("OPEN_SPIKE_10S_MIN_PCT", "0.25")),
+                "orderbook_ratio_min": float(os.getenv("OPEN_ORDERBOOK_RATIO_MIN", "1.10")),
             },
             "MID": {
-                "min_ret_pct": float(os.getenv("MID_MIN_RET_PCT", "0.70")),
-                "min_tr_value": float(os.getenv("MID_MIN_TR_VALUE", "50000000")),
-                "min_tick_count": int(os.getenv("MID_MIN_TICK_COUNT", "12")),
+                "min_ret_pct": float(os.getenv("MID_MIN_RET_PCT", "0.10")),
+                "min_tr_value": float(os.getenv("MID_MIN_TR_VALUE", "30000000")),
+                "min_tick_count": int(os.getenv("MID_MIN_TICK_COUNT", "10")),
                 "min_imb": float(os.getenv("MID_MIN_IMB", "0.62")),
                 "max_spread_pct": float(os.getenv("MID_MAX_SPREAD_PCT", "0.25")),
-                "confirm_sec": float(os.getenv("MID_CONFIRM_SEC", "1.0")),
+                "confirm_sec": float(os.getenv("MID_CONFIRM_SEC", "0.9")),
                 "cooldown_sec": float(os.getenv("MID_COOLDOWN_SEC", "120")),
                 "vi_like_ret_pct": float(os.getenv("VI_LIKE_RET_PCT_MID", "2.0")),
+                "spike_10s_min_pct": float(os.getenv("MID_SPIKE_10S_MIN_PCT", "0.30")),
+                "orderbook_ratio_min": float(os.getenv("MID_ORDERBOOK_RATIO_MIN", "1.15")),
             },
             "CLOSE": {
-                "min_ret_pct": float(os.getenv("CLOSE_MIN_RET_PCT", "0.60")),
-                "min_tr_value": float(os.getenv("CLOSE_MIN_TR_VALUE", "80000000")),
-                "min_tick_count": int(os.getenv("CLOSE_MIN_TICK_COUNT", "10")),
+                "min_ret_pct": float(os.getenv("CLOSE_MIN_RET_PCT", "0.12")),
+                "min_tr_value": float(os.getenv("CLOSE_MIN_TR_VALUE", "40000000")),
+                "min_tick_count": int(os.getenv("CLOSE_MIN_TICK_COUNT", "8")),
                 "min_imb": float(os.getenv("CLOSE_MIN_IMB", "0.60")),
-                "max_spread_pct": float(os.getenv("CLOSE_MAX_SPREAD_PCT", "0.20")),
-                "confirm_sec": float(os.getenv("CLOSE_CONFIRM_SEC", "1.2")),
+                "max_spread_pct": float(os.getenv("CLOSE_MAX_SPREAD_PCT", "0.24")),
+                "confirm_sec": float(os.getenv("CLOSE_CONFIRM_SEC", "0.9")),
                 "cooldown_sec": float(os.getenv("CLOSE_COOLDOWN_SEC", "180")),
                 "vi_like_ret_pct": float(os.getenv("VI_LIKE_RET_PCT_CLOSE", "1.6")),
+                "spike_10s_min_pct": float(os.getenv("CLOSE_SPIKE_10S_MIN_PCT", "0.25")),
+                "orderbook_ratio_min": float(os.getenv("CLOSE_ORDERBOOK_RATIO_MIN", "1.05")),
             },
         }
 
@@ -82,25 +88,27 @@ class EngineReal:
         self.position_pct = float(os.getenv("POSITION_PCT", "0.30"))
         self.entry_score_min = float(os.getenv("ENTRY_SCORE_MIN", "80"))
         self.entry_pick_window_sec = float(os.getenv("ENTRY_PICK_WINDOW_SEC", "1.2"))
-        self.open_entry_pick_window_sec = float(os.getenv("OPEN_ENTRY_PICK_WINDOW_SEC", str(self.entry_pick_window_sec)))
-        self.mid_entry_pick_window_sec = float(os.getenv("MID_ENTRY_PICK_WINDOW_SEC", str(self.entry_pick_window_sec)))
-        self.close_entry_pick_window_sec = float(os.getenv("CLOSE_ENTRY_PICK_WINDOW_SEC", str(self.entry_pick_window_sec)))
-        spike_raw = float(os.getenv("SPIKE_10S_MIN_PCT", "0.8"))
+        self.open_entry_pick_window_sec = float(os.getenv("OPEN_ENTRY_PICK_WINDOW_SEC", "0.6"))
+        self.mid_entry_pick_window_sec = float(os.getenv("MID_ENTRY_PICK_WINDOW_SEC", "0.9"))
+        self.close_entry_pick_window_sec = float(os.getenv("CLOSE_ENTRY_PICK_WINDOW_SEC", "0.8"))
+        spike_raw = float(os.getenv("SPIKE_10S_MIN_PCT", "0.30"))
         self.spike_10s_min_pct = (spike_raw / 100.0) if spike_raw >= 10.0 else spike_raw
-        self.burst_ratio_min = float(os.getenv("BURST_RATIO_MIN", "1.4"))
+        self.burst_ratio_min = float(os.getenv("BURST_RATIO_MIN", "1.25"))
         self.burst_baseline_sec = float(os.getenv("BURST_BASELINE_SEC", "120"))
-        self.burst_min_ticks = int(os.getenv("BURST_MIN_TICKS", "6"))
+        self.burst_min_ticks = int(os.getenv("BURST_MIN_TICKS", "10"))
         self.burst_require_baseline = os.getenv("BURST_REQUIRE_BASELINE", "1") == "1"
         self.baseline_ready_bin_ratio = float(os.getenv("BASELINE_READY_BIN_RATIO", "0.5"))
         # Legacy knob kept for backward compatibility; burst baseline now uses bucket history.
         self.tick_history_sec = float(os.getenv("TICK_HISTORY_SEC", str(max(self.window_sec, self.burst_baseline_sec + 20.0))))
         self.bucket_sec = float(os.getenv("BURST_BUCKET_SEC", "10.0"))
         self.bucket_history_sec = float(os.getenv("BURST_BUCKET_HISTORY_SEC", str(self.burst_baseline_sec + 30.0)))
+        self.flow_bucket_maxlen = int(os.getenv("FLOW_BUCKET_MAXLEN", str(max(64, math.ceil(self.bucket_history_sec / max(0.1, self.bucket_sec)) + 8))))
         self.first_trade_reset_gap_sec = float(os.getenv("FIRST_TRADE_RESET_GAP_SEC", str(self.burst_baseline_sec + self.bucket_sec)))
         self.candidate_reset_grace_sec = float(os.getenv("CANDIDATE_RESET_GRACE_SEC", "0.6"))
-        self.orderbook_ratio_min = float(os.getenv("ORDERBOOK_RATIO_MIN", "1.2"))
+        self.orderbook_ratio_min = float(os.getenv("ORDERBOOK_RATIO_MIN", "1.1"))
         self.orderbook_stale_mode = os.getenv("ORDERBOOK_STALE_MODE", "guard").strip().lower()
         self.cum_vol_first_tick_mode = os.getenv("CUM_VOL_FIRST_TICK_MODE", "zero").strip().lower()
+        self.max_first_cum_vol = float(os.getenv("MAX_FIRST_CUM_VOL", "0"))
 
         self.hard_stop_pct = float(os.getenv("HARD_STOP_PCT", "3.5"))
         self.trail_arm_pct = float(os.getenv("TRAIL_ARM_PCT", "4.0"))
@@ -148,7 +156,7 @@ class EngineReal:
         self.book: Dict[str, Dict[str, str]] = {}
         self.book_ts: Dict[str, float] = {}
         self.ticks: Dict[str, Deque[Tuple[float, float, float]]] = defaultdict(lambda: deque(maxlen=5000))
-        self.flow_buckets: Dict[str, Deque[Tuple[float, float, int]]] = defaultdict(lambda: deque(maxlen=256))
+        self.flow_buckets: Dict[str, Deque[Tuple[float, float, int]]] = defaultdict(lambda: deque(maxlen=self.flow_bucket_maxlen))
         self.last_trade_vol: Dict[str, float] = {}
         self.symbol_first_trade_ts: Dict[str, float] = {}
         self.pos: Dict[str, Position] = {}
@@ -172,6 +180,9 @@ class EngineReal:
     def _params(self, ts_epoch: float) -> Dict[str, Any]:
         s = self._session_name(ts_epoch)
         return self.session_cfg.get(s, {})
+
+    def _normalize_pct_input(self, v: float) -> float:
+        return (v / 100.0) if v >= 10.0 else v
 
     def _init_ledger(self):
         d = os.path.dirname(self.ledger_file)
@@ -310,6 +321,8 @@ class EngineReal:
             prev = self.last_trade_vol.get(sym)
             if prev is None:
                 use_vol = vol if self.cum_vol_first_tick_mode == "raw" else 0.0
+                if self.max_first_cum_vol > 0:
+                    use_vol = min(use_vol, self.max_first_cum_vol)
             else:
                 use_vol = max(0.0, vol - prev)
             self.last_trade_vol[sym] = vol
@@ -731,6 +744,8 @@ class EngineReal:
         min_tick_count = int(p.get("min_tick_count", self.min_tick_count))
         min_tr_value = float(p.get("min_tr_value", self.min_tr_value))
         max_spread_pct = float(p.get("max_spread_pct", self.max_spread_pct))
+        spike_10s_min_pct = self._normalize_pct_input(float(p.get("spike_10s_min_pct", self.spike_10s_min_pct)))
+        orderbook_ratio_min = float(p.get("orderbook_ratio_min", self.orderbook_ratio_min))
         confirm_sec = float(p.get("confirm_sec", self.confirm_sec))
         cooldown_sec = float(p.get("cooldown_sec", self.cooldown_sec))
         if ts_epoch - self.last_entry_ts.get(sym, 0.0) < cooldown_sec:
@@ -741,11 +756,11 @@ class EngineReal:
 
         dq = self.ticks[sym]
         dq.append((ts_epoch, price, vol))
-        last_bucket_ts = self.flow_buckets[sym][-1][0] if self.flow_buckets[sym] else 0.0
-        first_ts = self.symbol_first_trade_ts.get(sym)
-        if (first_ts is None) or (last_bucket_ts > 0 and (ts_epoch - last_bucket_ts) > self.first_trade_reset_gap_sec):
-            self.symbol_first_trade_ts[sym] = ts_epoch
+        prev_bucket_ts = self.flow_buckets[sym][-1][0] if self.flow_buckets[sym] else 0.0
         self._update_flow_bucket(sym, ts_epoch, price, vol, is_cum_vol)
+        first_ts = self.symbol_first_trade_ts.get(sym)
+        if (first_ts is None) or (prev_bucket_ts > 0 and (ts_epoch - prev_bucket_ts) > self.first_trade_reset_gap_sec):
+            self.symbol_first_trade_ts[sym] = ts_epoch
         while dq and ts_epoch - dq[0][0] > self.window_sec:
             dq.popleft()
 
@@ -793,8 +808,8 @@ class EngineReal:
             trigger_fail.append(f"trv cur={trv:.0f} thr={min_tr_value:.0f} margin={trv-min_tr_value:.0f}")
         if spread > max_spread_pct and not (ob_stale and self.orderbook_stale_mode == "guard"):
             trigger_fail.append(f"spread cur={spread:.2f} max={max_spread_pct:.2f} margin={max_spread_pct-spread:.2f}")
-        if ret10 < self.spike_10s_min_pct:
-            trigger_fail.append(f"ret10 cur={ret10:.2f} thr={self.spike_10s_min_pct:.2f} margin={ret10-self.spike_10s_min_pct:.2f}")
+        if ret10 < spike_10s_min_pct:
+            trigger_fail.append(f"ret10 cur={ret10:.2f} thr={spike_10s_min_pct:.2f} margin={ret10-spike_10s_min_pct:.2f}")
         min_hist_bins = max(1, math.ceil(baseline_scale * max(0.1, self.baseline_ready_bin_ratio)))
         baseline_ready = (hist_bins >= min_hist_bins) and (ticks_hist >= self.burst_min_ticks)
         baseline_guard_active = self.burst_require_baseline and ((ts_epoch - self.symbol_first_trade_ts.get(sym, ts_epoch)) >= self.burst_baseline_sec)
@@ -830,8 +845,8 @@ class EngineReal:
         if vi_std > 0 and vi_gap <= self.vi_guard_pct:
             guard_fail.append(f"vi_guard cur={vi_gap:.2f} min={self.vi_guard_pct:.2f} margin={vi_gap-self.vi_guard_pct:.2f}")
         depth_ratio = self._depth3_ratio(ob if (ob and not ob_stale) else None)
-        if depth_ratio > 0 and depth_ratio < self.orderbook_ratio_min:
-            guard_fail.append(f"depth_ratio cur={depth_ratio:.2f} min={self.orderbook_ratio_min:.2f} margin={depth_ratio-self.orderbook_ratio_min:.2f}")
+        if (not ob_stale) and depth_ratio > 0 and depth_ratio < orderbook_ratio_min:
+            guard_fail.append(f"depth_ratio cur={depth_ratio:.2f} min={orderbook_ratio_min:.2f} margin={depth_ratio-orderbook_ratio_min:.2f}")
         if guard_fail:
             primary = guard_fail[0]
             detail = f"reject={primary} | all={'; '.join(guard_fail)}"
@@ -853,7 +868,8 @@ class EngineReal:
             )
             return
 
-        score = self._entry_score(ret, tick_count, trv, imb, spread, max_spread_pct)
+        score_spread = max_spread_pct if (ob_stale and self.orderbook_stale_mode == "guard") else spread
+        score = self._entry_score(ret, tick_count, trv, imb, score_spread, max_spread_pct)
         if score < self.entry_score_min:
             self._note_no_buy(
                 ts_epoch,
@@ -901,7 +917,7 @@ class EngineReal:
             self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"qty=0 cash={cash:.0f} target={target:.0f}")
             return
 
-        j = self._safe_order("BUY", sym, qty, ts_epoch, price, f"signal ses={session} ret={ret:.2f} ret10={ret10:.2f} imb={imb:.2f} spr={spread:.2f} dayrise={dayrise:.2f} score={score:.1f} base_ready={int(baseline_ready)}")
+        j = self._safe_order("BUY", sym, qty, ts_epoch, price, f"signal ses={session} ret={ret:.2f} ret10={ret10:.2f} imb={imb:.2f} spr={spread:.2f} dayrise={dayrise:.2f} score={score:.1f} base_ready={int(baseline_ready)} ob_stale={int(ob_stale)} ob_age={ob_age:.2f}s")
         if j.get("rt_cd") == "0":
             self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, trail_armed=False)
             self.last_entry_ts[sym] = ts_epoch
