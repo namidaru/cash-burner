@@ -53,6 +53,8 @@ class EngineReal:
                 "confirm_sec": float(os.getenv("OPEN_CONFIRM_SEC", "0.9")),
                 "cooldown_sec": float(os.getenv("OPEN_COOLDOWN_SEC", "180")),
                 "vi_like_ret_pct": float(os.getenv("VI_LIKE_RET_PCT_OPEN", "2.5")),
+                "spike_10s_min_pct": float(os.getenv("OPEN_SPIKE_10S_MIN_PCT", "0.25")),
+                "orderbook_ratio_min": float(os.getenv("OPEN_ORDERBOOK_RATIO_MIN", "1.10")),
             },
             "MID": {
                 "min_ret_pct": float(os.getenv("MID_MIN_RET_PCT", "0.10")),
@@ -63,6 +65,8 @@ class EngineReal:
                 "confirm_sec": float(os.getenv("MID_CONFIRM_SEC", "0.9")),
                 "cooldown_sec": float(os.getenv("MID_COOLDOWN_SEC", "120")),
                 "vi_like_ret_pct": float(os.getenv("VI_LIKE_RET_PCT_MID", "2.0")),
+                "spike_10s_min_pct": float(os.getenv("MID_SPIKE_10S_MIN_PCT", "0.30")),
+                "orderbook_ratio_min": float(os.getenv("MID_ORDERBOOK_RATIO_MIN", "1.15")),
             },
             "CLOSE": {
                 "min_ret_pct": float(os.getenv("CLOSE_MIN_RET_PCT", "0.12")),
@@ -73,6 +77,8 @@ class EngineReal:
                 "confirm_sec": float(os.getenv("CLOSE_CONFIRM_SEC", "0.9")),
                 "cooldown_sec": float(os.getenv("CLOSE_COOLDOWN_SEC", "180")),
                 "vi_like_ret_pct": float(os.getenv("VI_LIKE_RET_PCT_CLOSE", "1.6")),
+                "spike_10s_min_pct": float(os.getenv("CLOSE_SPIKE_10S_MIN_PCT", "0.25")),
+                "orderbook_ratio_min": float(os.getenv("CLOSE_ORDERBOOK_RATIO_MIN", "1.05")),
             },
         }
 
@@ -99,7 +105,7 @@ class EngineReal:
         self.flow_bucket_maxlen = int(os.getenv("FLOW_BUCKET_MAXLEN", str(max(64, math.ceil(self.bucket_history_sec / max(0.1, self.bucket_sec)) + 8))))
         self.first_trade_reset_gap_sec = float(os.getenv("FIRST_TRADE_RESET_GAP_SEC", str(self.burst_baseline_sec + self.bucket_sec)))
         self.candidate_reset_grace_sec = float(os.getenv("CANDIDATE_RESET_GRACE_SEC", "0.6"))
-        self.orderbook_ratio_min = float(os.getenv("ORDERBOOK_RATIO_MIN", "1.2"))
+        self.orderbook_ratio_min = float(os.getenv("ORDERBOOK_RATIO_MIN", "1.1"))
         self.orderbook_stale_mode = os.getenv("ORDERBOOK_STALE_MODE", "guard").strip().lower()
         self.cum_vol_first_tick_mode = os.getenv("CUM_VOL_FIRST_TICK_MODE", "zero").strip().lower()
         self.max_first_cum_vol = float(os.getenv("MAX_FIRST_CUM_VOL", "0"))
@@ -735,6 +741,8 @@ class EngineReal:
         min_tick_count = int(p.get("min_tick_count", self.min_tick_count))
         min_tr_value = float(p.get("min_tr_value", self.min_tr_value))
         max_spread_pct = float(p.get("max_spread_pct", self.max_spread_pct))
+        spike_10s_min_pct = float(p.get("spike_10s_min_pct", self.spike_10s_min_pct))
+        orderbook_ratio_min = float(p.get("orderbook_ratio_min", self.orderbook_ratio_min))
         confirm_sec = float(p.get("confirm_sec", self.confirm_sec))
         cooldown_sec = float(p.get("cooldown_sec", self.cooldown_sec))
         if ts_epoch - self.last_entry_ts.get(sym, 0.0) < cooldown_sec:
@@ -797,8 +805,8 @@ class EngineReal:
             trigger_fail.append(f"trv cur={trv:.0f} thr={min_tr_value:.0f} margin={trv-min_tr_value:.0f}")
         if spread > max_spread_pct and not (ob_stale and self.orderbook_stale_mode == "guard"):
             trigger_fail.append(f"spread cur={spread:.2f} max={max_spread_pct:.2f} margin={max_spread_pct-spread:.2f}")
-        if ret10 < self.spike_10s_min_pct:
-            trigger_fail.append(f"ret10 cur={ret10:.2f} thr={self.spike_10s_min_pct:.2f} margin={ret10-self.spike_10s_min_pct:.2f}")
+        if ret10 < spike_10s_min_pct:
+            trigger_fail.append(f"ret10 cur={ret10:.2f} thr={spike_10s_min_pct:.2f} margin={ret10-spike_10s_min_pct:.2f}")
         min_hist_bins = max(1, math.ceil(baseline_scale * max(0.1, self.baseline_ready_bin_ratio)))
         baseline_ready = (hist_bins >= min_hist_bins) and (ticks_hist >= self.burst_min_ticks)
         baseline_guard_active = self.burst_require_baseline and ((ts_epoch - self.symbol_first_trade_ts.get(sym, ts_epoch)) >= self.burst_baseline_sec)
@@ -834,8 +842,8 @@ class EngineReal:
         if vi_std > 0 and vi_gap <= self.vi_guard_pct:
             guard_fail.append(f"vi_guard cur={vi_gap:.2f} min={self.vi_guard_pct:.2f} margin={vi_gap-self.vi_guard_pct:.2f}")
         depth_ratio = self._depth3_ratio(ob if (ob and not ob_stale) else None)
-        if depth_ratio > 0 and depth_ratio < self.orderbook_ratio_min:
-            guard_fail.append(f"depth_ratio cur={depth_ratio:.2f} min={self.orderbook_ratio_min:.2f} margin={depth_ratio-self.orderbook_ratio_min:.2f}")
+        if depth_ratio > 0 and depth_ratio < orderbook_ratio_min:
+            guard_fail.append(f"depth_ratio cur={depth_ratio:.2f} min={orderbook_ratio_min:.2f} margin={depth_ratio-orderbook_ratio_min:.2f}")
         if guard_fail:
             primary = guard_fail[0]
             detail = f"reject={primary} | all={'; '.join(guard_fail)}"
