@@ -89,9 +89,11 @@ class EngineReal:
         self.burst_min_ticks = int(os.getenv("BURST_MIN_TICKS", "6"))
         self.burst_require_baseline = os.getenv("BURST_REQUIRE_BASELINE", "1") == "1"
         self.baseline_ready_bin_ratio = float(os.getenv("BASELINE_READY_BIN_RATIO", "0.5"))
+        # Legacy knob kept for backward compatibility; burst baseline now uses bucket history.
         self.tick_history_sec = float(os.getenv("TICK_HISTORY_SEC", str(max(self.window_sec, self.burst_baseline_sec + 20.0))))
         self.bucket_sec = float(os.getenv("BURST_BUCKET_SEC", "10.0"))
         self.bucket_history_sec = float(os.getenv("BURST_BUCKET_HISTORY_SEC", str(self.burst_baseline_sec + 30.0)))
+        self.first_trade_reset_gap_sec = float(os.getenv("FIRST_TRADE_RESET_GAP_SEC", str(self.burst_baseline_sec + self.bucket_sec)))
         self.candidate_reset_grace_sec = float(os.getenv("CANDIDATE_RESET_GRACE_SEC", "0.6"))
         self.orderbook_ratio_min = float(os.getenv("ORDERBOOK_RATIO_MIN", "1.2"))
 
@@ -142,6 +144,7 @@ class EngineReal:
         self.book_ts: Dict[str, float] = {}
         self.ticks: Dict[str, Deque[Tuple[float, float, float]]] = defaultdict(lambda: deque(maxlen=5000))
         self.flow_buckets: Dict[str, Deque[Tuple[float, float, int]]] = defaultdict(lambda: deque(maxlen=256))
+        self.last_trade_vol: Dict[str, float] = {}
         self.symbol_first_trade_ts: Dict[str, float] = {}
         self.pos: Dict[str, Position] = {}
         self.last_entry_ts: Dict[str, float] = {}
@@ -244,6 +247,7 @@ class EngineReal:
         self.book_ts.pop(sym, None)
         self.ticks.pop(sym, None)
         self.flow_buckets.pop(sym, None)
+        self.last_trade_vol.pop(sym, None)
         self.symbol_first_trade_ts.pop(sym, None)
 
     def on_orderbook(self, row: Dict[str, str], ts_epoch: float):
@@ -293,16 +297,21 @@ class EngineReal:
         st = ts_epoch - sec
         return self._window_stats_between(dq, st, ts_epoch)
 
-    def _update_flow_bucket(self, sym: str, ts_epoch: float, price: float, vol: float):
+    def _update_flow_bucket(self, sym: str, ts_epoch: float, price: float, vol: float, is_cum_vol: bool):
         if self.bucket_sec <= 0:
             return
+        use_vol = vol
+        if is_cum_vol:
+            prev = self.last_trade_vol.get(sym)
+            use_vol = max(0.0, vol - prev) if prev is not None else 0.0
+            self.last_trade_vol[sym] = vol
         bts = math.floor(ts_epoch / self.bucket_sec) * self.bucket_sec
         dq = self.flow_buckets[sym]
         if dq and dq[-1][0] == bts:
             bt, trv, cnt = dq[-1]
-            dq[-1] = (bt, trv + (price * vol), cnt + 1)
+            dq[-1] = (bt, trv + (price * use_vol), cnt + 1)
         else:
-            dq.append((bts, price * vol, 1))
+            dq.append((bts, price * use_vol, 1))
         keep_after = ts_epoch - max(self.bucket_history_sec, self.burst_baseline_sec + self.bucket_sec)
         while dq and dq[0][0] < keep_after:
             dq.popleft()
@@ -686,6 +695,7 @@ class EngineReal:
             return
         price = _f(row.get("STCK_PRPR"))
         vol = _f(row.get("CNTG_VOL"))
+        is_cum_vol = row.get("CNTG_VOL_CUM", "0") == "1"
         if price <= 0:
             return
 
@@ -709,8 +719,11 @@ class EngineReal:
 
         dq = self.ticks[sym]
         dq.append((ts_epoch, price, vol))
-        self.symbol_first_trade_ts.setdefault(sym, ts_epoch)
-        self._update_flow_bucket(sym, ts_epoch, price, vol)
+        last_bucket_ts = self.flow_buckets[sym][-1][0] if self.flow_buckets[sym] else 0.0
+        first_ts = self.symbol_first_trade_ts.get(sym)
+        if (first_ts is None) or (last_bucket_ts > 0 and (ts_epoch - last_bucket_ts) > self.first_trade_reset_gap_sec):
+            self.symbol_first_trade_ts[sym] = ts_epoch
+        self._update_flow_bucket(sym, ts_epoch, price, vol, is_cum_vol)
         while dq and ts_epoch - dq[0][0] > self.window_sec:
             dq.popleft()
 
@@ -760,7 +773,7 @@ class EngineReal:
             trigger_fail.append(f"spread cur={spread:.2f} max={max_spread_pct:.2f} margin={max_spread_pct-spread:.2f}")
         if ret10 < self.spike_10s_min_pct:
             trigger_fail.append(f"ret10 cur={ret10:.2f} thr={self.spike_10s_min_pct:.2f} margin={ret10-self.spike_10s_min_pct:.2f}")
-        min_hist_bins = max(1, int(baseline_scale * max(0.1, self.baseline_ready_bin_ratio)))
+        min_hist_bins = max(1, math.ceil(baseline_scale * max(0.1, self.baseline_ready_bin_ratio)))
         baseline_ready = (hist_bins >= min_hist_bins) and (ticks_hist >= self.burst_min_ticks)
         baseline_guard_active = self.burst_require_baseline and ((ts_epoch - self.symbol_first_trade_ts.get(sym, ts_epoch)) >= self.burst_baseline_sec)
         if not baseline_ready and baseline_guard_active:
