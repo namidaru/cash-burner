@@ -82,6 +82,9 @@ class EngineReal:
         self.position_pct = float(os.getenv("POSITION_PCT", "0.30"))
         self.entry_score_min = float(os.getenv("ENTRY_SCORE_MIN", "80"))
         self.entry_pick_window_sec = float(os.getenv("ENTRY_PICK_WINDOW_SEC", "1.2"))
+        self.open_entry_pick_window_sec = float(os.getenv("OPEN_ENTRY_PICK_WINDOW_SEC", str(self.entry_pick_window_sec)))
+        self.mid_entry_pick_window_sec = float(os.getenv("MID_ENTRY_PICK_WINDOW_SEC", str(self.entry_pick_window_sec)))
+        self.close_entry_pick_window_sec = float(os.getenv("CLOSE_ENTRY_PICK_WINDOW_SEC", str(self.entry_pick_window_sec)))
         spike_raw = float(os.getenv("SPIKE_10S_MIN_PCT", "0.8"))
         self.spike_10s_min_pct = (spike_raw / 100.0) if spike_raw >= 10.0 else spike_raw
         self.burst_ratio_min = float(os.getenv("BURST_RATIO_MIN", "1.4"))
@@ -96,7 +99,7 @@ class EngineReal:
         self.first_trade_reset_gap_sec = float(os.getenv("FIRST_TRADE_RESET_GAP_SEC", str(self.burst_baseline_sec + self.bucket_sec)))
         self.candidate_reset_grace_sec = float(os.getenv("CANDIDATE_RESET_GRACE_SEC", "0.6"))
         self.orderbook_ratio_min = float(os.getenv("ORDERBOOK_RATIO_MIN", "1.2"))
-        self.orderbook_stale_mode = os.getenv("ORDERBOOK_STALE_MODE", "block").strip().lower()
+        self.orderbook_stale_mode = os.getenv("ORDERBOOK_STALE_MODE", "guard").strip().lower()
         self.cum_vol_first_tick_mode = os.getenv("CUM_VOL_FIRST_TICK_MODE", "zero").strip().lower()
 
         self.hard_stop_pct = float(os.getenv("HARD_STOP_PCT", "3.5"))
@@ -598,7 +601,7 @@ class EngineReal:
             self._send_day_close_summary(ts_epoch)
         self._send_health_check(ts_epoch)
 
-    def _score_pick_update(self, ts_epoch: float, sym: str, score: float, price: float, ret: float, tick_count: int, trv: float, imb: float, spread: float, dayrise: float):
+    def _score_pick_update(self, ts_epoch: float, sym: str, score: float, price: float, ret: float, tick_count: int, trv: float, imb: float, spread: float, dayrise: float, ret10: float, baseline_ready: bool):
         if self._score_pick_bucket_start <= 0:
             self._score_pick_bucket_start = ts_epoch
             self._score_pick_best = {
@@ -611,6 +614,9 @@ class EngineReal:
                 "imb": imb,
                 "spread": spread,
                 "dayrise": dayrise,
+                "ret10": ret10,
+                "baseline_ready": baseline_ready,
+                "session": self._session_name(ts_epoch),
                 "ts": ts_epoch,
             }
             return
@@ -627,13 +633,24 @@ class EngineReal:
                 "imb": imb,
                 "spread": spread,
                 "dayrise": dayrise,
+                "ret10": ret10,
+                "baseline_ready": baseline_ready,
+                "session": self._session_name(ts_epoch),
                 "ts": ts_epoch,
             }
+
+    def _entry_pick_window_for_ts(self, ts_epoch: float) -> float:
+        ses = self._session_name(ts_epoch)
+        if ses == "OPEN":
+            return self.open_entry_pick_window_sec
+        if ses == "MID":
+            return self.mid_entry_pick_window_sec
+        return self.close_entry_pick_window_sec
 
     def _score_pick_ready(self, ts_epoch: float) -> bool:
         if self._score_pick_bucket_start <= 0:
             return False
-        return (ts_epoch - self._score_pick_bucket_start) >= self.entry_pick_window_sec
+        return (ts_epoch - self._score_pick_bucket_start) >= self._entry_pick_window_for_ts(ts_epoch)
 
     def _score_pick_take(self) -> Dict[str, Any] | None:
         best = self._score_pick_best
@@ -739,7 +756,7 @@ class EngineReal:
         ret10, _, _ = self._window_stats(dq, ts_epoch, 10.0)
         cur_start = ts_epoch - self.bucket_sec
         cur_end = ts_epoch
-        trv10, ticks10, cur_bins = self._bucket_flow_stats(sym, cur_start, cur_end)
+        trv10, ticks10, _cur_bins = self._bucket_flow_stats(sym, cur_start, cur_end)
         baseline_start = ts_epoch - (self.burst_baseline_sec + self.bucket_sec)
         baseline_end = ts_epoch - self.bucket_sec
         trv_hist, ticks_hist, hist_bins = self._bucket_flow_stats(sym, baseline_start, baseline_end)
@@ -782,7 +799,8 @@ class EngineReal:
         baseline_ready = (hist_bins >= min_hist_bins) and (ticks_hist >= self.burst_min_ticks)
         baseline_guard_active = self.burst_require_baseline and ((ts_epoch - self.symbol_first_trade_ts.get(sym, ts_epoch)) >= self.burst_baseline_sec)
         if not baseline_ready and baseline_guard_active:
-            trigger_fail.append(f"baseline_not_ready cur_bins={hist_bins} thr_bins={min_hist_bins} cur_ticks={ticks_hist} thr_ticks={self.burst_min_ticks}")
+            first_trade_age = ts_epoch - self.symbol_first_trade_ts.get(sym, ts_epoch)
+            trigger_fail.append(f"baseline_not_ready age={first_trade_age:.1f}s cur_bins={hist_bins} thr_bins={min_hist_bins} cur_ticks={ticks_hist} thr_ticks={self.burst_min_ticks}")
         if baseline_ready:
             if trv_prev > 0 and trv10 < trv_prev * self.burst_ratio_min:
                 trigger_fail.append(f"trv_burst cur={trv10:.0f} thr={trv_prev*self.burst_ratio_min:.0f} margin={trv10-(trv_prev*self.burst_ratio_min):.0f}")
@@ -851,7 +869,7 @@ class EngineReal:
             )
             return
 
-        self._score_pick_update(ts_epoch, sym, score, price, ret, tick_count, trv, imb, spread, dayrise)
+        self._score_pick_update(ts_epoch, sym, score, price, ret, tick_count, trv, imb, spread, dayrise, ret10, baseline_ready)
         if not self._score_pick_ready(ts_epoch):
             return
         best = self._score_pick_take()
@@ -868,6 +886,9 @@ class EngineReal:
         spread = float(best.get("spread", spread))
         dayrise = float(best.get("dayrise", dayrise))
         score = float(best.get("score", score))
+        ret10 = float(best.get("ret10", ret10))
+        baseline_ready = bool(best.get("baseline_ready", baseline_ready))
+        session = str(best.get("session", self._session_name(ts_epoch)))
         try:
             cash = buyable_cash(sym, ord_dvsn="01", price="0")
         except Exception as e:
@@ -880,7 +901,7 @@ class EngineReal:
             self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"qty=0 cash={cash:.0f} target={target:.0f}")
             return
 
-        j = self._safe_order("BUY", sym, qty, ts_epoch, price, f"signal ret={ret:.2f} imb={imb:.2f} spr={spread:.2f} dayrise={dayrise:.2f} score={score:.1f}")
+        j = self._safe_order("BUY", sym, qty, ts_epoch, price, f"signal ses={session} ret={ret:.2f} ret10={ret10:.2f} imb={imb:.2f} spr={spread:.2f} dayrise={dayrise:.2f} score={score:.1f} base_ready={int(baseline_ready)}")
         if j.get("rt_cd") == "0":
             self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, trail_armed=False)
             self.last_entry_ts[sym] = ts_epoch
