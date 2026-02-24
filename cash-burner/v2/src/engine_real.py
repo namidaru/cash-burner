@@ -316,6 +316,10 @@ class EngineReal:
             n += 1
         return trv, ticks, n
 
+    def _window_stats(self, dq: Deque[Tuple[float, float, float]], ts_epoch: float, sec: float) -> tuple[float, float, int]:
+        st = ts_epoch - sec
+        return self._window_stats_between(dq, st, ts_epoch)
+
     def _depth3_ratio(self, ob: Dict[str, str] | None) -> float:
         if not ob:
             return 0.0
