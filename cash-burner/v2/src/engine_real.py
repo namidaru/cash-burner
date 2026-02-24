@@ -262,7 +262,7 @@ class EngineReal:
 
 
     def _window_stats_between(self, dq: Deque[Tuple[float, float, float]], start_ts: float, end_ts: float) -> tuple[float, float, int]:
-        arr = [(t, p, v) for (t, p, v) in dq if (start_ts <= t <= end_ts)]
+        arr = [(t, p, v) for (t, p, v) in dq if (start_ts <= t < end_ts)]
         if len(arr) < 2:
             return 0.0, 0.0, len(arr)
         base = arr[0][1]
@@ -663,7 +663,8 @@ class EngineReal:
 
         dq = self.ticks[sym]
         dq.append((ts_epoch, price, vol))
-        while dq and ts_epoch - dq[0][0] > self.tick_history_sec:
+        effective_history_sec = max(self.tick_history_sec, self.burst_baseline_sec + 10.0)
+        while dq and ts_epoch - dq[0][0] > effective_history_sec:
             dq.popleft()
 
         ret, trv, tick_count = self._window_stats(dq, ts_epoch, float(self.window_sec))
@@ -715,9 +716,9 @@ class EngineReal:
 
         if trigger_fail:
             self.candidate_since.pop(sym, None)
-            self._note_no_buy(
-                ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, " | ".join(trigger_fail)
-            )
+            primary = trigger_fail[0]
+            detail = f"reject={primary} | all={'; '.join(trigger_fail)}"
+            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, detail)
             return
 
         c0 = self.candidate_since.get(sym)
@@ -737,9 +738,9 @@ class EngineReal:
         if depth_ratio > 0 and depth_ratio < self.orderbook_ratio_min:
             guard_fail.append(f"depth_ratio {depth_ratio:.2f}<{self.orderbook_ratio_min:.2f}")
         if guard_fail:
-            self._note_no_buy(
-                ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, " | ".join(guard_fail)
-            )
+            primary = guard_fail[0]
+            detail = f"reject={primary} | all={'; '.join(guard_fail)}"
+            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, detail)
             return
 
         try:
