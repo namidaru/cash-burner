@@ -35,7 +35,7 @@ class EngineReal:
 
         # fallback/base
         self.min_ret_pct = float(os.getenv("MIN_RET_PCT", "0.6"))
-        self.min_tick_count = int(os.getenv("MIN_TICK_COUNT", "10"))
+        self.min_tick_count = int(os.getenv("MIN_TICK_COUNT", "8"))
         self.min_tr_value = float(os.getenv("MIN_TR_VALUE", "0"))
         self.min_imb = float(os.getenv("MIN_IMB", "0.60"))
         self.max_spread_pct = float(os.getenv("MAX_SPREAD_PCT", "0.30"))
@@ -55,9 +55,9 @@ class EngineReal:
                 "vi_like_ret_pct": float(os.getenv("VI_LIKE_RET_PCT_OPEN", "2.5")),
             },
             "MID": {
-                "min_ret_pct": float(os.getenv("MID_MIN_RET_PCT", "0.70")),
+                "min_ret_pct": float(os.getenv("MID_MIN_RET_PCT", "0.08")),
                 "min_tr_value": float(os.getenv("MID_MIN_TR_VALUE", "50000000")),
-                "min_tick_count": int(os.getenv("MID_MIN_TICK_COUNT", "12")),
+                "min_tick_count": int(os.getenv("MID_MIN_TICK_COUNT", "10")),
                 "min_imb": float(os.getenv("MID_MIN_IMB", "0.62")),
                 "max_spread_pct": float(os.getenv("MID_MAX_SPREAD_PCT", "0.25")),
                 "confirm_sec": float(os.getenv("MID_CONFIRM_SEC", "1.0")),
@@ -85,9 +85,9 @@ class EngineReal:
         self.open_entry_pick_window_sec = float(os.getenv("OPEN_ENTRY_PICK_WINDOW_SEC", str(self.entry_pick_window_sec)))
         self.mid_entry_pick_window_sec = float(os.getenv("MID_ENTRY_PICK_WINDOW_SEC", str(self.entry_pick_window_sec)))
         self.close_entry_pick_window_sec = float(os.getenv("CLOSE_ENTRY_PICK_WINDOW_SEC", str(self.entry_pick_window_sec)))
-        spike_raw = float(os.getenv("SPIKE_10S_MIN_PCT", "0.8"))
+        spike_raw = float(os.getenv("SPIKE_10S_MIN_PCT", "0.30"))
         self.spike_10s_min_pct = (spike_raw / 100.0) if spike_raw >= 10.0 else spike_raw
-        self.burst_ratio_min = float(os.getenv("BURST_RATIO_MIN", "1.4"))
+        self.burst_ratio_min = float(os.getenv("BURST_RATIO_MIN", "1.25"))
         self.burst_baseline_sec = float(os.getenv("BURST_BASELINE_SEC", "120"))
         self.burst_min_ticks = int(os.getenv("BURST_MIN_TICKS", "6"))
         self.burst_require_baseline = os.getenv("BURST_REQUIRE_BASELINE", "1") == "1"
