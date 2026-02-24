@@ -96,6 +96,8 @@ class EngineReal:
         self.first_trade_reset_gap_sec = float(os.getenv("FIRST_TRADE_RESET_GAP_SEC", str(self.burst_baseline_sec + self.bucket_sec)))
         self.candidate_reset_grace_sec = float(os.getenv("CANDIDATE_RESET_GRACE_SEC", "0.6"))
         self.orderbook_ratio_min = float(os.getenv("ORDERBOOK_RATIO_MIN", "1.2"))
+        self.orderbook_stale_mode = os.getenv("ORDERBOOK_STALE_MODE", "block").strip().lower()
+        self.cum_vol_first_tick_mode = os.getenv("CUM_VOL_FIRST_TICK_MODE", "zero").strip().lower()
 
         self.hard_stop_pct = float(os.getenv("HARD_STOP_PCT", "3.5"))
         self.trail_arm_pct = float(os.getenv("TRAIL_ARM_PCT", "4.0"))
@@ -303,7 +305,10 @@ class EngineReal:
         use_vol = vol
         if is_cum_vol:
             prev = self.last_trade_vol.get(sym)
-            use_vol = max(0.0, vol - prev) if prev is not None else 0.0
+            if prev is None:
+                use_vol = vol if self.cum_vol_first_tick_mode == "raw" else 0.0
+            else:
+                use_vol = max(0.0, vol - prev)
             self.last_trade_vol[sym] = vol
         bts = math.floor(ts_epoch / self.bucket_sec) * self.bucket_sec
         dq = self.flow_buckets[sym]
@@ -769,7 +774,7 @@ class EngineReal:
             trigger_fail.append(f"ticks cur={tick_count} thr={min_tick_count} margin={tick_count-min_tick_count}")
         if trv < min_tr_value:
             trigger_fail.append(f"trv cur={trv:.0f} thr={min_tr_value:.0f} margin={trv-min_tr_value:.0f}")
-        if spread > max_spread_pct:
+        if spread > max_spread_pct and not (ob_stale and self.orderbook_stale_mode == "guard"):
             trigger_fail.append(f"spread cur={spread:.2f} max={max_spread_pct:.2f} margin={max_spread_pct-spread:.2f}")
         if ret10 < self.spike_10s_min_pct:
             trigger_fail.append(f"ret10 cur={ret10:.2f} thr={self.spike_10s_min_pct:.2f} margin={ret10-self.spike_10s_min_pct:.2f}")
@@ -802,6 +807,8 @@ class EngineReal:
 
         # 2) Guard gate: order-right-before safety checks only
         guard_fail = []
+        if ob_stale and self.orderbook_stale_mode == "guard":
+            guard_fail.append(f"orderbook_stale age={ob_age:.2f}s max={self.orderbook_max_age_sec:.2f}s")
         if vi_std > 0 and vi_gap <= self.vi_guard_pct:
             guard_fail.append(f"vi_guard cur={vi_gap:.2f} min={self.vi_guard_pct:.2f} margin={vi_gap-self.vi_guard_pct:.2f}")
         depth_ratio = self._depth3_ratio(ob if (ob and not ob_stale) else None)
