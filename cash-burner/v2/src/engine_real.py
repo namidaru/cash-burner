@@ -86,7 +86,10 @@ class EngineReal:
         self.vi_cooldown_sec = float(os.getenv("VI_COOLDOWN_SEC", "120"))
 
         self.position_pct = float(os.getenv("POSITION_PCT", "0.30"))
-        self.entry_score_min = float(os.getenv("ENTRY_SCORE_MIN", "80"))
+        self.entry_score_min = float(os.getenv("ENTRY_SCORE_MIN", "120"))
+        self.open_entry_score_min = float(os.getenv("OPEN_ENTRY_SCORE_MIN", "150"))
+        self.mid_entry_score_min = float(os.getenv("MID_ENTRY_SCORE_MIN", "135"))
+        self.close_entry_score_min = float(os.getenv("CLOSE_ENTRY_SCORE_MIN", "125"))
         self.entry_pick_window_sec = float(os.getenv("ENTRY_PICK_WINDOW_SEC", "1.2"))
         self.open_entry_pick_window_sec = float(os.getenv("OPEN_ENTRY_PICK_WINDOW_SEC", "0.6"))
         self.mid_entry_pick_window_sec = float(os.getenv("MID_ENTRY_PICK_WINDOW_SEC", "0.9"))
@@ -135,9 +138,6 @@ class EngineReal:
         self._health_failures = 0
         self.buy_fail_cooldown_sec = float(os.getenv("BUY_FAIL_COOLDOWN_SEC", "30"))
         self.buy_fail_state_ttl_sec = float(os.getenv("BUY_FAIL_STATE_TTL_SEC", "1800"))
-        self.buy_try_cooldown_sec = float(os.getenv("BUY_TRY_COOLDOWN_SEC", "20"))
-        self.global_buy_try_window_sec = float(os.getenv("GLOBAL_BUY_TRY_WINDOW_SEC", "60"))
-        self.global_buy_try_limit = int(os.getenv("GLOBAL_BUY_TRY_LIMIT", "8"))
         self._buy_fail_by_symbol = {}
         self.health_cash_symbol = os.getenv("HEALTH_CASH_SYMBOL", "005930").strip() or "005930"
         self._last_buyable_cash = 0.0
@@ -174,8 +174,6 @@ class EngineReal:
         self.symbol_first_trade_ts: Dict[str, float] = {}
         self.pos: Dict[str, Position] = {}
         self.last_entry_ts: Dict[str, float] = {}
-        self.last_buy_try_ts: Dict[str, float] = {}
-        self._global_buy_try_ts: Deque[float] = deque(maxlen=5000)
         self.candidate_since: Dict[str, float] = {}
         self.vi_last_ts: Dict[str, float] = {}
         self._score_pick_bucket_start = 0.0
@@ -351,26 +349,10 @@ class EngineReal:
         msg = fail_msg or "order_fail"
         return True, f"buy_fail_cooldown<{remain:.1f}s msg={msg[:80]}"
 
-    def _global_buy_try_allowed(self, ts_epoch: float) -> tuple[bool, float]:
-        if self.global_buy_try_limit <= 0 or self.global_buy_try_window_sec <= 0:
-            return True, 0.0
-        cutoff = ts_epoch - self.global_buy_try_window_sec
-        while self._global_buy_try_ts and self._global_buy_try_ts[0] < cutoff:
-            self._global_buy_try_ts.popleft()
-        if len(self._global_buy_try_ts) < self.global_buy_try_limit:
-            return True, 0.0
-        wait = max(0.0, self._global_buy_try_ts[0] + self.global_buy_try_window_sec - ts_epoch)
-        return False, wait
-
-    def _record_buy_try(self, sym: str, ts_epoch: float):
-        self.last_buy_try_ts[sym] = ts_epoch
-        self._global_buy_try_ts.append(ts_epoch)
-
     def _cleanup_symbol_state(self, sym: str):
         self.pos.pop(sym, None)
         self.candidate_since.pop(sym, None)
         self.last_entry_ts.pop(sym, None)
-        self.last_buy_try_ts.pop(sym, None)
         self.vi_last_ts.pop(sym, None)
         self._last_diag_ts.pop(sym, None)
         self.book.pop(sym, None)
@@ -481,14 +463,20 @@ class EngineReal:
         return bid / ask
 
     def _entry_score(self, ret: float, ret10: float, tick_count: int, trv: float, imb: float, depth_ratio: float, spread: float, max_spread_pct: float) -> float:
-        spread_bonus = max(0.0, max_spread_pct - spread) * 30.0
-        tick_bonus = min(tick_count, 20) * 1.0
-        trv_bonus = min(math.log10(max(0.0, trv) / 10000000.0 + 1.0) * 18.0, 25.0)
-        imb_bonus = max(0.0, imb - 0.5) * 80.0
-        depth_bonus = max(0.0, depth_ratio - 1.0) * 25.0
-        ret_bonus = ret * 40.0
-        ret10_bonus = ret10 * 90.0
-        return ret10_bonus + ret_bonus + imb_bonus + depth_bonus + spread_bonus + trv_bonus + tick_bonus
+        # 모멘텀은 중요하지만 과대추격을 막기 위해 구간별 감쇄를 둔다.
+        ret10_main = min(max(ret10, 0.0), 1.20) * 55.0
+        ret10_tail = max(0.0, ret10 - 1.20) * 20.0
+        ret_main = min(max(ret, 0.0), 1.00) * 20.0
+
+        # 품질 지표는 가산/감산 모두 반영해 저품질(imb/depth/spread) 고점을 억제한다.
+        imb_component = max(-35.0, min(35.0, (imb - 0.5) * 140.0))
+        depth_component = max(-20.0, min(20.0, (depth_ratio - 1.0) * 30.0)) if depth_ratio > 0 else -8.0
+        spread_component = max(-20.0, min(20.0, (max_spread_pct - spread) * 60.0))
+
+        # 유동성(trv/ticks)은 보조지표로 제한한다.
+        trv_component = min(math.log10(max(0.0, trv) / 10000000.0 + 1.0) * 12.0, 18.0)
+        tick_component = min(tick_count, 20) * 0.5
+        return ret10_main + ret10_tail + ret_main + imb_component + depth_component + spread_component + trv_component + tick_component
 
     def _notify_buy(
         self,
@@ -575,8 +563,6 @@ class EngineReal:
         self._lat_cnt = 0
         self._lat_max = 0.0
         self._nobuy_reason_counts.clear()
-        self.last_buy_try_ts.clear()
-        self._global_buy_try_ts.clear()
         self._buy_fail_by_symbol.clear()
         self._last_buyable_cash = 0.0
         self._last_buyable_cash_ts = 0.0
@@ -894,11 +880,6 @@ class EngineReal:
         if ts_epoch - self.last_entry_ts.get(sym, 0.0) < cooldown_sec:
             self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, 0, f"cooldown<{cooldown_sec:.0f}s")
             return
-        if self.buy_try_cooldown_sec > 0 and (ts_epoch - self.last_buy_try_ts.get(sym, 0.0)) < self.buy_try_cooldown_sec:
-            remain = self.buy_try_cooldown_sec - (ts_epoch - self.last_buy_try_ts.get(sym, 0.0))
-            self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, 0, f"buy_try_cooldown<{remain:.1f}s")
-            return
-
         dayrise = self._day_rise_pct(sym, price)
 
         blocked, block_detail = self._is_buy_blocked_after_fail(sym, ts_epoch)
@@ -1058,9 +1039,11 @@ class EngineReal:
         score = self._entry_score(ret, ret10, tick_count, trv, imb, depth_ratio, score_spread, max_spread_pct)
         score_floor = self.entry_score_min
         if session == "OPEN":
-            score_floor += float(os.getenv("OPEN_ENTRY_SCORE_BONUS", "12"))
+            score_floor = max(score_floor, self.open_entry_score_min)
         elif session == "MID":
-            score_floor += float(os.getenv("MID_ENTRY_SCORE_BONUS", "4"))
+            score_floor = max(score_floor, self.mid_entry_score_min)
+        else:
+            score_floor = max(score_floor, self.close_entry_score_min)
         if score < score_floor:
             self._note_no_buy(
                 ts_epoch,
@@ -1108,11 +1091,6 @@ class EngineReal:
             self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"qty=0 cash={cash:.0f} target={target:.0f}")
             return
 
-        allowed, wait = self._global_buy_try_allowed(ts_epoch)
-        if not allowed:
-            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"global_buy_try_limit wait={wait:.1f}s")
-            return
-        self._record_buy_try(sym, ts_epoch)
         j = self._safe_order("BUY", sym, qty, ts_epoch, price, f"signal ses={session} ret={ret:.2f} ret10={ret10:.2f} imb={imb:.2f} spr={spread:.2f} dayrise={dayrise:.2f} score={score:.1f} base_ready={int(baseline_ready)} ob_stale={int(ob_stale)} ob_age={ob_age:.2f}s")
         if j.get("rt_cd") == "0":
             self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, trail_armed=False)
