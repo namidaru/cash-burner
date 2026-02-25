@@ -459,14 +459,15 @@ class EngineReal:
             return 0.0
         return bid / ask
 
-    def _entry_score(self, ret: float, tick_count: int, trv: float, imb: float, spread: float, max_spread_pct: float) -> float:
-        spread_room = max(0.0, max_spread_pct - spread)
-        spread_component = spread_room * 35.0
-        tick_component = min(tick_count, 20) * 2.0
-        trv_component = min(trv / 10000000.0, 60.0)
-        imb_component = max(0.0, imb - 0.5) * 120.0
-        ret_component = ret * 45.0
-        return ret_component + tick_component + trv_component + imb_component + spread_component
+    def _entry_score(self, ret: float, ret10: float, tick_count: int, trv: float, imb: float, depth_ratio: float, spread: float, max_spread_pct: float) -> float:
+        spread_bonus = max(0.0, max_spread_pct - spread) * 30.0
+        tick_bonus = min(tick_count, 20) * 1.0
+        trv_bonus = min(math.log10(max(0.0, trv) / 10000000.0 + 1.0) * 20.0, 30.0)
+        imb_bonus = max(0.0, imb - 0.5) * 80.0
+        depth_bonus = max(0.0, depth_ratio - 1.0) * 25.0
+        ret_bonus = ret * 40.0
+        ret10_bonus = ret10 * 90.0
+        return ret10_bonus + ret_bonus + imb_bonus + depth_bonus + spread_bonus + trv_bonus + tick_bonus
 
     def _notify_buy(
         self,
@@ -861,6 +862,7 @@ class EngineReal:
         min_ret_pct = float(p.get("min_ret_pct", self.min_ret_pct))
         min_tick_count = int(p.get("min_tick_count", self.min_tick_count))
         min_tr_value = float(p.get("min_tr_value", self.min_tr_value))
+        min_imb = float(p.get("min_imb", self.min_imb))
         max_spread_pct = float(p.get("max_spread_pct", self.max_spread_pct))
         spike_10s_min_pct = self._normalize_pct_input(float(p.get("spike_10s_min_pct", self.spike_10s_min_pct)))
         orderbook_ratio_min = float(p.get("orderbook_ratio_min", self.orderbook_ratio_min))
@@ -941,6 +943,20 @@ class EngineReal:
             trigger_fail.append(f"spread cur={spread:.2f} max={max_spread_pct:.2f} margin={max_spread_pct-spread:.2f}")
         if ret10 < spike_10s_min_pct:
             trigger_fail.append(f"ret10 cur={ret10:.2f} thr={spike_10s_min_pct:.2f} margin={ret10-spike_10s_min_pct:.2f}")
+        if ret10 <= 0:
+            trigger_fail.append(f"ret10_non_positive cur={ret10:.2f}")
+        if ret10 >= 0.25 and imb < 0.55:
+            trigger_fail.append(f"ret10_imb_mismatch ret10={ret10:.2f} imb={imb:.2f} need>=0.55")
+
+        imb_min_dynamic = min_imb
+        if 0.25 <= ret10 < 0.40:
+            imb_min_dynamic = max(imb_min_dynamic, 0.60)
+        elif 0.40 <= ret10 <= 0.60:
+            imb_min_dynamic = max(imb_min_dynamic, 0.65)
+        elif ret10 > 0.60:
+            imb_min_dynamic = max(imb_min_dynamic, 0.70)
+        if imb < imb_min_dynamic:
+            trigger_fail.append(f"imb cur={imb:.2f} min={imb_min_dynamic:.2f} margin={imb-imb_min_dynamic:.2f}")
         min_hist_bins = max(1, math.ceil(baseline_scale * max(0.1, self.baseline_ready_bin_ratio)))
         baseline_ready = (hist_bins >= min_hist_bins) and (ticks_hist >= self.burst_min_ticks)
         baseline_guard_active = self.burst_require_baseline and ((ts_epoch - self.symbol_first_trade_ts.get(sym, ts_epoch)) >= self.burst_baseline_sec)
@@ -976,6 +992,8 @@ class EngineReal:
         if vi_std > 0 and vi_gap <= self.vi_guard_pct:
             guard_fail.append(f"vi_guard cur={vi_gap:.2f} min={self.vi_guard_pct:.2f} margin={vi_gap-self.vi_guard_pct:.2f}")
         depth_ratio = self._depth3_ratio(ob if (ob and not ob_stale) else None)
+        if ret10 >= 0.25 and depth_ratio > 0 and depth_ratio < orderbook_ratio_min:
+            guard_fail.append(f"ret10_depth_mismatch ret10={ret10:.2f} depth={depth_ratio:.2f} min={orderbook_ratio_min:.2f}")
         if (not ob_stale) and depth_ratio > 0 and depth_ratio < orderbook_ratio_min:
             guard_fail.append(f"depth_ratio cur={depth_ratio:.2f} min={orderbook_ratio_min:.2f} margin={depth_ratio-orderbook_ratio_min:.2f}")
         if guard_fail:
@@ -1001,7 +1019,7 @@ class EngineReal:
 
         session = self._session_name(ts_epoch)
         score_spread = max_spread_pct if (ob_stale and self.orderbook_stale_mode == "guard") else spread
-        score = self._entry_score(ret, tick_count, trv, imb, score_spread, max_spread_pct)
+        score = self._entry_score(ret, ret10, tick_count, trv, imb, depth_ratio, score_spread, max_spread_pct)
         score_floor = self.entry_score_min
         if session == "OPEN":
             score_floor += float(os.getenv("OPEN_ENTRY_SCORE_BONUS", "12"))
