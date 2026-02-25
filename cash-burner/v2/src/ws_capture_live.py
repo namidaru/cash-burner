@@ -330,7 +330,7 @@ class WSCapture:
             _append(CONTROL_FILE, f"{_ts()}	SUB_BUILD_ERR {type(e).__name__}: {e}")
             return False
 
-    def _extract_control_fields(self, j: dict) -> tuple[str, str, str, str]:
+    def _extract_control_fields(self, j: dict) -> tuple[str, str, str, str, str]:
         body = j.get("body", {}) if isinstance(j, dict) else {}
         header = j.get("header", {}) if isinstance(j, dict) else {}
         input_body = body.get("input", {}) if isinstance(body, dict) else {}
@@ -351,22 +351,32 @@ class WSCapture:
             or output.get("tr_key", "")
             or header.get("tr_key", "")
         ).strip()
-        return rt_cd, msg, tr_id, tr_key
+        tr_type = str(
+            header.get("tr_type", "")
+            or body.get("tr_type", "")
+            or input_body.get("tr_type", "")
+            or output.get("tr_type", "")
+        ).strip()
+        return rt_cd, msg, tr_id, tr_key, tr_type
 
     def _refresh_subscribed_symbols(self):
         self.subscribed = {sym for (sym, _tr) in self.subscribed_keys}
 
     def _handle_control_json(self, j: dict):
-        rt_cd, msg, tr_id, tr_key = self._extract_control_fields(j)
+        rt_cd, msg, tr_id, tr_key, tr_type = self._extract_control_fields(j)
         if not tr_id or not tr_key:
             return
         key = self._sub_key(tr_key, tr_id)
         now = time.time()
         if rt_cd == "0":
+            was_pending_sub = key in self.pending_subscribe
             self.pending_subscribe.pop(key, None)
             self.sub_blocked_until.pop(key, None)
             self.sub_blocked_retry_exp.pop(key, None)
-            self.subscribed_keys.add(key)
+            if tr_type == "2":
+                self.subscribed_keys.discard(key)
+            elif tr_type == "1" or was_pending_sub:
+                self.subscribed_keys.add(key)
             self._refresh_subscribed_symbols()
             return
         if "MAX SUBSCRIBE OVER" in msg.upper():
@@ -423,28 +433,29 @@ class WSCapture:
     def _sync_subscriptions(self, ws, desired: set[str], force: bool = False):
         with self.lock:
             desired_symbols = set(desired)
-            desired_keys = set(self._desired_sub_keys(desired_symbols))
+            desired_key_seq = self._desired_sub_keys(desired_symbols)
+            desired_keys = set(desired_key_seq)
 
             rem_keys = self.subscribed_keys - desired_keys
             for sym, tr in sorted(rem_keys):
                 self._unsubscribe_key(sym, tr)
 
-            add_keys = desired_keys - self.subscribed_keys
+            add_keys_ordered = [k for k in desired_key_seq if k not in self.subscribed_keys]
             sent_req = 0
-            if force or desired_keys != self.last_sync_desired or add_keys:
-                for sym, tr in sorted(add_keys):
+            if force or desired_keys != self.last_sync_desired or add_keys_ordered:
+                for sym, tr in add_keys_ordered:
                     sent_req += self._try_subscribe_key(sym, tr)
                 self.last_sync_desired = set(desired_keys)
 
             self._refresh_subscribed_symbols()
 
-            if add_keys or rem_keys or force or sent_req:
+            if add_keys_ordered or rem_keys or force or sent_req:
                 blocked = 0
                 now = time.time()
-                for sym, tr in add_keys:
+                for sym, tr in add_keys_ordered:
                     if self.sub_blocked_until.get(self._sub_key(sym, tr), 0.0) > now:
                         blocked += 1
                 _append(
                     CONTROL_FILE,
-                    f"{_ts()}	SYNC desired_sym={len(desired_symbols)} desired_key={len(desired_keys)} add={len(add_keys)} rem={len(rem_keys)} subscribed_sym={len(self.subscribed)} subscribed_key={len(self.subscribed_keys)} sent={sent_req} blocked={blocked}",
+                    f"{_ts()}	SYNC desired_sym={len(desired_symbols)} desired_key={len(desired_keys)} add={len(add_keys_ordered)} rem={len(rem_keys)} subscribed_sym={len(self.subscribed)} subscribed_key={len(self.subscribed_keys)} sent={sent_req} blocked={blocked}",
                 )

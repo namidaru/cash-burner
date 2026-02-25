@@ -190,7 +190,6 @@ class EngineReal:
 
         self._init_ledger()
         self._init_diag()
-        self._load_positions_state()
         self._verify_startup_cash_or_block()
 
 
