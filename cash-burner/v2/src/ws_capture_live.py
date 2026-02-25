@@ -285,7 +285,10 @@ class WSCapture:
 
     def _desired_sub_keys(self, desired_symbols: set[str]) -> list[tuple[str, str]]:
         # 한도 초과 방지를 위해 체결(H0STCNT0)을 우선 배치하고, 남는 슬롯에 호가를 배치한다.
-        ordered_syms = sorted(desired_symbols)
+        # 보유 종목은 구독 잘림 시에도 먼저 유지되도록 우선순위를 높인다.
+        held_syms = sorted(desired_symbols & self.last_held_symbols)
+        other_syms = sorted(desired_symbols - self.last_held_symbols)
+        ordered_syms = held_syms + other_syms
         keys: list[tuple[str, str]] = []
         if "H0STCNT0" in TR_IDS:
             for sym in ordered_syms:

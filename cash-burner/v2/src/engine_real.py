@@ -859,9 +859,6 @@ class EngineReal:
         sym = row.get("MKSC_SHRN_ISCD", "")
         if not sym:
             return
-        if not self.trade_ready:
-            self._note_no_buy(ts_epoch, sym, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, f"trade_blocked {self.trade_block_reason[:120]}")
-            return
         self._prune_buy_fail_state(ts_epoch)
         price = _f(row.get("STCK_PRPR"))
         vol = _f(row.get("CNTG_VOL"))
@@ -872,6 +869,10 @@ class EngineReal:
         if sym in self.pos:
             self._maybe_exit(sym, price, ts_epoch)
         if sym in self.pos:
+            return
+
+        if not self.trade_ready:
+            self._note_no_buy(ts_epoch, sym, price, 0.0, 0, 0.0, 0.0, 0.0, self._day_rise_pct(sym, price), f"trade_blocked {self.trade_block_reason[:120]}")
             return
 
         p = self._params(ts_epoch)
