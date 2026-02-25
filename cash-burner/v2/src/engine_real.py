@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from collections import defaultdict, deque
 from typing import Dict, Deque, Tuple, Any
 
-from kis_orders import buyable_cash, sellable_qty, order_cash
+from kis_orders import buyable_cash, sellable_qty, order_cash, account_buying_power
 from quote_basic import load_cache
 from notifier import DiscordNotifier
 
@@ -133,6 +133,16 @@ class EngineReal:
         self._health_signal_hits = 0
         self._health_order_tries = 0
         self._health_failures = 0
+        self.buy_fail_cooldown_sec = float(os.getenv("BUY_FAIL_COOLDOWN_SEC", "30"))
+        self.buy_fail_state_ttl_sec = float(os.getenv("BUY_FAIL_STATE_TTL_SEC", "1800"))
+        self._buy_fail_by_symbol = {}
+        self.health_cash_symbol = os.getenv("HEALTH_CASH_SYMBOL", "005930").strip() or "005930"
+        self._last_buyable_cash = 0.0
+        self._last_buyable_cash_ts = 0.0
+        self.cash_check_retry_sec = float(os.getenv("CASH_CHECK_RETRY_SEC", "30"))
+        self.trade_ready = False
+        self.trade_block_reason = "startup_cash_unchecked"
+        self._last_cash_check_ts = 0.0
         self._lat_sum = 0.0
         self._lat_cnt = 0
         self._lat_max = 0.0
@@ -168,6 +178,54 @@ class EngineReal:
 
         self._init_ledger()
         self._init_diag()
+        self._verify_startup_cash_or_block()
+
+
+    def _verify_startup_cash_or_block(self):
+        now = time.time()
+        try:
+            cash = account_buying_power(symbol=self.health_cash_symbol, ord_dvsn="01", price="0")
+            self.trade_ready = cash > 0
+            self.trade_block_reason = "" if self.trade_ready else f"cash_non_positive:{cash:.0f}"
+            self._last_buyable_cash = cash
+            self._last_buyable_cash_ts = now
+            self._last_cash_check_ts = now
+        except Exception as e:
+            self.trade_ready = False
+            self.trade_block_reason = f"cash_parse_fail:{type(e).__name__}:{e}"
+            self._last_cash_check_ts = now
+            self.notifier.send(
+                title="⛔ 거래 시작 차단",
+                color=0xE74C3C,
+                lines=[
+                    "사유: 주문가능금액 파싱 실패",
+                    f"detail: {type(e).__name__}: {e}",
+                    "조치: API 응답/계좌설정 확인 후 자동 재시도",
+                ],
+            )
+
+    def _refresh_trade_ready(self, ts_epoch: float):
+        if self.trade_ready:
+            return
+        if (ts_epoch - self._last_cash_check_ts) < self.cash_check_retry_sec:
+            return
+        self._last_cash_check_ts = ts_epoch
+        try:
+            cash = account_buying_power(symbol=self.health_cash_symbol, ord_dvsn="01", price="0")
+            self._last_buyable_cash = cash
+            self._last_buyable_cash_ts = ts_epoch
+            if cash > 0:
+                self.trade_ready = True
+                self.trade_block_reason = ""
+                self.notifier.send(
+                    title="✅ 거래 시작 허용",
+                    color=0x2ECC71,
+                    lines=[f"주문가능금액 확인: {cash:,.0f}원"],
+                )
+            else:
+                self.trade_block_reason = f"cash_non_positive:{cash:.0f}"
+        except Exception as e:
+            self.trade_block_reason = f"cash_parse_fail:{type(e).__name__}:{e}"
 
     def _session_name(self, ts_epoch: float) -> str:
         hhmm = int(time.strftime("%H%M", time.localtime(ts_epoch)))
@@ -247,11 +305,46 @@ class EngineReal:
             self._log(ts_epoch, side, sym, qty, price, reason, j.get("rt_cd", ""), j.get("msg1", ""))
             if j.get("rt_cd") != "0":
                 self._health_failures += 1
+                if side.upper() == "BUY":
+                    self._mark_buy_fail(sym, ts_epoch, j.get("msg1", ""))
+            else:
+                if side.upper() == "BUY":
+                    self._clear_buy_fail(sym)
             return j
         except Exception as e:
             self._health_failures += 1
+            if side.upper() == "BUY":
+                self._mark_buy_fail(sym, ts_epoch, f"order_err:{type(e).__name__}:{e}")
             self._log(ts_epoch, side, sym, qty, price, reason, "EX", f"order_err:{type(e).__name__}:{e}")
             return {"rt_cd": "EX", "msg1": str(e)}
+
+    def _mark_buy_fail(self, sym: str, ts_epoch: float, msg: str):
+        self._buy_fail_by_symbol[sym] = (ts_epoch, (msg or "").strip())
+
+    def _clear_buy_fail(self, sym: str):
+        self._buy_fail_by_symbol.pop(sym, None)
+
+    def _prune_buy_fail_state(self, ts_epoch: float):
+        if self.buy_fail_state_ttl_sec <= 0:
+            return
+        cutoff = ts_epoch - self.buy_fail_state_ttl_sec
+        stale = [sym for sym, (fail_ts, _) in self._buy_fail_by_symbol.items() if fail_ts < cutoff]
+        for sym in stale:
+            self._buy_fail_by_symbol.pop(sym, None)
+
+    def _is_buy_blocked_after_fail(self, sym: str, ts_epoch: float) -> Tuple[bool, str]:
+        if self.buy_fail_cooldown_sec <= 0:
+            return False, ""
+        state = self._buy_fail_by_symbol.get(sym)
+        if not state:
+            return False, ""
+        fail_ts, fail_msg = state
+        remain = self.buy_fail_cooldown_sec - (ts_epoch - fail_ts)
+        if remain <= 0:
+            self._buy_fail_by_symbol.pop(sym, None)
+            return False, ""
+        msg = fail_msg or "order_fail"
+        return True, f"buy_fail_cooldown<{remain:.1f}s msg={msg[:80]}"
 
     def _cleanup_symbol_state(self, sym: str):
         self.pos.pop(sym, None)
@@ -460,6 +553,13 @@ class EngineReal:
         self._lat_cnt = 0
         self._lat_max = 0.0
         self._nobuy_reason_counts.clear()
+        self._buy_fail_by_symbol.clear()
+        self._last_buyable_cash = 0.0
+        self._last_buyable_cash_ts = 0.0
+        self.cash_check_retry_sec = float(os.getenv("CASH_CHECK_RETRY_SEC", "30"))
+        self.trade_ready = False
+        self.trade_block_reason = "startup_cash_unchecked"
+        self._last_cash_check_ts = 0.0
 
     def _event_latency_update(self, ts_epoch: float):
         lag = max(0.0, time.time() - ts_epoch)
@@ -582,6 +682,17 @@ class EngineReal:
             ws_gap = 0.0
             ws_state = "초기화중(이벤트 대기)"
         lat_avg = (self._lat_sum / self._lat_cnt) if self._lat_cnt else 0.0
+        try:
+            buyable_cash_now = account_buying_power(symbol=self.health_cash_symbol, ord_dvsn="01", price="0")
+            self._last_buyable_cash = buyable_cash_now
+            self._last_buyable_cash_ts = ts_epoch
+            cash_state = f"{buyable_cash_now:,.0f}원"
+        except Exception as e:
+            if self._last_buyable_cash_ts > 0:
+                age = max(0.0, ts_epoch - self._last_buyable_cash_ts)
+                cash_state = f"조회실패({type(e).__name__}) / 마지막 {self._last_buyable_cash:,.0f}원 {age:.0f}s전"
+            else:
+                cash_state = f"조회실패({type(e).__name__})"
         top_reason = "-"
         top_cnt = 0
         if self._nobuy_reason_counts:
@@ -592,6 +703,8 @@ class EngineReal:
             lines=[
                 f"WS 상태: {ws_state}",
                 f"최근 이벤트: 신호 {self._health_signal_hits} / 주문 {self._health_order_tries} / 실패 {self._health_failures}",
+                f"현재 주문가능금액: {cash_state}",
+                f"거래가능 상태: {'ON' if self.trade_ready else 'BLOCKED'} {self.trade_block_reason[:80]}",
                 f"미체결 주원인: {top_reason} ({top_cnt}회)",
                 f"지연: avg {lat_avg:.3f}s / max {self._lat_max:.3f}s",
                 f"메모리(RSS): {self._memory_mb():.1f} MB",
@@ -607,6 +720,7 @@ class EngineReal:
 
     def on_timer(self, ts_epoch: float):
         self._ensure_day_roll(ts_epoch)
+        self._refresh_trade_ready(ts_epoch)
         hhmm = int(time.strftime("%H%M", time.localtime(ts_epoch)))
         if 900 <= hhmm <= 910:
             self._send_day_start_summary(ts_epoch)
@@ -728,6 +842,10 @@ class EngineReal:
         sym = row.get("MKSC_SHRN_ISCD", "")
         if not sym:
             return
+        if not self.trade_ready:
+            self._note_no_buy(ts_epoch, sym, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, f"trade_blocked {self.trade_block_reason[:120]}")
+            return
+        self._prune_buy_fail_state(ts_epoch)
         price = _f(row.get("STCK_PRPR"))
         vol = _f(row.get("CNTG_VOL"))
         is_cum_vol = row.get("CNTG_VOL_CUM", "0") == "1"
@@ -753,6 +871,11 @@ class EngineReal:
             return
 
         dayrise = self._day_rise_pct(sym, price)
+
+        blocked, block_detail = self._is_buy_blocked_after_fail(sym, ts_epoch)
+        if blocked:
+            self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, dayrise, block_detail)
+            return
 
         dq = self.ticks[sym]
         dq.append((ts_epoch, price, vol))
@@ -800,8 +923,16 @@ class EngineReal:
 
         # 1) Trigger gate: ret/tick/spread + confirm
         trigger_fail = []
-        if ret < min_ret_pct:
-            trigger_fail.append(f"ret cur={ret:.2f} thr={min_ret_pct:.2f} margin={ret-min_ret_pct:.2f}")
+        dynamic_ret_min = min_ret_pct
+        if dayrise >= 2.0:
+            dynamic_ret_min += 0.10
+        if dayrise >= 4.0:
+            dynamic_ret_min += 0.12
+        if dayrise >= 7.0:
+            dynamic_ret_min += 0.18
+
+        if ret < dynamic_ret_min:
+            trigger_fail.append(f"ret cur={ret:.2f} thr={dynamic_ret_min:.2f} margin={ret-dynamic_ret_min:.2f}")
         if tick_count < min_tick_count:
             trigger_fail.append(f"ticks cur={tick_count} thr={min_tick_count} margin={tick_count-min_tick_count}")
         if trv < min_tr_value:
@@ -868,9 +999,15 @@ class EngineReal:
             )
             return
 
+        session = self._session_name(ts_epoch)
         score_spread = max_spread_pct if (ob_stale and self.orderbook_stale_mode == "guard") else spread
         score = self._entry_score(ret, tick_count, trv, imb, score_spread, max_spread_pct)
-        if score < self.entry_score_min:
+        score_floor = self.entry_score_min
+        if session == "OPEN":
+            score_floor += float(os.getenv("OPEN_ENTRY_SCORE_BONUS", "12"))
+        elif session == "MID":
+            score_floor += float(os.getenv("MID_ENTRY_SCORE_BONUS", "4"))
+        if score < score_floor:
             self._note_no_buy(
                 ts_epoch,
                 sym,
@@ -881,7 +1018,7 @@ class EngineReal:
                 imb,
                 spread,
                 dayrise,
-                f"score {score:.1f}<{self.entry_score_min:.1f}",
+                f"score {score:.1f}<{score_floor:.1f}",
             )
             return
 

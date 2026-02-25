@@ -29,6 +29,8 @@ PREOPEN_START_HHMM = int(os.getenv("PREOPEN_START_HHMM", "900"))
 
 TR_IDS = [t.strip() for t in os.getenv("TR_IDS", "H0STCNT0,H0STASP0").split(",") if t.strip()]
 POLL_WATCH_SEC = float(os.getenv("WATCH_POLL_SEC", "2.0"))
+MAX_SUB_BACKOFF_SEC = float(os.getenv("WS_SUB_BACKOFF_MAX_SEC", "60"))
+BASE_SUB_BACKOFF_SEC = float(os.getenv("WS_SUB_BACKOFF_BASE_SEC", "2"))
 
 
 def _ensure_dir(path: str):
@@ -116,6 +118,10 @@ class WSCapture:
         self.stop_evt = threading.Event()
         self.reconnect_evt = threading.Event()
         self.subscribed = set()
+        self.pending_subscribe: dict[tuple[str, str], float] = {}
+        self.sub_blocked_until: dict[tuple[str, str], float] = {}
+        self.sub_blocked_retry_exp: dict[tuple[str, str], int] = {}
+        self.last_sync_desired: set[str] = set()
         self.lock = threading.Lock()
         self.preopen_day = ""
         self.preopen_snapshot: set[str] = set()
@@ -170,6 +176,7 @@ class WSCapture:
                     pass
                 return
             if s.startswith("{"):
+                j = {}
                 try:
                     j = json.loads(s)
                     if str(j.get("header", {}).get("tr_id", "")).upper() == "PINGPONG":
@@ -178,6 +185,7 @@ class WSCapture:
                         return
                 except Exception:
                     pass
+                self._handle_control_json(j if isinstance(j, dict) else {})
                 _append(CONTROL_FILE, f"{_ts()}\t{s[:2000]}")
                 return
             if s.startswith("0|") or s.startswith("1|"):
@@ -213,6 +221,10 @@ class WSCapture:
             if self.reconnect_evt.is_set() or dead:
                 self.reconnect_evt.clear()
                 self.subscribed.clear()
+                self.pending_subscribe.clear()
+                self.sub_blocked_until.clear()
+                self.sub_blocked_retry_exp.clear()
+                self.last_sync_desired = set()
                 _append(CONTROL_FILE, f"{_ts()}\tRECONNECT start")
                 try:
                     self.approval_key = get_approval_key()
@@ -220,6 +232,69 @@ class WSCapture:
                     _append(CONTROL_FILE, f"{_ts()}\tRECONNECT approval_err {type(e).__name__}: {e}")
                     continue
                 _spawn_ws()
+
+    def _sub_key(self, sym: str, tr_id: str) -> tuple[str, str]:
+        return (sym, tr_id)
+
+    def _handle_control_json(self, j: dict):
+        body = j.get("body", {}) if isinstance(j, dict) else {}
+        header = j.get("header", {}) if isinstance(j, dict) else {}
+        rt_cd = str(j.get("rt_cd", body.get("rt_cd", ""))).strip()
+        msg = str(j.get("msg1", body.get("msg1", ""))).strip()
+        tr_id = str(header.get("tr_id", body.get("tr_id", ""))).strip()
+        tr_key = str(body.get("tr_key", body.get("input", {}).get("tr_key", ""))).strip()
+        if not tr_id or not tr_key:
+            return
+        key = self._sub_key(tr_key, tr_id)
+        now = time.time()
+        if rt_cd == "0":
+            self.pending_subscribe.pop(key, None)
+            self.sub_blocked_until.pop(key, None)
+            self.sub_blocked_retry_exp.pop(key, None)
+            self.subscribed.add(tr_key)
+            return
+        if "MAX SUBSCRIBE OVER" in msg.upper():
+            exp = self.sub_blocked_retry_exp.get(key, 0)
+            wait = min(MAX_SUB_BACKOFF_SEC, BASE_SUB_BACKOFF_SEC * (2 ** exp))
+            self.sub_blocked_until[key] = now + wait
+            self.sub_blocked_retry_exp[key] = min(exp + 1, 8)
+            self.pending_subscribe.pop(key, None)
+            self.subscribed.discard(tr_key)
+            _append(CONTROL_FILE, f"{_ts()}	SUB_BLOCK key={tr_key}/{tr_id} wait={wait:.1f}s msg={msg[:120]}")
+            return
+        if rt_cd:
+            self.pending_subscribe.pop(key, None)
+            self.subscribed.discard(tr_key)
+
+    def _unsubscribe_symbol(self, ws, sym: str):
+        for tr in TR_IDS:
+            key = self._sub_key(sym, tr)
+            self.pending_subscribe.pop(key, None)
+            self.sub_blocked_until.pop(key, None)
+            self.sub_blocked_retry_exp.pop(key, None)
+            try:
+                ws.send(build_msg(self.approval_key, tr, sym, "0"))
+            except Exception:
+                pass
+        self.subscribed.discard(sym)
+
+    def _try_subscribe_symbol(self, ws, sym: str) -> int:
+        sent = 0
+        now = time.time()
+        for tr in TR_IDS:
+            key = self._sub_key(sym, tr)
+            if self.pending_subscribe.get(key):
+                continue
+            blocked_until = self.sub_blocked_until.get(key, 0.0)
+            if blocked_until > now:
+                continue
+            try:
+                ws.send(build_msg(self.approval_key, tr, sym, "1"))
+                self.pending_subscribe[key] = now
+                sent += 1
+            except Exception:
+                pass
+        return sent
 
     def stop(self):
         self.stop_evt.set()
@@ -231,30 +306,26 @@ class WSCapture:
 
     def _sync_subscriptions(self, ws, desired: set[str], force: bool = False):
         with self.lock:
-            add = desired - self.subscribed
+            desired = set(desired)
             rem = self.subscribed - desired
-            if force:
-                add = desired
-                rem = set()
+            if rem:
+                for sym in sorted(rem):
+                    self._unsubscribe_symbol(ws, sym)
 
-            for sym in sorted(add):
-                for tr in TR_IDS:
-                    try:
-                        ws.send(build_msg(self.approval_key, tr, sym, "1"))
-                    except Exception:
-                        pass
-                self.subscribed.add(sym)
+            add = desired - self.subscribed
+            sent_req = 0
+            if force or desired != self.last_sync_desired or add:
+                for sym in sorted(add):
+                    sent_req += self._try_subscribe_symbol(ws, sym)
+                self.last_sync_desired = set(desired)
 
-            for sym in sorted(rem):
-                for tr in TR_IDS:
-                    try:
-                        ws.send(build_msg(self.approval_key, tr, sym, "0"))
-                    except Exception:
-                        pass
-                self.subscribed.discard(sym)
-
-            if add or rem or force:
+            if add or rem or force or sent_req:
+                blocked = 0
+                now = time.time()
+                for sym in add:
+                    if any(self.sub_blocked_until.get(self._sub_key(sym, tr), 0.0) > now for tr in TR_IDS):
+                        blocked += 1
                 _append(
                     CONTROL_FILE,
-                    f"{_ts()}\tSYNC desired={len(desired)} add={len(add)} rem={len(rem)} subscribed={len(self.subscribed)}",
+                    f"{_ts()}	SYNC desired={len(desired)} add={len(add)} rem={len(rem)} subscribed={len(self.subscribed)} sent={sent_req} blocked={blocked}",
                 )
