@@ -462,7 +462,7 @@ class EngineReal:
     def _entry_score(self, ret: float, ret10: float, tick_count: int, trv: float, imb: float, depth_ratio: float, spread: float, max_spread_pct: float) -> float:
         spread_bonus = max(0.0, max_spread_pct - spread) * 30.0
         tick_bonus = min(tick_count, 20) * 1.0
-        trv_bonus = min(math.log10(max(0.0, trv) / 10000000.0 + 1.0) * 20.0, 30.0)
+        trv_bonus = min(math.log10(max(0.0, trv) / 10000000.0 + 1.0) * 18.0, 25.0)
         imb_bonus = max(0.0, imb - 0.5) * 80.0
         depth_bonus = max(0.0, depth_ratio - 1.0) * 25.0
         ret_bonus = ret * 40.0
@@ -922,6 +922,7 @@ class EngineReal:
         vi_gap = abs(price - vi_std) / vi_std * 100.0 if vi_std > 0 else 999.0
 
         c0 = self.candidate_since.get(sym)
+        session = self._session_name(ts_epoch)
 
         # 1) Trigger gate: ret/tick/spread + confirm
         trigger_fail = []
@@ -948,7 +949,16 @@ class EngineReal:
         if ret10 >= 0.25 and imb < 0.55:
             trigger_fail.append(f"ret10_imb_mismatch ret10={ret10:.2f} imb={imb:.2f} need>=0.55")
 
+        if session == "OPEN" and ret10 >= 0.25 and imb < 0.60:
+            trigger_fail.append(f"open_ret10_imb_mismatch ret10={ret10:.2f} imb={imb:.2f} need>=0.60")
+
         imb_min_dynamic = min_imb
+        if session == "OPEN":
+            imb_min_dynamic = max(imb_min_dynamic, 0.62)
+        elif session == "MID":
+            imb_min_dynamic = max(imb_min_dynamic, 0.60)
+        else:
+            imb_min_dynamic = max(imb_min_dynamic, 0.58)
         if 0.25 <= ret10 < 0.40:
             imb_min_dynamic = max(imb_min_dynamic, 0.60)
         elif 0.40 <= ret10 <= 0.60:
@@ -1017,7 +1027,6 @@ class EngineReal:
             )
             return
 
-        session = self._session_name(ts_epoch)
         score_spread = max_spread_pct if (ob_stale and self.orderbook_stale_mode == "guard") else spread
         score = self._entry_score(ret, ret10, tick_count, trv, imb, depth_ratio, score_spread, max_spread_pct)
         score_floor = self.entry_score_min
