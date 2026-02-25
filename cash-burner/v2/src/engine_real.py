@@ -135,6 +135,9 @@ class EngineReal:
         self._health_failures = 0
         self.buy_fail_cooldown_sec = float(os.getenv("BUY_FAIL_COOLDOWN_SEC", "30"))
         self.buy_fail_state_ttl_sec = float(os.getenv("BUY_FAIL_STATE_TTL_SEC", "1800"))
+        self.buy_try_cooldown_sec = float(os.getenv("BUY_TRY_COOLDOWN_SEC", "20"))
+        self.global_buy_try_window_sec = float(os.getenv("GLOBAL_BUY_TRY_WINDOW_SEC", "60"))
+        self.global_buy_try_limit = int(os.getenv("GLOBAL_BUY_TRY_LIMIT", "8"))
         self._buy_fail_by_symbol = {}
         self.health_cash_symbol = os.getenv("HEALTH_CASH_SYMBOL", "005930").strip() or "005930"
         self._last_buyable_cash = 0.0
@@ -171,6 +174,8 @@ class EngineReal:
         self.symbol_first_trade_ts: Dict[str, float] = {}
         self.pos: Dict[str, Position] = {}
         self.last_entry_ts: Dict[str, float] = {}
+        self.last_buy_try_ts: Dict[str, float] = {}
+        self._global_buy_try_ts: Deque[float] = deque(maxlen=5000)
         self.candidate_since: Dict[str, float] = {}
         self.vi_last_ts: Dict[str, float] = {}
         self._score_pick_bucket_start = 0.0
@@ -346,10 +351,26 @@ class EngineReal:
         msg = fail_msg or "order_fail"
         return True, f"buy_fail_cooldown<{remain:.1f}s msg={msg[:80]}"
 
+    def _global_buy_try_allowed(self, ts_epoch: float) -> tuple[bool, float]:
+        if self.global_buy_try_limit <= 0 or self.global_buy_try_window_sec <= 0:
+            return True, 0.0
+        cutoff = ts_epoch - self.global_buy_try_window_sec
+        while self._global_buy_try_ts and self._global_buy_try_ts[0] < cutoff:
+            self._global_buy_try_ts.popleft()
+        if len(self._global_buy_try_ts) < self.global_buy_try_limit:
+            return True, 0.0
+        wait = max(0.0, self._global_buy_try_ts[0] + self.global_buy_try_window_sec - ts_epoch)
+        return False, wait
+
+    def _record_buy_try(self, sym: str, ts_epoch: float):
+        self.last_buy_try_ts[sym] = ts_epoch
+        self._global_buy_try_ts.append(ts_epoch)
+
     def _cleanup_symbol_state(self, sym: str):
         self.pos.pop(sym, None)
         self.candidate_since.pop(sym, None)
         self.last_entry_ts.pop(sym, None)
+        self.last_buy_try_ts.pop(sym, None)
         self.vi_last_ts.pop(sym, None)
         self._last_diag_ts.pop(sym, None)
         self.book.pop(sym, None)
@@ -554,6 +575,8 @@ class EngineReal:
         self._lat_cnt = 0
         self._lat_max = 0.0
         self._nobuy_reason_counts.clear()
+        self.last_buy_try_ts.clear()
+        self._global_buy_try_ts.clear()
         self._buy_fail_by_symbol.clear()
         self._last_buyable_cash = 0.0
         self._last_buyable_cash_ts = 0.0
@@ -871,6 +894,10 @@ class EngineReal:
         if ts_epoch - self.last_entry_ts.get(sym, 0.0) < cooldown_sec:
             self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, 0, f"cooldown<{cooldown_sec:.0f}s")
             return
+        if self.buy_try_cooldown_sec > 0 and (ts_epoch - self.last_buy_try_ts.get(sym, 0.0)) < self.buy_try_cooldown_sec:
+            remain = self.buy_try_cooldown_sec - (ts_epoch - self.last_buy_try_ts.get(sym, 0.0))
+            self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, 0, f"buy_try_cooldown<{remain:.1f}s")
+            return
 
         dayrise = self._day_rise_pct(sym, price)
 
@@ -1081,6 +1108,11 @@ class EngineReal:
             self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"qty=0 cash={cash:.0f} target={target:.0f}")
             return
 
+        allowed, wait = self._global_buy_try_allowed(ts_epoch)
+        if not allowed:
+            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"global_buy_try_limit wait={wait:.1f}s")
+            return
+        self._record_buy_try(sym, ts_epoch)
         j = self._safe_order("BUY", sym, qty, ts_epoch, price, f"signal ses={session} ret={ret:.2f} ret10={ret10:.2f} imb={imb:.2f} spr={spread:.2f} dayrise={dayrise:.2f} score={score:.1f} base_ready={int(baseline_ready)} ob_stale={int(ob_stale)} ob_age={ob_age:.2f}s")
         if j.get("rt_cd") == "0":
             self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, trail_armed=False)
