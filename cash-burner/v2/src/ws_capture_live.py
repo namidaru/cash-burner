@@ -27,12 +27,33 @@ LEDGER_FILE = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
 PREOPEN_TRACK_MIN = int(os.getenv("PREOPEN_TRACK_MIN", "15"))
 PREOPEN_START_HHMM = int(os.getenv("PREOPEN_START_HHMM", "900"))
 
-TR_IDS = [t.strip() for t in os.getenv("TR_IDS", "H0STCNT0,H0STASP0").split(",") if t.strip()]
+RAW_TR_IDS = [t.strip() for t in os.getenv("TR_IDS", "H0STCNT0,H0STASP0").split(",") if t.strip()]
+ALLOWED_TR_IDS = {"H0STCNT0", "H0STASP0"}
+ALLOWED_TR_TYPES = {"1", "2"}
 POLL_WATCH_SEC = float(os.getenv("WATCH_POLL_SEC", "2.0"))
 MAX_SUB_BACKOFF_SEC = float(os.getenv("WS_SUB_BACKOFF_MAX_SEC", "60"))
 BASE_SUB_BACKOFF_SEC = float(os.getenv("WS_SUB_BACKOFF_BASE_SEC", "2"))
-ALLOWED_TR_IDS = {"H0STCNT0", "H0STASP0"}
-ALLOWED_TR_TYPES = {"1", "2"}
+MAX_ACTIVE_SUB_KEYS = int(os.getenv("WS_MAX_ACTIVE_SUB_KEYS", "50"))
+
+
+def _normalized_tr_ids(raw_ids: list[str]) -> tuple[list[str], list[str]]:
+    ordered: list[str] = []
+    dropped: list[str] = []
+    seen: set[str] = set()
+    for tr in raw_ids:
+        if tr not in ALLOWED_TR_IDS:
+            dropped.append(tr)
+            continue
+        if tr in seen:
+            continue
+        seen.add(tr)
+        ordered.append(tr)
+    return ordered, dropped
+
+
+TR_IDS, DROPPED_TR_IDS = _normalized_tr_ids(RAW_TR_IDS)
+if not TR_IDS:
+    TR_IDS = ["H0STCNT0"]
 
 
 def _ensure_dir(path: str):
@@ -122,6 +143,7 @@ class WSCapture:
         self.stop_evt = threading.Event()
         self.reconnect_evt = threading.Event()
         self.subscribed = set()
+        self.subscribed_keys: set[tuple[str, str]] = set()
         self.pending_subscribe: dict[tuple[str, str], float] = {}
         self.sub_blocked_until: dict[tuple[str, str], float] = {}
         self.sub_blocked_retry_exp: dict[tuple[str, str], int] = {}
@@ -165,6 +187,8 @@ class WSCapture:
         _ensure_dir(OUT_FILE)
         _append(OUT_FILE, f"# ---- session start {_ts()} mode=real tr_ids={TR_IDS} ----")
         _append(CONTROL_FILE, f"{_ts()}\tBOOT watchlist_file={WATCHLIST_FILE}")
+        if DROPPED_TR_IDS:
+            _append(CONTROL_FILE, f"{_ts()}\tTR_ID_DROP unsupported={','.join(DROPPED_TR_IDS)}")
         self.approval_key = get_approval_key()
 
 
@@ -243,6 +267,7 @@ class WSCapture:
             if self.reconnect_evt.is_set() or dead:
                 self.reconnect_evt.clear()
                 self.subscribed.clear()
+                self.subscribed_keys.clear()
                 self.pending_subscribe.clear()
                 self.sub_blocked_until.clear()
                 self.sub_blocked_retry_exp.clear()
@@ -257,6 +282,20 @@ class WSCapture:
 
     def _sub_key(self, sym: str, tr_id: str) -> tuple[str, str]:
         return (sym, tr_id)
+
+    def _desired_sub_keys(self, desired_symbols: set[str]) -> list[tuple[str, str]]:
+        # 한도 초과 방지를 위해 체결(H0STCNT0)을 우선 배치하고, 남는 슬롯에 호가를 배치한다.
+        ordered_syms = sorted(desired_symbols)
+        keys: list[tuple[str, str]] = []
+        if "H0STCNT0" in TR_IDS:
+            for sym in ordered_syms:
+                keys.append((sym, "H0STCNT0"))
+        for tr in TR_IDS:
+            if tr == "H0STCNT0":
+                continue
+            for sym in ordered_syms:
+                keys.append((sym, tr))
+        return keys[:max(0, MAX_ACTIVE_SUB_KEYS)]
 
     def _enqueue_ws_raw(self, payload: str):
         try:
@@ -286,13 +325,34 @@ class WSCapture:
             _append(CONTROL_FILE, f"{_ts()}	SUB_BUILD_ERR {type(e).__name__}: {e}")
             return False
 
-    def _handle_control_json(self, j: dict):
+    def _extract_control_fields(self, j: dict) -> tuple[str, str, str, str]:
         body = j.get("body", {}) if isinstance(j, dict) else {}
         header = j.get("header", {}) if isinstance(j, dict) else {}
+        input_body = body.get("input", {}) if isinstance(body, dict) else {}
+        output = body.get("output", {}) if isinstance(body, dict) else {}
+
         rt_cd = str(j.get("rt_cd", body.get("rt_cd", ""))).strip()
-        msg = str(j.get("msg1", body.get("msg1", ""))).strip()
-        tr_id = str(header.get("tr_id", body.get("tr_id", ""))).strip()
-        tr_key = str(body.get("tr_key", body.get("input", {}).get("tr_key", ""))).strip()
+        msg = str(j.get("msg1", body.get("msg1", j.get("msg", "")))).strip()
+
+        tr_id = str(
+            header.get("tr_id", "")
+            or body.get("tr_id", "")
+            or input_body.get("tr_id", "")
+            or output.get("tr_id", "")
+        ).strip()
+        tr_key = str(
+            body.get("tr_key", "")
+            or input_body.get("tr_key", "")
+            or output.get("tr_key", "")
+            or header.get("tr_key", "")
+        ).strip()
+        return rt_cd, msg, tr_id, tr_key
+
+    def _refresh_subscribed_symbols(self):
+        self.subscribed = {sym for (sym, _tr) in self.subscribed_keys}
+
+    def _handle_control_json(self, j: dict):
+        rt_cd, msg, tr_id, tr_key = self._extract_control_fields(j)
         if not tr_id or not tr_key:
             return
         key = self._sub_key(tr_key, tr_id)
@@ -301,7 +361,8 @@ class WSCapture:
             self.pending_subscribe.pop(key, None)
             self.sub_blocked_until.pop(key, None)
             self.sub_blocked_retry_exp.pop(key, None)
-            self.subscribed.add(tr_key)
+            self.subscribed_keys.add(key)
+            self._refresh_subscribed_symbols()
             return
         if "MAX SUBSCRIBE OVER" in msg.upper():
             exp = self.sub_blocked_retry_exp.get(key, 0)
@@ -309,41 +370,41 @@ class WSCapture:
             self.sub_blocked_until[key] = now + wait
             self.sub_blocked_retry_exp[key] = min(exp + 1, 8)
             self.pending_subscribe.pop(key, None)
-            self.subscribed.discard(tr_key)
+            self.subscribed_keys.discard(key)
+            self._refresh_subscribed_symbols()
             _append(CONTROL_FILE, f"{_ts()}	SUB_BLOCK key={tr_key}/{tr_id} wait={wait:.1f}s msg={msg[:120]}")
             return
         if rt_cd:
             self.pending_subscribe.pop(key, None)
-            self.subscribed.discard(tr_key)
+            self.subscribed_keys.discard(key)
+            self._refresh_subscribed_symbols()
 
-    def _unsubscribe_symbol(self, ws, sym: str):
-        for tr in TR_IDS:
-            key = self._sub_key(sym, tr)
-            self.pending_subscribe.pop(key, None)
-            self.sub_blocked_until.pop(key, None)
-            self.sub_blocked_retry_exp.pop(key, None)
-            try:
-                self._enqueue_sub_message(tr, sym, "2")
-            except Exception:
-                pass
-        self.subscribed.discard(sym)
+    def _unsubscribe_key(self, sym: str, tr: str):
+        key = self._sub_key(sym, tr)
+        self.pending_subscribe.pop(key, None)
+        self.sub_blocked_until.pop(key, None)
+        self.sub_blocked_retry_exp.pop(key, None)
+        try:
+            self._enqueue_sub_message(tr, sym, "2")
+        except Exception:
+            pass
+        self.subscribed_keys.discard(key)
 
-    def _try_subscribe_symbol(self, ws, sym: str) -> int:
+    def _try_subscribe_key(self, sym: str, tr: str) -> int:
         sent = 0
         now = time.time()
-        for tr in TR_IDS:
-            key = self._sub_key(sym, tr)
-            if self.pending_subscribe.get(key):
-                continue
-            blocked_until = self.sub_blocked_until.get(key, 0.0)
-            if blocked_until > now:
-                continue
-            try:
-                if self._enqueue_sub_message(tr, sym, "1"):
-                    self.pending_subscribe[key] = now
-                    sent += 1
-            except Exception:
-                pass
+        key = self._sub_key(sym, tr)
+        if self.pending_subscribe.get(key):
+            return 0
+        blocked_until = self.sub_blocked_until.get(key, 0.0)
+        if blocked_until > now:
+            return 0
+        try:
+            if self._enqueue_sub_message(tr, sym, "1"):
+                self.pending_subscribe[key] = now
+                sent += 1
+        except Exception:
+            pass
         return sent
 
     def stop(self):
@@ -356,26 +417,29 @@ class WSCapture:
 
     def _sync_subscriptions(self, ws, desired: set[str], force: bool = False):
         with self.lock:
-            desired = set(desired)
-            rem = self.subscribed - desired
-            if rem:
-                for sym in sorted(rem):
-                    self._unsubscribe_symbol(ws, sym)
+            desired_symbols = set(desired)
+            desired_keys = set(self._desired_sub_keys(desired_symbols))
 
-            add = desired - self.subscribed
+            rem_keys = self.subscribed_keys - desired_keys
+            for sym, tr in sorted(rem_keys):
+                self._unsubscribe_key(sym, tr)
+
+            add_keys = desired_keys - self.subscribed_keys
             sent_req = 0
-            if force or desired != self.last_sync_desired or add:
-                for sym in sorted(add):
-                    sent_req += self._try_subscribe_symbol(ws, sym)
-                self.last_sync_desired = set(desired)
+            if force or desired_keys != self.last_sync_desired or add_keys:
+                for sym, tr in sorted(add_keys):
+                    sent_req += self._try_subscribe_key(sym, tr)
+                self.last_sync_desired = set(desired_keys)
 
-            if add or rem or force or sent_req:
+            self._refresh_subscribed_symbols()
+
+            if add_keys or rem_keys or force or sent_req:
                 blocked = 0
                 now = time.time()
-                for sym in add:
-                    if any(self.sub_blocked_until.get(self._sub_key(sym, tr), 0.0) > now for tr in TR_IDS):
+                for sym, tr in add_keys:
+                    if self.sub_blocked_until.get(self._sub_key(sym, tr), 0.0) > now:
                         blocked += 1
                 _append(
                     CONTROL_FILE,
-                    f"{_ts()}	SYNC desired={len(desired)} add={len(add)} rem={len(rem)} subscribed={len(self.subscribed)} sent={sent_req} blocked={blocked}",
+                    f"{_ts()}	SYNC desired_sym={len(desired_symbols)} desired_key={len(desired_keys)} add={len(add_keys)} rem={len(rem_keys)} subscribed_sym={len(self.subscribed)} subscribed_key={len(self.subscribed_keys)} sent={sent_req} blocked={blocked}",
                 )

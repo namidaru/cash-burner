@@ -120,6 +120,13 @@ class EngineReal:
         self.entry_block_dayrise_pct = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "12.0"))
         self.limitup_gap_take_pct = float(os.getenv("LIMITUP_GAP_TAKE_PCT", "0.85"))
 
+        self.ret_dayrise_add_2 = float(os.getenv("RET_DAYRISE_ADD_2", "0.05"))
+        self.ret_dayrise_add_4 = float(os.getenv("RET_DAYRISE_ADD_4", "0.08"))
+        self.ret_dayrise_add_7 = float(os.getenv("RET_DAYRISE_ADD_7", "0.12"))
+        self.ret10_relax_start = float(os.getenv("RET10_RELAX_START", "0.30"))
+        self.ret10_relax_end = float(os.getenv("RET10_RELAX_END", "0.60"))
+        self.ret10_relax_max = float(os.getenv("RET10_RELAX_MAX", "0.12"))
+
         self.kill_switch_file = os.getenv("KILL_SWITCH_FILE", os.path.join("data", "kill.switch"))
         self.ledger_file = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
 
@@ -936,14 +943,20 @@ class EngineReal:
         trigger_fail = []
         dynamic_ret_min = min_ret_pct
         if dayrise >= 2.0:
-            dynamic_ret_min += 0.10
+            dynamic_ret_min += self.ret_dayrise_add_2
         if dayrise >= 4.0:
-            dynamic_ret_min += 0.12
+            dynamic_ret_min += self.ret_dayrise_add_4
         if dayrise >= 7.0:
-            dynamic_ret_min += 0.18
+            dynamic_ret_min += self.ret_dayrise_add_7
+
+        ret10_relax = 0.0
+        if self.ret10_relax_end > self.ret10_relax_start and ret10 > self.ret10_relax_start:
+            ratio = min(1.0, (ret10 - self.ret10_relax_start) / (self.ret10_relax_end - self.ret10_relax_start))
+            ret10_relax = self.ret10_relax_max * ratio
+            dynamic_ret_min = max(min_ret_pct, dynamic_ret_min - ret10_relax)
 
         if ret < dynamic_ret_min:
-            trigger_fail.append(f"ret cur={ret:.2f} thr={dynamic_ret_min:.2f} margin={ret-dynamic_ret_min:.2f}")
+            trigger_fail.append(f"ret cur={ret:.2f} thr={dynamic_ret_min:.2f} margin={ret-dynamic_ret_min:.2f} relax={ret10_relax:.2f}")
         if tick_count < min_tick_count:
             trigger_fail.append(f"ticks cur={tick_count} thr={min_tick_count} margin={tick_count-min_tick_count}")
         if trv < min_tr_value:
