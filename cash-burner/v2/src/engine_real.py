@@ -139,6 +139,7 @@ class EngineReal:
         self.notifier = DiscordNotifier()
 
         self.health_check_sec = float(os.getenv("HEALTH_CHECK_SEC", "1800"))
+        self.health_check_market_only = os.getenv("HEALTH_CHECK_MARKET_ONLY", "1") == "1"
         self.ws_stale_sec = float(os.getenv("WS_STALE_SEC", "20"))
         self._last_health_ts = 0.0
         self._health_signal_hits = 0
@@ -776,6 +777,10 @@ class EngineReal:
 
     def _send_health_check(self, ts_epoch: float):
         if self.health_check_sec <= 0:
+            return
+        hhmm = int(time.strftime("%H%M", time.localtime(ts_epoch)))
+        if self.health_check_market_only and not (900 <= hhmm < 1530):
+            self._nobuy_reason_counts.clear()
             return
         if (ts_epoch - self._last_health_ts) < self.health_check_sec:
             return
