@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os, json, time, threading, csv
+import os, json, time, threading, csv, queue, re
 import requests, websocket
 
 APP_KEY = os.getenv("KOREA_INVEST_APP_KEY","")
@@ -31,6 +31,8 @@ TR_IDS = [t.strip() for t in os.getenv("TR_IDS", "H0STCNT0,H0STASP0").split(",")
 POLL_WATCH_SEC = float(os.getenv("WATCH_POLL_SEC", "2.0"))
 MAX_SUB_BACKOFF_SEC = float(os.getenv("WS_SUB_BACKOFF_MAX_SEC", "60"))
 BASE_SUB_BACKOFF_SEC = float(os.getenv("WS_SUB_BACKOFF_BASE_SEC", "2"))
+ALLOWED_TR_IDS = {"H0STCNT0", "H0STASP0"}
+ALLOWED_TR_TYPES = {"1", "2"}
 
 
 def _ensure_dir(path: str):
@@ -115,6 +117,8 @@ class WSCapture:
         self.approval_key = None
         self.ws = None
         self.ws_thread = None
+        self.ws_send_queue: queue.Queue[str] = queue.Queue(maxsize=10000)
+        self.ws_send_thread = None
         self.stop_evt = threading.Event()
         self.reconnect_evt = threading.Event()
         self.subscribed = set()
@@ -163,6 +167,24 @@ class WSCapture:
         _append(CONTROL_FILE, f"{_ts()}\tBOOT watchlist_file={WATCHLIST_FILE}")
         self.approval_key = get_approval_key()
 
+
+        def _send_loop():
+            while not self.stop_evt.is_set():
+                try:
+                    payload = self.ws_send_queue.get(timeout=0.5)
+                except Exception:
+                    continue
+                try:
+                    ws_ref = self.ws
+                    if ws_ref is not None:
+                        ws_ref.send(payload)
+                except Exception as e:
+                    _append(CONTROL_FILE, f"{_ts()}	SEND_ERR {type(e).__name__}: {e}")
+
+        if self.ws_send_thread is None or (not self.ws_send_thread.is_alive()):
+            self.ws_send_thread = threading.Thread(target=_send_loop, daemon=True)
+            self.ws_send_thread.start()
+
         def on_open(ws):
             _append(CONTROL_FILE, f"{_ts()}\tOPEN {WS_URL}")
             self._sync_subscriptions(ws, self._desired_symbols(), force=True)
@@ -171,7 +193,7 @@ class WSCapture:
             s = message if isinstance(message, str) else message.decode("utf-8", "ignore")
             if s == "PINGPONG":
                 try:
-                    ws.send("PINGPONG")
+                    self._enqueue_ws_raw("PINGPONG")
                 except Exception:
                     pass
                 return
@@ -180,7 +202,7 @@ class WSCapture:
                 try:
                     j = json.loads(s)
                     if str(j.get("header", {}).get("tr_id", "")).upper() == "PINGPONG":
-                        ws.send("PINGPONG")
+                        self._enqueue_ws_raw("PINGPONG")
                         _append(CONTROL_FILE, f"{_ts()}\tPING_ACK json")
                         return
                 except Exception:
@@ -236,6 +258,34 @@ class WSCapture:
     def _sub_key(self, sym: str, tr_id: str) -> tuple[str, str]:
         return (sym, tr_id)
 
+    def _enqueue_ws_raw(self, payload: str):
+        try:
+            self.ws_send_queue.put_nowait(payload)
+        except Exception:
+            _append(CONTROL_FILE, f"{_ts()}	SEND_DROP queue_full")
+
+    def _validate_sub_request(self, tr_id: str, tr_key: str, tr_type: str) -> tuple[bool, str]:
+        if tr_type not in ALLOWED_TR_TYPES:
+            return False, f"invalid_tr_type {tr_type}"
+        if tr_id not in ALLOWED_TR_IDS:
+            return False, f"invalid_tr_id {tr_id}"
+        if (not re.fullmatch(r"\d{6}", tr_key or "")):
+            return False, f"invalid_tr_key {tr_key}"
+        return True, ""
+
+    def _enqueue_sub_message(self, tr_id: str, sym: str, tr_type: str) -> bool:
+        ok, reason = self._validate_sub_request(tr_id, sym, tr_type)
+        if not ok:
+            _append(CONTROL_FILE, f"{_ts()}	SUB_DROP {reason}")
+            return False
+        try:
+            payload = build_msg(self.approval_key, tr_id, sym, tr_type)
+            self._enqueue_ws_raw(payload)
+            return True
+        except Exception as e:
+            _append(CONTROL_FILE, f"{_ts()}	SUB_BUILD_ERR {type(e).__name__}: {e}")
+            return False
+
     def _handle_control_json(self, j: dict):
         body = j.get("body", {}) if isinstance(j, dict) else {}
         header = j.get("header", {}) if isinstance(j, dict) else {}
@@ -273,7 +323,7 @@ class WSCapture:
             self.sub_blocked_until.pop(key, None)
             self.sub_blocked_retry_exp.pop(key, None)
             try:
-                ws.send(build_msg(self.approval_key, tr, sym, "0"))
+                self._enqueue_sub_message(tr, sym, "2")
             except Exception:
                 pass
         self.subscribed.discard(sym)
@@ -289,9 +339,9 @@ class WSCapture:
             if blocked_until > now:
                 continue
             try:
-                ws.send(build_msg(self.approval_key, tr, sym, "1"))
-                self.pending_subscribe[key] = now
-                sent += 1
+                if self._enqueue_sub_message(tr, sym, "1"):
+                    self.pending_subscribe[key] = now
+                    sent += 1
             except Exception:
                 pass
         return sent

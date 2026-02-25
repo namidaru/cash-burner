@@ -65,9 +65,18 @@ def buyable_cash(symbol: str, ord_dvsn: str="01", price: str="0") -> float:
         "PDNO": symbol,
         "ORD_DVSN": ord_dvsn,
         "ORD_UNPR": str(price),
+        # KIS 문서 필수 파라미터. 누락 시 rt_cd/msg만 오고 output이 비는 케이스가 발생한다.
+        "CMA_EVLU_AMT_ICLD_YN": "Y",
+        "OVRS_ICLD_YN": "N",
     }
     j = request("GET", PATH_BUYABLE, TRID_BUYABLE, params=params)
-    return _extract_buyable_cash_strict(j)
+    try:
+        return _extract_buyable_cash_strict(j)
+    except ValueError as e:
+        rt_cd = str(j.get("rt_cd", ""))
+        msg_cd = str(j.get("msg_cd", ""))
+        msg1 = str(j.get("msg1", j.get("msg", "")))
+        raise ValueError(f"{e}; rt_cd={rt_cd}; msg_cd={msg_cd}; msg={msg1[:160]}")
 
 
 def sellable_qty(symbol: str) -> int:
