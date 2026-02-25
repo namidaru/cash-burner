@@ -1,7 +1,7 @@
 # src/engine_real.py
 from __future__ import annotations
 
-import os, time, math, sys
+import os, time, math, sys, json
 from dataclasses import dataclass
 from collections import defaultdict, deque
 from typing import Dict, Deque, Tuple, Any
@@ -129,6 +129,7 @@ class EngineReal:
 
         self.kill_switch_file = os.getenv("KILL_SWITCH_FILE", os.path.join("data", "kill.switch"))
         self.ledger_file = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
+        self.position_state_file = os.getenv("POSITION_STATE_FILE", os.path.join("data", "positions_real.json"))
 
         self.signal_diag_file = os.getenv("SIGNAL_DIAG_FILE", os.path.join("data", "signal_diag.log"))
         self.signal_diag_sec = float(os.getenv("SIGNAL_DIAG_SEC", "20"))
@@ -180,6 +181,7 @@ class EngineReal:
         self.last_trade_vol: Dict[str, float] = {}
         self.symbol_first_trade_ts: Dict[str, float] = {}
         self.pos: Dict[str, Position] = {}
+        self.loaded_carry_positions = 0
         self.last_entry_ts: Dict[str, float] = {}
         self.candidate_since: Dict[str, float] = {}
         self.vi_last_ts: Dict[str, float] = {}
@@ -368,6 +370,85 @@ class EngineReal:
         self.flow_buckets.pop(sym, None)
         self.last_trade_vol.pop(sym, None)
         self.symbol_first_trade_ts.pop(sym, None)
+        self._save_positions_state()
+
+    def _save_positions_state(self):
+        d = os.path.dirname(self.position_state_file)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        payload = {
+            "updated_at": time.time(),
+            "positions": [
+                {
+                    "symbol": sym,
+                    "qty": int(p.qty),
+                    "entry_price": float(p.entry_price),
+                    "entry_ts": float(p.entry_ts),
+                    "max_price": float(p.max_price),
+                    "trail_armed": bool(p.trail_armed),
+                }
+                for sym, p in sorted(self.pos.items())
+            ],
+        }
+        with open(self.position_state_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    def _load_positions_state(self):
+        if not os.path.exists(self.position_state_file):
+            return
+        try:
+            with open(self.position_state_file, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            return
+        raw_positions = payload.get("positions", []) if isinstance(payload, dict) else []
+        if not isinstance(raw_positions, list):
+            return
+
+        loaded = 0
+        dropped = 0
+        for item in raw_positions:
+            if not isinstance(item, dict):
+                continue
+            sym = str(item.get("symbol", "")).strip()
+            qty = int(_f(item.get("qty"), 0))
+            entry_price = _f(item.get("entry_price"), 0.0)
+            entry_ts = _f(item.get("entry_ts"), time.time())
+            max_price = _f(item.get("max_price"), entry_price)
+            trail_armed = bool(item.get("trail_armed", False))
+            if not sym or qty <= 0 or entry_price <= 0:
+                dropped += 1
+                continue
+
+            try:
+                qty_live = int(sellable_qty(sym))
+            except Exception:
+                qty_live = qty
+            if qty_live <= 0:
+                dropped += 1
+                continue
+            qty = min(qty, qty_live)
+            self.pos[sym] = Position(
+                qty=qty,
+                entry_price=entry_price,
+                entry_ts=entry_ts,
+                max_price=max(max_price, entry_price),
+                trail_armed=trail_armed,
+            )
+            loaded += 1
+
+        self.loaded_carry_positions = loaded
+        if loaded > 0:
+            self.notifier.send(
+                title="📦 이월 보유 복구",
+                color=0x3498DB,
+                lines=[
+                    f"복구 종목수: {loaded}개",
+                    f"제외 종목수: {dropped}개",
+                    f"상태파일: {self.position_state_file}",
+                ],
+            )
+            self._save_positions_state()
 
     def on_orderbook(self, row: Dict[str, str], ts_epoch: float):
         self._ensure_day_roll(ts_epoch)
@@ -653,16 +734,22 @@ class EngineReal:
     def _day_summary_lines(self) -> list[str]:
         total = self.day_sell_count
         win_rate = (self.day_win_count / total * 100.0) if total > 0 else 0.0
-        best = self.day_best or ("-", 0.0, 0.0)
-        worst = self.day_worst or ("-", 0.0, 0.0)
-        return [
+        lines = [
             f"오늘 거래: 매수 {self.day_buy_count} / 매도 {self.day_sell_count}",
             f"승률: {win_rate:.1f}% ({self.day_win_count}승 {self.day_loss_count}패)",
             f"실현손익: {self.day_realized_pnl:,.0f}원",
             f"MDD(실현기준): -{self.day_mdd:,.0f}원",
-            f"최대 수익 1건: {best[0]} {best[1]:,.0f}원 ({best[2]:+.2f}%)",
-            f"최대 손실 1건: {worst[0]} {worst[1]:,.0f}원 ({worst[2]:+.2f}%)",
+            f"이월 포함 보유: {len(self.pos)}종목 / {sum(p.qty for p in self.pos.values()):,}주",
         ]
+        if self.day_best is not None:
+            lines.append(f"최대 수익 1건: {self.day_best[0]} {self.day_best[1]:,.0f}원 ({self.day_best[2]:+.2f}%)")
+        else:
+            lines.append("최대 수익: 없음 (매도 0건)")
+        if self.day_worst is not None:
+            lines.append(f"최대 손실 1건: {self.day_worst[0]} {self.day_worst[1]:,.0f}원 ({self.day_worst[2]:+.2f}%)")
+        else:
+            lines.append("최대 손실: 없음 (매도 0건)")
+        return lines
 
     def _send_day_start_summary(self, ts_epoch: float):
         if self.day_started:
@@ -672,7 +759,7 @@ class EngineReal:
         self.notifier.send(
             title="✅ 매매 시작 요약",
             color=0x2ECC71,
-            lines=[f"시간: {kst}"] + self._day_summary_lines(),
+            lines=[f"시간: {kst}", f"이월 복구: {self.loaded_carry_positions}종목"] + self._day_summary_lines(),
         )
 
     def _send_day_close_summary(self, ts_epoch: float):
@@ -1110,6 +1197,7 @@ class EngineReal:
         j = self._safe_order("BUY", sym, qty, ts_epoch, price, f"signal ses={session} ret={ret:.2f} ret10={ret10:.2f} imb={imb:.2f} spr={spread:.2f} dayrise={dayrise:.2f} score={score:.1f} base_ready={int(baseline_ready)} ob_stale={int(ob_stale)} ob_age={ob_age:.2f}s")
         if j.get("rt_cd") == "0":
             self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, trail_armed=False)
+            self._save_positions_state()
             self.last_entry_ts[sym] = ts_epoch
             self.day_buy_count += 1
             self._send_day_start_summary(ts_epoch)
