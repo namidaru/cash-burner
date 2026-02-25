@@ -57,15 +57,15 @@ class EngineReal:
                 "orderbook_ratio_min": float(os.getenv("OPEN_ORDERBOOK_RATIO_MIN", "1.10")),
             },
             "MID": {
-                "min_ret_pct": float(os.getenv("MID_MIN_RET_PCT", "0.10")),
+                "min_ret_pct": float(os.getenv("MID_MIN_RET_PCT", "0.08")),
                 "min_tr_value": float(os.getenv("MID_MIN_TR_VALUE", "30000000")),
                 "min_tick_count": int(os.getenv("MID_MIN_TICK_COUNT", "10")),
-                "min_imb": float(os.getenv("MID_MIN_IMB", "0.62")),
+                "min_imb": float(os.getenv("MID_MIN_IMB", "0.59")),
                 "max_spread_pct": float(os.getenv("MID_MAX_SPREAD_PCT", "0.25")),
                 "confirm_sec": float(os.getenv("MID_CONFIRM_SEC", "0.9")),
                 "cooldown_sec": float(os.getenv("MID_COOLDOWN_SEC", "120")),
                 "vi_like_ret_pct": float(os.getenv("VI_LIKE_RET_PCT_MID", "2.0")),
-                "spike_10s_min_pct": float(os.getenv("MID_SPIKE_10S_MIN_PCT", "0.30")),
+                "spike_10s_min_pct": float(os.getenv("MID_SPIKE_10S_MIN_PCT", "0.24")),
                 "orderbook_ratio_min": float(os.getenv("MID_ORDERBOOK_RATIO_MIN", "1.15")),
             },
             "CLOSE": {
@@ -96,7 +96,7 @@ class EngineReal:
         self.close_entry_pick_window_sec = float(os.getenv("CLOSE_ENTRY_PICK_WINDOW_SEC", "0.8"))
         spike_raw = float(os.getenv("SPIKE_10S_MIN_PCT", "0.30"))
         self.spike_10s_min_pct = (spike_raw / 100.0) if spike_raw >= 10.0 else spike_raw
-        self.burst_ratio_min = float(os.getenv("BURST_RATIO_MIN", "1.25"))
+        self.burst_ratio_min = float(os.getenv("BURST_RATIO_MIN", "1.12"))
         self.burst_baseline_sec = float(os.getenv("BURST_BASELINE_SEC", "120"))
         self.burst_min_ticks = int(os.getenv("BURST_MIN_TICKS", "10"))
         self.burst_require_baseline = os.getenv("BURST_REQUIRE_BASELINE", "1") == "1"
@@ -964,15 +964,15 @@ class EngineReal:
         if session == "OPEN":
             imb_min_dynamic = max(imb_min_dynamic, 0.62)
         elif session == "MID":
-            imb_min_dynamic = max(imb_min_dynamic, 0.60)
+            imb_min_dynamic = max(imb_min_dynamic, 0.59)
         else:
             imb_min_dynamic = max(imb_min_dynamic, 0.58)
-        if 0.25 <= ret10 < 0.40:
+        if 0.24 <= ret10 < 0.40:
             imb_min_dynamic = max(imb_min_dynamic, 0.60)
         elif 0.40 <= ret10 <= 0.60:
-            imb_min_dynamic = max(imb_min_dynamic, 0.65)
+            imb_min_dynamic = max(imb_min_dynamic, 0.64)
         elif ret10 > 0.60:
-            imb_min_dynamic = max(imb_min_dynamic, 0.70)
+            imb_min_dynamic = max(imb_min_dynamic, 0.69)
         if imb < imb_min_dynamic:
             trigger_fail.append(f"imb cur={imb:.2f} min={imb_min_dynamic:.2f} margin={imb-imb_min_dynamic:.2f}")
         min_hist_bins = max(1, math.ceil(baseline_scale * max(0.1, self.baseline_ready_bin_ratio)))
