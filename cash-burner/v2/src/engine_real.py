@@ -872,8 +872,10 @@ class EngineReal:
             return
 
         if not self.trade_ready:
-            self._note_no_buy(ts_epoch, sym, price, 0.0, 0, 0.0, 0.0, 0.0, self._day_rise_pct(sym, price), f"trade_blocked {self.trade_block_reason[:120]}")
-            return
+            self._refresh_trade_ready(ts_epoch)
+            if not self.trade_ready:
+                self._note_no_buy(ts_epoch, sym, price, 0.0, 0, 0.0, 0.0, 0.0, self._day_rise_pct(sym, price), f"trade_blocked {self.trade_block_reason[:120]}")
+                return
 
         p = self._params(ts_epoch)
         min_ret_pct = float(p.get("min_ret_pct", self.min_ret_pct))

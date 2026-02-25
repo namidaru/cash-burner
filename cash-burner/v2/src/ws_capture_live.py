@@ -28,8 +28,9 @@ PREOPEN_TRACK_MIN = int(os.getenv("PREOPEN_TRACK_MIN", "15"))
 PREOPEN_START_HHMM = int(os.getenv("PREOPEN_START_HHMM", "900"))
 
 RAW_TR_IDS = [t.strip() for t in os.getenv("TR_IDS", "H0STCNT0,H0STASP0").split(",") if t.strip()]
-ALLOWED_TR_IDS = {"H0STCNT0", "H0STASP0"}
+ALLOWED_TR_IDS = {"H0STCNT0", "H0STASP0", "H0NXCNT0"}
 ALLOWED_TR_TYPES = {"1", "2"}
+PRIORITY_TRADE_TR_IDS = ("H0STCNT0", "H0NXCNT0")
 POLL_WATCH_SEC = float(os.getenv("WATCH_POLL_SEC", "2.0"))
 MAX_SUB_BACKOFF_SEC = float(os.getenv("WS_SUB_BACKOFF_MAX_SEC", "60"))
 BASE_SUB_BACKOFF_SEC = float(os.getenv("WS_SUB_BACKOFF_BASE_SEC", "2"))
@@ -290,11 +291,12 @@ class WSCapture:
         other_syms = sorted(desired_symbols - self.last_held_symbols)
         ordered_syms = held_syms + other_syms
         keys: list[tuple[str, str]] = []
-        if "H0STCNT0" in TR_IDS:
-            for sym in ordered_syms:
-                keys.append((sym, "H0STCNT0"))
+        for trade_tr in PRIORITY_TRADE_TR_IDS:
+            if trade_tr in TR_IDS:
+                for sym in ordered_syms:
+                    keys.append((sym, trade_tr))
         for tr in TR_IDS:
-            if tr == "H0STCNT0":
+            if tr in PRIORITY_TRADE_TR_IDS:
                 continue
             for sym in ordered_syms:
                 keys.append((sym, tr))
