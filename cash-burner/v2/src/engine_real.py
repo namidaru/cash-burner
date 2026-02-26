@@ -25,6 +25,7 @@ class Position:
     entry_ts: float
     max_price: float
     trail_armed: bool
+    hard_stop_since: float = 0.0
 
 
 class EngineReal:
@@ -114,6 +115,8 @@ class EngineReal:
         self.max_first_cum_vol = float(os.getenv("MAX_FIRST_CUM_VOL", "0"))
 
         self.hard_stop_pct = float(os.getenv("HARD_STOP_PCT", "3.5"))
+        self.hard_stop_grace_sec = float(os.getenv("HARD_STOP_GRACE_SEC", "12"))
+        self.hard_stop_confirm_sec = float(os.getenv("HARD_STOP_CONFIRM_SEC", "1.2"))
         self.trail_arm_pct = float(os.getenv("TRAIL_ARM_PCT", "4.0"))
         self.trail_drop_pct = float(os.getenv("TRAIL_DROP_PCT", "3.5"))
 
@@ -126,6 +129,29 @@ class EngineReal:
         self.ret10_relax_start = float(os.getenv("RET10_RELAX_START", "0.30"))
         self.ret10_relax_end = float(os.getenv("RET10_RELAX_END", "0.60"))
         self.ret10_relax_max = float(os.getenv("RET10_RELAX_MAX", "0.12"))
+
+        # Entry anti-chase: buy after a small pullback + rebound instead of buying spike top.
+        self.pullback_entry_enabled = os.getenv("PULLBACK_ENTRY_ENABLED", "1") == "1"
+        self.pullback_pct = float(os.getenv("PULLBACK_PCT", "0.20"))
+        self.pullback_rebound_pct = float(os.getenv("PULLBACK_REBOUND_PCT", "0.05"))
+        self.pullback_wait_sec = float(os.getenv("PULLBACK_WAIT_SEC", "7.0"))
+        self.entry_slip_cap_bps = float(os.getenv("ENTRY_SLIP_CAP_BPS", "12"))
+        self.entry_use_limit_price = os.getenv("ENTRY_USE_LIMIT_PRICE", "0") == "1"
+
+        # Early-score (상한가급 전조 점수): hard filter를 줄이고 품질을 점수화.
+        self.early_score_enabled = os.getenv("EARLY_SCORE_ENABLED", "1") == "1"
+        self.early_score_min = float(os.getenv("EARLY_SCORE_MIN", "118"))
+        self.open_early_score_min = float(os.getenv("OPEN_EARLY_SCORE_MIN", "126"))
+        self.mid_early_score_min = float(os.getenv("MID_EARLY_SCORE_MIN", "118"))
+        self.close_early_score_min = float(os.getenv("CLOSE_EARLY_SCORE_MIN", "112"))
+        self.early_trv_short_sec = float(os.getenv("EARLY_TRV_SHORT_SEC", "60"))
+        self.early_trv_long_sec = float(os.getenv("EARLY_TRV_LONG_SEC", "300"))
+        self.early_dd_ref_pct = float(os.getenv("EARLY_DD_REF_PCT", "1.2"))
+        self.early_new_high_cooldown_sec = float(os.getenv("EARLY_NEW_HIGH_COOLDOWN_SEC", "10"))
+        self.early_new_high_window_sec = float(os.getenv("EARLY_NEW_HIGH_WINDOW_SEC", "300"))
+        self.early_imb_keep_sec = float(os.getenv("EARLY_IMB_KEEP_SEC", "2.0"))
+        self.early_imb_keep_min = float(os.getenv("EARLY_IMB_KEEP_MIN", "0.65"))
+        self.early_spread_ref_pct = float(os.getenv("EARLY_SPREAD_REF_PCT", "0.25"))
 
         self.kill_switch_file = os.getenv("KILL_SWITCH_FILE", os.path.join("data", "kill.switch"))
         self.ledger_file = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
@@ -184,6 +210,11 @@ class EngineReal:
         self.loaded_carry_positions = 0
         self.last_entry_ts: Dict[str, float] = {}
         self.candidate_since: Dict[str, float] = {}
+        self.candidate_peak_price: Dict[str, float] = {}
+        self.candidate_pullback_seen: Dict[str, bool] = {}
+        self.imb_samples: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=1024))
+        self.new_high_events: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=256))
+        self.new_high_last_ts: Dict[str, float] = {}
         self.vi_last_ts: Dict[str, float] = {}
         self._score_pick_bucket_start = 0.0
         self._score_pick_best: Dict[str, Any] | None = None
@@ -310,10 +341,10 @@ class EngineReal:
         self._nobuy_reason_counts[key] += 1
         self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "NO_BUY", detail)
 
-    def _safe_order(self, side: str, sym: str, qty: int, ts_epoch: float, price: float, reason: str):
+    def _safe_order(self, side: str, sym: str, qty: int, ts_epoch: float, price: float, reason: str, ord_dvsn: str = "01", ord_unpr: str = "0"):
         self._health_order_tries += 1
         try:
-            j = order_cash(side, sym, qty, ord_dvsn="01", ord_unpr="0")
+            j = order_cash(side, sym, qty, ord_dvsn=ord_dvsn, ord_unpr=ord_unpr)
             self._log(ts_epoch, side, sym, qty, price, reason, j.get("rt_cd", ""), j.get("msg1", ""))
             if j.get("rt_cd") != "0":
                 self._health_failures += 1
@@ -361,6 +392,11 @@ class EngineReal:
     def _cleanup_symbol_state(self, sym: str):
         self.pos.pop(sym, None)
         self.candidate_since.pop(sym, None)
+        self.candidate_peak_price.pop(sym, None)
+        self.candidate_pullback_seen.pop(sym, None)
+        self.imb_samples.pop(sym, None)
+        self.new_high_events.pop(sym, None)
+        self.new_high_last_ts.pop(sym, None)
         self.last_entry_ts.pop(sym, None)
         self.vi_last_ts.pop(sym, None)
         self._last_diag_ts.pop(sym, None)
@@ -386,6 +422,7 @@ class EngineReal:
                     "entry_ts": float(p.entry_ts),
                     "max_price": float(p.max_price),
                     "trail_armed": bool(p.trail_armed),
+                    "hard_stop_since": float(p.hard_stop_since),
                 }
                 for sym, p in sorted(self.pos.items())
             ],
@@ -416,6 +453,7 @@ class EngineReal:
             entry_ts = _f(item.get("entry_ts"), time.time())
             max_price = _f(item.get("max_price"), entry_price)
             trail_armed = bool(item.get("trail_armed", False))
+            hard_stop_since = _f(item.get("hard_stop_since"), 0.0)
             if not sym or qty <= 0 or entry_price <= 0:
                 dropped += 1
                 continue
@@ -434,6 +472,7 @@ class EngineReal:
                 entry_ts=entry_ts,
                 max_price=max(max_price, entry_price),
                 trail_armed=trail_armed,
+                hard_stop_since=max(0.0, hard_stop_since),
             )
             loaded += 1
 
@@ -550,6 +589,71 @@ class EngineReal:
             return 0.0
         return bid / ask
 
+    def _clamp01(self, v: float) -> float:
+        return max(0.0, min(1.0, v))
+
+    def _update_early_microstructure(self, sym: str, ts_epoch: float, price: float, imb: float):
+        imb_q = self.imb_samples[sym]
+        imb_q.append((ts_epoch, imb))
+        while imb_q and (ts_epoch - imb_q[0][0]) > max(5.0, self.early_imb_keep_sec + 2.0):
+            imb_q.popleft()
+
+        if not self.ticks.get(sym):
+            return
+        h_5m = max(px for t, px, _ in self.ticks[sym] if (ts_epoch - t) <= self.early_new_high_window_sec) if self.ticks[sym] else price
+        if h_5m <= 0:
+            return
+        if price >= h_5m * 0.9998:
+            last_evt = self.new_high_last_ts.get(sym, 0.0)
+            if (ts_epoch - last_evt) >= self.early_new_high_cooldown_sec:
+                self.new_high_last_ts[sym] = ts_epoch
+                self.new_high_events[sym].append(ts_epoch)
+
+    def _calc_early_score(self, sym: str, ts_epoch: float, price: float, spread: float, imb: float, trv_prev: float) -> tuple[float, Dict[str, float]]:
+        dq = self.ticks.get(sym, deque())
+        _, trv_1m, _ = self._window_stats_between(dq, ts_epoch - self.early_trv_short_sec, ts_epoch)
+        _, trv_5m, _ = self._window_stats_between(dq, ts_epoch - self.early_trv_long_sec, ts_epoch)
+        trv_5m_avg = trv_5m / max(1.0, self.early_trv_long_sec / max(1.0, self.early_trv_short_sec))
+        eps = max(1.0, trv_prev, trv_5m_avg * 0.25)
+        trv_ratio = trv_1m / max(eps, trv_5m_avg)
+        score_trv = 60.0 * self._clamp01((trv_ratio - 0.6) / 0.6)
+
+        h_5m = price
+        if dq:
+            h_5m = max(px for t, px, _ in dq if (ts_epoch - t) <= self.early_new_high_window_sec)
+        dd = ((h_5m - price) / h_5m) if h_5m > 0 else 1.0
+        dd_ref = max(0.2, self.early_dd_ref_pct) / 100.0
+        score_dd = 40.0 * self._clamp01((dd_ref - dd) / dd_ref)
+
+        evq = self.new_high_events[sym]
+        while evq and (ts_epoch - evq[0]) > self.early_new_high_window_sec:
+            evq.popleft()
+        new_high_cnt_5m = len(evq)
+        score_hh = 30.0 * self._clamp01(new_high_cnt_5m / 3.0)
+
+        imb_q = self.imb_samples[sym]
+        keep_vals = [v for t, v in imb_q if (ts_epoch - t) <= self.early_imb_keep_sec]
+        if not keep_vals:
+            keep_vals = [imb]
+        imb_keep_2s = sum(1.0 for v in keep_vals if v >= self.early_imb_keep_min) / max(1, len(keep_vals))
+        score_imb = 40.0 * imb_keep_2s
+
+        spr_ref = max(0.05, self.early_spread_ref_pct)
+        score_spr = 30.0 * self._clamp01((spr_ref - spread) / spr_ref)
+
+        early_score = score_trv + score_dd + score_hh + score_imb + score_spr
+        return early_score, {
+            "trv_ratio": trv_ratio,
+            "dd": dd * 100.0,
+            "new_high_cnt_5m": float(new_high_cnt_5m),
+            "imb_keep_2s": imb_keep_2s,
+            "score_trv": score_trv,
+            "score_dd": score_dd,
+            "score_hh": score_hh,
+            "score_imb": score_imb,
+            "score_spr": score_spr,
+        }
+
     def _entry_score(self, ret: float, ret10: float, tick_count: int, trv: float, imb: float, depth_ratio: float, spread: float, max_spread_pct: float) -> float:
         # 모멘텀은 중요하지만 과대추격을 막기 위해 구간별 감쇄를 둔다.
         ret10_main = min(max(ret10, 0.0), 1.20) * 55.0
@@ -579,6 +683,7 @@ class EngineReal:
         dayrise: float,
         score: float,
         ts_epoch: float,
+        early_score: float = 0.0,
     ):
         kst = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_epoch))
         self.notifier.send(
@@ -587,7 +692,7 @@ class EngineReal:
             lines=[
                 f"시간: {kst}",
                 f"수량/단가: {qty}주 @ {price:,.0f}",
-                f"진입 종합점수: {score:.1f}",
+                f"진입 종합점수: {score:.1f} (early={early_score:.1f})",
                 f"근거: ret={ret:.3f}% | ticks={tick_count} | trv={trv:,.0f}",
                 f"호가: imb={imb:.3f} | spread={spread:.3f}%",
                 f"당일등락: {dayrise:.3f}%",
@@ -832,7 +937,7 @@ class EngineReal:
             self._send_day_close_summary(ts_epoch)
         self._send_health_check(ts_epoch)
 
-    def _score_pick_update(self, ts_epoch: float, sym: str, score: float, price: float, ret: float, tick_count: int, trv: float, imb: float, spread: float, dayrise: float, ret10: float, baseline_ready: bool):
+    def _score_pick_update(self, ts_epoch: float, sym: str, score: float, price: float, ret: float, tick_count: int, trv: float, imb: float, spread: float, dayrise: float, ret10: float, baseline_ready: bool, early_score: float = 0.0):
         if self._score_pick_bucket_start <= 0:
             self._score_pick_bucket_start = ts_epoch
             self._score_pick_best = {
@@ -847,6 +952,7 @@ class EngineReal:
                 "dayrise": dayrise,
                 "ret10": ret10,
                 "baseline_ready": baseline_ready,
+                "early_score": early_score,
                 "session": self._session_name(ts_epoch),
                 "ts": ts_epoch,
             }
@@ -866,6 +972,7 @@ class EngineReal:
                 "dayrise": dayrise,
                 "ret10": ret10,
                 "baseline_ready": baseline_ready,
+                "early_score": early_score,
                 "session": self._session_name(ts_epoch),
                 "ts": ts_epoch,
             }
@@ -888,6 +995,59 @@ class EngineReal:
         self._score_pick_best = None
         self._score_pick_bucket_start = 0.0
         return best
+
+    def _orderbook_best_quote(self, sym: str, ts_epoch: float) -> tuple[float, float, float, bool, float]:
+        ob = self.book.get(sym)
+        ob_age = ts_epoch - self.book_ts.get(sym, 0.0)
+        ob_stale = (not ob) or (ob_age > self.orderbook_max_age_sec)
+        ask1 = _f(ob.get("ASKP1")) if ob and not ob_stale else 0.0
+        bid1 = _f(ob.get("BIDP1")) if ob and not ob_stale else 0.0
+        mid = (ask1 + bid1) / 2.0 if (ask1 > 0 and bid1 > 0) else 0.0
+        return bid1, ask1, mid, ob_stale, ob_age
+
+    def _build_buy_order(self, sym: str, ts_epoch: float, fallback_price: float) -> tuple[str, str, str]:
+        bid1, ask1, mid, ob_stale, ob_age = self._orderbook_best_quote(sym, ts_epoch)
+        ord_dvsn = "01"
+        ord_unpr = "0"
+        px_ref = fallback_price
+
+        if (not ob_stale) and ask1 > 0:
+            cap_px = mid * (1.0 + (self.entry_slip_cap_bps / 10000.0)) if mid > 0 else ask1
+            if ask1 > cap_px:
+                return "", "", f"ask_slip_guard ask1={ask1:.2f} cap={cap_px:.2f} mid={mid:.2f} bps={self.entry_slip_cap_bps:.1f}"
+            px_ref = mid if mid > 0 else ask1
+            if self.entry_use_limit_price:
+                ord_dvsn = "00"
+                ord_unpr = str(int(round(ask1)))
+
+        detail = (
+            f"order_ts={ts_epoch:.3f} px_ref={px_ref:.2f} best_bid={bid1:.2f} "
+            f"best_ask={ask1:.2f} order_type={ord_dvsn} order_price={ord_unpr} ob_stale={int(ob_stale)} ob_age={ob_age:.2f}s"
+        )
+        return ord_dvsn, ord_unpr, detail
+
+    def _pullback_gate(self, sym: str, price: float, ts_epoch: float) -> tuple[bool, str]:
+        if not self.pullback_entry_enabled:
+            return True, ""
+        c0 = self.candidate_since.get(sym)
+        if c0 is None:
+            return True, ""
+        peak = max(self.candidate_peak_price.get(sym, price), price)
+        self.candidate_peak_price[sym] = peak
+        age = ts_epoch - c0
+        if age > self.pullback_wait_sec:
+            return True, f"pullback_timeout age={age:.1f}s"
+        pullback_thr = peak * (1.0 - self.pullback_pct / 100.0)
+        rebound_thr = peak * (1.0 - self.pullback_rebound_pct / 100.0)
+        pulled_before = self.candidate_pullback_seen.get(sym, False)
+        pulled_now = price <= pullback_thr
+        if pulled_now:
+            self.candidate_pullback_seen[sym] = True
+            pulled_before = True
+        rebounded = pulled_before and (price >= rebound_thr)
+        if rebounded:
+            return True, f"pullback_ok peak={peak:.2f} pb={self.pullback_pct:.2f}% reb={self.pullback_rebound_pct:.2f}%"
+        return False, f"pullback_wait cur={price:.2f} peak={peak:.2f} pb_thr={pullback_thr:.2f} reb_thr={rebound_thr:.2f} pulled={int(pulled_before)}"
 
     def _maybe_exit(self, sym: str, price: float, ts_epoch: float):
         p = self.pos.get(sym)
@@ -912,6 +1072,13 @@ class EngineReal:
             return
 
         if price <= p.entry_price * (1.0 - self.hard_stop_pct / 100.0):
+            if (ts_epoch - p.entry_ts) < self.hard_stop_grace_sec:
+                return
+            if p.hard_stop_since <= 0:
+                p.hard_stop_since = ts_epoch
+                return
+            if (ts_epoch - p.hard_stop_since) < self.hard_stop_confirm_sec:
+                return
             qty_sell = sellable_qty(sym)
             if qty_sell <= 0:
                 return
@@ -921,6 +1088,8 @@ class EngineReal:
                 self._notify_sell(sym, qty_ord, price, "HARD_STOP", f"hard_stop={self.hard_stop_pct}%", p, ts_epoch)
                 self._cleanup_symbol_state(sym)
             return
+        else:
+            p.hard_stop_since = 0.0
 
         if p.trail_armed:
             stop = p.max_price * (1.0 - self.trail_drop_pct / 100.0)
@@ -1049,50 +1218,19 @@ class EngineReal:
             trigger_fail.append(f"ret cur={ret:.2f} thr={dynamic_ret_min:.2f} margin={ret-dynamic_ret_min:.2f} relax={ret10_relax:.2f}")
         if tick_count < min_tick_count:
             trigger_fail.append(f"ticks cur={tick_count} thr={min_tick_count} margin={tick_count-min_tick_count}")
-        if trv < min_tr_value:
-            trigger_fail.append(f"trv cur={trv:.0f} thr={min_tr_value:.0f} margin={trv-min_tr_value:.0f}")
-        if spread > max_spread_pct and not (ob_stale and self.orderbook_stale_mode == "guard"):
-            trigger_fail.append(f"spread cur={spread:.2f} max={max_spread_pct:.2f} margin={max_spread_pct-spread:.2f}")
         if ret10 < spike_10s_min_pct:
             trigger_fail.append(f"ret10 cur={ret10:.2f} thr={spike_10s_min_pct:.2f} margin={ret10-spike_10s_min_pct:.2f}")
         if ret10 <= 0:
             trigger_fail.append(f"ret10_non_positive cur={ret10:.2f}")
-        if ret10 >= 0.25 and imb < 0.55:
-            trigger_fail.append(f"ret10_imb_mismatch ret10={ret10:.2f} imb={imb:.2f} need>=0.55")
-
-        if session == "OPEN" and ret10 >= 0.25 and imb < 0.60:
-            trigger_fail.append(f"open_ret10_imb_mismatch ret10={ret10:.2f} imb={imb:.2f} need>=0.60")
-
-        imb_min_dynamic = min_imb
-        if session == "OPEN":
-            imb_min_dynamic = max(imb_min_dynamic, 0.62)
-        elif session == "MID":
-            imb_min_dynamic = max(imb_min_dynamic, 0.59)
-        else:
-            imb_min_dynamic = max(imb_min_dynamic, 0.58)
-        if 0.24 <= ret10 < 0.40:
-            imb_min_dynamic = max(imb_min_dynamic, 0.60)
-        elif 0.40 <= ret10 <= 0.60:
-            imb_min_dynamic = max(imb_min_dynamic, 0.64)
-        elif ret10 > 0.60:
-            imb_min_dynamic = max(imb_min_dynamic, 0.69)
-        if imb < imb_min_dynamic:
-            trigger_fail.append(f"imb cur={imb:.2f} min={imb_min_dynamic:.2f} margin={imb-imb_min_dynamic:.2f}")
+        if trv <= max(1.0, min_tr_value * 0.25):
+            trigger_fail.append(f"trv_too_low cur={trv:.0f} floor={max(1.0, min_tr_value*0.25):.0f}")
         min_hist_bins = max(1, math.ceil(baseline_scale * max(0.1, self.baseline_ready_bin_ratio)))
         baseline_ready = (hist_bins >= min_hist_bins) and (ticks_hist >= self.burst_min_ticks)
-        baseline_guard_active = self.burst_require_baseline and ((ts_epoch - self.symbol_first_trade_ts.get(sym, ts_epoch)) >= self.burst_baseline_sec)
-        if not baseline_ready and baseline_guard_active:
-            first_trade_age = ts_epoch - self.symbol_first_trade_ts.get(sym, ts_epoch)
-            trigger_fail.append(f"baseline_not_ready age={first_trade_age:.1f}s cur_bins={hist_bins} thr_bins={min_hist_bins} cur_ticks={ticks_hist} thr_ticks={self.burst_min_ticks}")
-        if baseline_ready:
-            if trv_prev > 0 and trv10 < trv_prev * self.burst_ratio_min:
-                trigger_fail.append(f"trv_burst cur={trv10:.0f} thr={trv_prev*self.burst_ratio_min:.0f} margin={trv10-(trv_prev*self.burst_ratio_min):.0f}")
-            if ticks_prev > 0 and ticks10 < math.ceil(ticks_prev * self.burst_ratio_min):
-                trigger_fail.append(f"tick_burst cur={ticks10} thr={math.ceil(ticks_prev*self.burst_ratio_min)} margin={ticks10-math.ceil(ticks_prev*self.burst_ratio_min)}")
-
         if trigger_fail:
             if c0 is None or (ts_epoch - c0) > self.candidate_reset_grace_sec:
                 self.candidate_since.pop(sym, None)
+            self.candidate_peak_price.pop(sym, None)
+            self.candidate_pullback_seen.pop(sym, None)
             primary = trigger_fail[0]
             detail = f"reject={primary} | all={'; '.join(trigger_fail)}"
             self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, detail)
@@ -1100,10 +1238,41 @@ class EngineReal:
 
         if c0 is None:
             self.candidate_since[sym] = ts_epoch
+            self.candidate_peak_price[sym] = price
+            self.candidate_pullback_seen[sym] = False
             self._health_signal_hits += 1
             self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"confirm_wait {confirm_sec:.1f}s")
             return
         if ts_epoch - c0 < confirm_sec:
+            return
+
+        pullback_ok, pullback_detail = self._pullback_gate(sym, price, ts_epoch)
+        if not pullback_ok:
+            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, pullback_detail)
+            return
+
+        self._update_early_microstructure(sym, ts_epoch, price, imb)
+        early_score, early_meta = self._calc_early_score(sym, ts_epoch, price, spread, imb, trv_prev)
+        early_floor = self.early_score_min
+        if session == "OPEN":
+            early_floor = max(early_floor, self.open_early_score_min)
+        elif session == "MID":
+            early_floor = max(early_floor, self.mid_early_score_min)
+        else:
+            early_floor = max(early_floor, self.close_early_score_min)
+        if self.early_score_enabled and early_score < early_floor:
+            self._note_no_buy(
+                ts_epoch,
+                sym,
+                price,
+                ret,
+                tick_count,
+                trv,
+                imb,
+                spread,
+                dayrise,
+                f"early_score {early_score:.1f}<{early_floor:.1f} trvR={early_meta['trv_ratio']:.2f} dd={early_meta['dd']:.2f}% hh={early_meta['new_high_cnt_5m']:.0f} imb2s={early_meta['imb_keep_2s']:.2f}",
+            )
             return
 
         # 2) Guard gate: order-right-before safety checks only
@@ -1139,7 +1308,8 @@ class EngineReal:
             return
 
         score_spread = max_spread_pct if (ob_stale and self.orderbook_stale_mode == "guard") else spread
-        score = self._entry_score(ret, ret10, tick_count, trv, imb, depth_ratio, score_spread, max_spread_pct)
+        score_raw = self._entry_score(ret, ret10, tick_count, trv, imb, depth_ratio, score_spread, max_spread_pct)
+        score = score_raw + (early_score * 0.35 if self.early_score_enabled else 0.0)
         score_floor = self.entry_score_min
         if session == "OPEN":
             score_floor = max(score_floor, self.open_entry_score_min)
@@ -1158,11 +1328,11 @@ class EngineReal:
                 imb,
                 spread,
                 dayrise,
-                f"score {score:.1f}<{score_floor:.1f}",
+                f"score {score:.1f}<{score_floor:.1f} raw={score_raw:.1f} early={early_score:.1f}",
             )
             return
 
-        self._score_pick_update(ts_epoch, sym, score, price, ret, tick_count, trv, imb, spread, dayrise, ret10, baseline_ready)
+        self._score_pick_update(ts_epoch, sym, score, price, ret, tick_count, trv, imb, spread, dayrise, ret10, baseline_ready, early_score)
         if not self._score_pick_ready(ts_epoch):
             return
         best = self._score_pick_take()
@@ -1181,6 +1351,7 @@ class EngineReal:
         score = float(best.get("score", score))
         ret10 = float(best.get("ret10", ret10))
         baseline_ready = bool(best.get("baseline_ready", baseline_ready))
+        early_score = float(best.get("early_score", early_score if "early_score" in locals() else 0.0))
         session = str(best.get("session", self._session_name(ts_epoch)))
         try:
             cash = buyable_cash(sym, ord_dvsn="01", price="0")
@@ -1194,7 +1365,16 @@ class EngineReal:
             self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"qty=0 cash={cash:.0f} target={target:.0f}")
             return
 
-        j = self._safe_order("BUY", sym, qty, ts_epoch, price, f"signal ses={session} ret={ret:.2f} ret10={ret10:.2f} imb={imb:.2f} spr={spread:.2f} dayrise={dayrise:.2f} score={score:.1f} base_ready={int(baseline_ready)} ob_stale={int(ob_stale)} ob_age={ob_age:.2f}s")
+        ord_dvsn, ord_unpr, order_detail = self._build_buy_order(sym, ts_epoch, price)
+        if not ord_dvsn:
+            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, order_detail)
+            return
+        buy_reason = (
+            f"signal ses={session} ret={ret:.2f} ret10={ret10:.2f} imb={imb:.2f} spr={spread:.2f} "
+            f"dayrise={dayrise:.2f} score={score:.1f} early={early_score:.1f} base_ready={int(baseline_ready)} "
+            f"ob_stale={int(ob_stale)} ob_age={ob_age:.2f}s {order_detail}"
+        )
+        j = self._safe_order("BUY", sym, qty, ts_epoch, price, buy_reason, ord_dvsn=ord_dvsn, ord_unpr=ord_unpr)
         if j.get("rt_cd") == "0":
             self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, trail_armed=False)
             self._save_positions_state()
@@ -1202,7 +1382,9 @@ class EngineReal:
             self.day_buy_count += 1
             self._send_day_start_summary(ts_epoch)
             self.candidate_since.pop(sym, None)
+            self.candidate_peak_price.pop(sym, None)
+            self.candidate_pullback_seen.pop(sym, None)
             self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "BUY_TRY", f"qty={qty} score={score:.1f}")
-            self._notify_buy(sym, qty, price, ret, tick_count, trv, imb, spread, dayrise, score, ts_epoch)
+            self._notify_buy(sym, qty, price, ret, tick_count, trv, imb, spread, dayrise, score, ts_epoch, early_score)
         else:
             self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "BUY_FAIL", j.get("msg1", ""))
