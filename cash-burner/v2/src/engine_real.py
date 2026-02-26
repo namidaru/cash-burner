@@ -156,6 +156,7 @@ class EngineReal:
         self.kill_switch_file = os.getenv("KILL_SWITCH_FILE", os.path.join("data", "kill.switch"))
         self.ledger_file = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
         self.position_state_file = os.getenv("POSITION_STATE_FILE", os.path.join("data", "positions_real.json"))
+        self.auto_position_log_file = os.getenv("AUTO_POSITION_LOG_FILE", os.path.join("data", "auto_positions_real.csv"))
 
         self.signal_diag_file = os.getenv("SIGNAL_DIAG_FILE", os.path.join("data", "signal_diag.log"))
         self.signal_diag_sec = float(os.getenv("SIGNAL_DIAG_SEC", "20"))
@@ -220,6 +221,7 @@ class EngineReal:
         self._score_pick_best: Dict[str, Any] | None = None
 
         self._init_ledger()
+        self._init_auto_position_log()
         self._init_diag()
         self._verify_startup_cash_or_block()
 
@@ -301,6 +303,23 @@ class EngineReal:
             with open(self.signal_diag_file, "w", encoding="utf-8") as f:
                 f.write("ts,symbol,session,price,ret,tick_count,trv,imb,spread,dayrise,status,detail\n")
 
+
+    def _init_auto_position_log(self):
+        d = os.path.dirname(self.auto_position_log_file)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        if not os.path.exists(self.auto_position_log_file):
+            with open(self.auto_position_log_file, "w", encoding="utf-8") as f:
+                f.write("ts,event,symbol,qty,entry_price,ref_price,pnl_pct,note\n")
+
+    def _log_auto_position(self, ts_epoch: float, event: str, sym: str, p: Position, ref_price: float = 0.0, note: str = ""):
+        safe_note = (note or "").replace('"', "")[:200]
+        pnl_pct = ((ref_price / p.entry_price - 1.0) * 100.0) if (p.entry_price > 0 and ref_price > 0) else 0.0
+        with open(self.auto_position_log_file, "a", encoding="utf-8") as f:
+            f.write(
+                f"{ts_epoch:.3f},{event},{sym},{int(p.qty)},{float(p.entry_price):.4f},{float(ref_price):.4f},{pnl_pct:.3f},\"{safe_note}\"\n"
+            )
+
     def _kill_active(self) -> bool:
         try:
             return os.path.exists(self.kill_switch_file)
@@ -335,6 +354,33 @@ class EngineReal:
             f.write(
                 f"{ts_epoch:.3f},{sym},{ses},{price:.4f},{ret:.3f},{tick_count},{trv:.0f},{imb:.3f},{spread:.3f},{dayrise:.3f},{status},{detail}\n"
             )
+
+
+    def _latest_trade_price(self, sym: str) -> float:
+        dq = self.ticks.get(sym)
+        if dq and len(dq) > 0:
+            return float(dq[-1][1])
+        return 0.0
+
+    def _auto_holdings_lines(self, max_items: int = 4) -> list[str]:
+        if not self.pos:
+            return ["자동매매 보유: 없음"]
+        total_qty = sum(p.qty for p in self.pos.values())
+        lines = [f"자동매매 보유: {len(self.pos)}종목 / {total_qty:,}주"]
+        ranked = []
+        for sym, p in self.pos.items():
+            now = self._latest_trade_price(sym)
+            if now <= 0:
+                now = p.entry_price
+            pnl_pct = (now / p.entry_price - 1.0) * 100.0 if p.entry_price > 0 else 0.0
+            ranked.append((sym, p, now, pnl_pct))
+        ranked.sort(key=lambda x: abs(x[3]), reverse=True)
+        for sym, p, now, pnl_pct in ranked[:max_items]:
+            lines.append(f"- {sym} {p.qty}주 | {p.entry_price:,.0f}→{now:,.0f} ({pnl_pct:+.2f}%)")
+        remain = len(ranked) - max_items
+        if remain > 0:
+            lines.append(f"- 외 {remain}종목")
+        return lines
 
     def _note_no_buy(self, ts_epoch: float, sym: str, price: float, ret: float, tick_count: int, trv: float, imb: float, spread: float, dayrise: float, detail: str):
         key = (detail or "unknown").split(" | ", 1)[0]
@@ -474,6 +520,7 @@ class EngineReal:
                 trail_armed=trail_armed,
                 hard_stop_since=max(0.0, hard_stop_since),
             )
+            self._log_auto_position(time.time(), "LOAD", sym, self.pos[sym], note="carry_state_restore")
             loaded += 1
 
         self.loaded_carry_positions = loaded
@@ -696,7 +743,7 @@ class EngineReal:
                 f"근거: ret={ret:.3f}% | ticks={tick_count} | trv={trv:,.0f}",
                 f"호가: imb={imb:.3f} | spread={spread:.3f}%",
                 f"당일등락: {dayrise:.3f}%",
-            ],
+            ] + self._auto_holdings_lines(),
         )
 
     def _notify_sell(self, sym: str, qty: int, price: float, reason: str, detail: str, p: Position, ts_epoch: float):
@@ -730,7 +777,7 @@ class EngineReal:
                 f"손익: {pnl_amt:,.0f}원 ({pnl_pct:+.3f}%)",
                 f"보유시간: {hold_min:.1f}분",
                 f"청산사유: {detail}",
-            ],
+            ] + self._auto_holdings_lines(),
         )
     def _ensure_day_roll(self, ts_epoch: float):
         dk = time.strftime("%Y%m%d", time.localtime(ts_epoch))
@@ -844,7 +891,7 @@ class EngineReal:
             f"승률: {win_rate:.1f}% ({self.day_win_count}승 {self.day_loss_count}패)",
             f"실현손익: {self.day_realized_pnl:,.0f}원",
             f"MDD(실현기준): -{self.day_mdd:,.0f}원",
-            f"이월 포함 보유: {len(self.pos)}종목 / {sum(p.qty for p in self.pos.values()):,}주",
+            f"자동매매 보유: {len(self.pos)}종목 / {sum(p.qty for p in self.pos.values()):,}주",
         ]
         if self.day_best is not None:
             lines.append(f"최대 수익 1건: {self.day_best[0]} {self.day_best[1]:,.0f}원 ({self.day_best[2]:+.2f}%)")
@@ -864,7 +911,7 @@ class EngineReal:
         self.notifier.send(
             title="✅ 매매 시작 요약",
             color=0x2ECC71,
-            lines=[f"시간: {kst}", f"이월 복구: {self.loaded_carry_positions}종목"] + self._day_summary_lines(),
+            lines=[f"시간: {kst}", f"이월 복구: {self.loaded_carry_positions}종목"] + self._day_summary_lines() + self._auto_holdings_lines(),
         )
 
     def _send_day_close_summary(self, ts_epoch: float):
@@ -875,7 +922,7 @@ class EngineReal:
         self.notifier.send(
             title="📌 장 마감 요약",
             color=0xF1C40F,
-            lines=[f"시간: {kst}"] + self._day_summary_lines(),
+            lines=[f"시간: {kst}"] + self._day_summary_lines() + self._auto_holdings_lines(),
         )
 
     def _send_health_check(self, ts_epoch: float):
@@ -916,8 +963,7 @@ class EngineReal:
                 f"거래가능 상태: {'ON' if self.trade_ready else 'BLOCKED'} {self.trade_block_reason[:80]}",
                 f"미체결 주원인: {top_reason} ({top_cnt}회)",
                 f"지연: avg {lat_avg:.3f}s / max {self._lat_max:.3f}s",
-                f"메모리(RSS): {self._memory_mb():.1f} MB",
-            ],
+            ] + self._auto_holdings_lines(),
         )
         self._health_signal_hits = 0
         self._health_order_tries = 0
@@ -1068,6 +1114,7 @@ class EngineReal:
             j = self._safe_order("SELL", sym, qty_ord, ts_epoch, price, f"limitup_gap_take {self.limitup_gap_take_pct}")
             if j.get("rt_cd") == "0":
                 self._notify_sell(sym, qty_ord, price, "LIMITUP", f"limitup_gap_take={self.limitup_gap_take_pct}", p, ts_epoch)
+                self._log_auto_position(ts_epoch, "SELL", sym, p, ref_price=price, note="LIMITUP")
                 self._cleanup_symbol_state(sym)
             return
 
@@ -1086,6 +1133,7 @@ class EngineReal:
             j = self._safe_order("SELL", sym, qty_ord, ts_epoch, price, f"hard_stop {self.hard_stop_pct}")
             if j.get("rt_cd") == "0":
                 self._notify_sell(sym, qty_ord, price, "HARD_STOP", f"hard_stop={self.hard_stop_pct}%", p, ts_epoch)
+                self._log_auto_position(ts_epoch, "SELL", sym, p, ref_price=price, note="HARD_STOP")
                 self._cleanup_symbol_state(sym)
             return
         else:
@@ -1101,6 +1149,7 @@ class EngineReal:
                 j = self._safe_order("SELL", sym, qty_ord, ts_epoch, price, f"trail_stop drop={self.trail_drop_pct}")
                 if j.get("rt_cd") == "0":
                     self._notify_sell(sym, qty_ord, price, "TRAIL_STOP", f"trail_drop={self.trail_drop_pct}% stop={stop:.2f}", p, ts_epoch)
+                    self._log_auto_position(ts_epoch, "SELL", sym, p, ref_price=price, note="TRAIL_STOP")
                     self._cleanup_symbol_state(sym)
                 return
 
@@ -1377,6 +1426,7 @@ class EngineReal:
         j = self._safe_order("BUY", sym, qty, ts_epoch, price, buy_reason, ord_dvsn=ord_dvsn, ord_unpr=ord_unpr)
         if j.get("rt_cd") == "0":
             self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, trail_armed=False)
+            self._log_auto_position(ts_epoch, "BUY", sym, self.pos[sym], ref_price=price, note=f"score={score:.1f}")
             self._save_positions_state()
             self.last_entry_ts[sym] = ts_epoch
             self.day_buy_count += 1
