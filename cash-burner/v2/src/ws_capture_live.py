@@ -10,13 +10,8 @@ APP_SECRET = os.getenv("KOREA_INVEST_APP_SECRET","")
 WS_URL = os.getenv("KIS_WS_URL", "ws://ops.koreainvestment.com:21000")
 BASE_URL = os.getenv("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443")
 
-PAPER_TRADE_MODE = os.getenv("PAPER_TRADE_MODE", "1") == "1"
-
-def _mode_default(real_path: str, paper_path: str) -> str:
-    return paper_path if PAPER_TRADE_MODE else real_path
-
 def _dated_out_file() -> str:
-    raw = os.getenv("OUT_FILE", _mode_default(os.path.join("data", "ws_dump.log"), os.path.join("data", "ws_dump_paper.log")))
+    raw = os.getenv("OUT_FILE", os.path.join("data", "ws_dump.log"))
     ymd = time.strftime("%Y%m%d")
     if "{date}" in raw:
         return raw.replace("{date}", ymd)
@@ -27,9 +22,9 @@ def _dated_out_file() -> str:
 
 
 OUT_FILE = _dated_out_file()
-CONTROL_FILE = os.getenv("CONTROL_FILE", _mode_default(os.path.join("data", "ws_control.log"), os.path.join("data", "ws_control_paper.log")))
-WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", _mode_default(os.path.join("data", "watchlist.txt"), os.path.join("data", "watchlist_paper.txt")))
-LEDGER_FILE = os.getenv("LEDGER_FILE", _mode_default(os.path.join("data", "ledger_real.csv"), os.path.join("data", "ledger_paper.csv")))
+CONTROL_FILE = os.getenv("CONTROL_FILE", os.path.join("data", "ws_control.log"))
+WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
+LEDGER_FILE = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
 PREOPEN_TRACK_MIN = int(os.getenv("PREOPEN_TRACK_MIN", "15"))
 PREOPEN_START_HHMM = int(os.getenv("PREOPEN_START_HHMM", "900"))
 
