@@ -172,7 +172,8 @@ class WSCapture:
         self.pending_subscribe: dict[tuple[str, str], float] = {}
         self.sub_blocked_until: dict[tuple[str, str], float] = {}
         self.sub_blocked_retry_exp: dict[tuple[str, str], int] = {}
-        self.last_sync_desired: set[str] = set()
+        self.last_sync_desired_symbols: set[str] = set()
+        self.last_sync_desired_keys: set[tuple[str, str]] = set()
         self.lock = threading.Lock()
         self.preopen_day = ""
         self.preopen_snapshot: set[str] = set()
@@ -210,7 +211,7 @@ class WSCapture:
         watch_now = set(base)
         kept_watch: set[str] = set(watch_now)
         if WATCH_REMOVE_DELAY_SEC > 0:
-            removed = self.last_sync_desired - watch_now
+            removed = self.last_sync_desired_symbols - watch_now
             for sym in removed:
                 self.watch_remove_after.setdefault(sym, now + WATCH_REMOVE_DELAY_SEC)
             for sym in watch_now:
@@ -402,7 +403,8 @@ class WSCapture:
                 self.pending_subscribe.clear()
                 self.sub_blocked_until.clear()
                 self.sub_blocked_retry_exp.clear()
-                self.last_sync_desired = set()
+                self.last_sync_desired_symbols = set()
+                self.last_sync_desired_keys = set()
                 _append(CONTROL_FILE, f"{_ts()}\tRECONNECT start")
                 try:
                     self.approval_key = get_approval_key()
@@ -579,10 +581,11 @@ class WSCapture:
 
             add_keys_ordered = [k for k in desired_key_seq if k not in self.subscribed_keys]
             sent_req = 0
-            if force or desired_keys != self.last_sync_desired or add_keys_ordered:
+            if force or desired_keys != self.last_sync_desired_keys or add_keys_ordered:
                 for sym, tr in add_keys_ordered:
                     sent_req += self._try_subscribe_key(sym, tr)
-                self.last_sync_desired = set(desired_keys)
+                self.last_sync_desired_keys = set(desired_keys)
+                self.last_sync_desired_symbols = set(desired_symbols)
 
             self._refresh_subscribed_symbols()
 

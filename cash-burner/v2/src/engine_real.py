@@ -308,6 +308,12 @@ class EngineReal:
     def _sellable_qty(self, sym: str) -> int:
         return int(sellable_qty(sym))
 
+    def _effective_buying_power(self) -> float:
+        try:
+            return self._buyable_cash(self.health_cash_symbol)
+        except Exception:
+            return self._account_buying_power()
+
     def _cooldown_for_exit_reason(self, reason: str, fallback_sec: float) -> float:
         r = (reason or "").upper()
         stop_reasons = {"PROTECT_STOP", "MOMENTUM_EXIT", "LIQUIDITY_EXIT"}
@@ -350,7 +356,7 @@ class EngineReal:
     def _verify_startup_cash_or_block(self):
         now = time.time()
         try:
-            cash = self._account_buying_power()
+            cash = self._effective_buying_power()
             self.trade_ready = cash > 0
             self.trade_block_reason = "" if self.trade_ready else f"cash_non_positive:{cash:.0f}"
             self._last_buyable_cash = cash
@@ -377,7 +383,7 @@ class EngineReal:
             return
         self._last_cash_check_ts = ts_epoch
         try:
-            cash = self._account_buying_power()
+            cash = self._effective_buying_power()
             self._last_buyable_cash = cash
             self._last_buyable_cash_ts = ts_epoch
             if cash > 0:
@@ -1269,7 +1275,7 @@ class EngineReal:
             ws_state = "초기화중(이벤트 대기)"
         lat_avg = (self._lat_sum / self._lat_cnt) if self._lat_cnt else 0.0
         try:
-            buyable_cash_now = self._account_buying_power()
+            buyable_cash_now = self._effective_buying_power()
             self._last_buyable_cash = buyable_cash_now
             self._last_buyable_cash_ts = ts_epoch
             cash_state = f"{buyable_cash_now:,.0f}원"
