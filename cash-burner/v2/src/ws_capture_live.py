@@ -3,6 +3,7 @@ from __future__ import annotations
 import os, json, time, threading, csv, queue, re
 from dataclasses import dataclass
 import requests, websocket
+from kis_http import request
 
 APP_KEY = os.getenv("KOREA_INVEST_APP_KEY","")
 APP_SECRET = os.getenv("KOREA_INVEST_APP_SECRET","")
@@ -37,6 +38,15 @@ MAX_SUB_BACKOFF_SEC = float(os.getenv("WS_SUB_BACKOFF_MAX_SEC", "60"))
 BASE_SUB_BACKOFF_SEC = float(os.getenv("WS_SUB_BACKOFF_BASE_SEC", "2"))
 MAX_ACTIVE_SUB_KEYS = int(os.getenv("WS_MAX_ACTIVE_SUB_KEYS", "50"))
 WATCH_REMOVE_DELAY_SEC = float(os.getenv("WATCH_REMOVE_DELAY_SEC", "120"))
+LEADER_RADAR_ENABLE = os.getenv("LEADER_RADAR_ENABLE", "1") == "1"
+LEADER_RADAR_RET3S_PCT = float(os.getenv("LEADER_RADAR_RET3S_PCT", "1.0"))
+LEADER_RADAR_MAX_SUBS = max(0, int(os.getenv("LEADER_RADAR_MAX_SUBS", "5")))
+LEADER_RADAR_HOLD_SEC = float(os.getenv("LEADER_RADAR_HOLD_SEC", "120"))
+LEADER_RADAR_POLL_SEC = float(os.getenv("LEADER_RADAR_POLL_SEC", "1.0"))
+LEADER_RADAR_POOL_TOPK = max(10, int(os.getenv("LEADER_RADAR_POOL_TOPK", "120")))
+LEADER_RADAR_MARKETS = [m.strip() for m in os.getenv("LEADER_RADAR_MARKETS", os.getenv("VOLUME_RANK_MARKETS", "J,NX")).split(",") if m.strip()]
+VOLUME_RANK_PATH = "/uapi/domestic-stock/v1/quotations/volume-rank"
+VOLUME_RANK_TR_ID = os.getenv("LEADER_RADAR_TR_ID", "FHPST01710000")
 
 
 def _normalized_tr_ids(raw_ids: list[str]) -> tuple[list[str], list[str]]:
@@ -168,6 +178,9 @@ class WSCapture:
         self.preopen_snapshot: set[str] = set()
         self.last_held_symbols: set[str] = set()
         self.watch_remove_after: dict[str, float] = {}
+        self.leader_radar_active_until: dict[str, float] = {}
+        self.leader_radar_price_hist: dict[str, list[tuple[float, float]]] = {}
+        self._leader_radar_last_poll_ts = 0.0
 
     def _in_preopen_window(self, ts_epoch: float | None = None) -> bool:
         hhmm = _hhmm_now(ts_epoch)
@@ -213,7 +226,88 @@ class WSCapture:
         if held != self.last_held_symbols:
             _append(CONTROL_FILE, f"{_ts()}	HELD merge n={len(held)}")
             self.last_held_symbols = set(held)
-        return kept_watch | held
+
+        base_desired = kept_watch | held
+        radar_syms = self._leader_radar_symbols(now, excluded=base_desired)
+        if radar_syms:
+            _append(CONTROL_FILE, f"{_ts()}	LEADER_RADAR add={len(radar_syms)} thr={LEADER_RADAR_RET3S_PCT:.2f}%")
+        return base_desired | radar_syms
+
+    def _fetch_volume_rank_rows(self, market: str) -> list[dict]:
+        params = {
+            "FID_COND_MRKT_DIV_CODE": market,
+            "FID_COND_SCR_DIV_CODE": os.getenv("LEADER_RADAR_SCR", "20171"),
+            "FID_INPUT_ISCD": os.getenv("LEADER_RADAR_INPUT_ISCD", "0000"),
+            "FID_DIV_CLS_CODE": "0",
+            "FID_BLNG_CLS_CODE": "0",
+            "FID_TRGT_CLS_CODE": "111111111",
+            "FID_TRGT_EXLS_CLS_CODE": "000000",
+            "FID_INPUT_PRICE_1": "",
+            "FID_INPUT_PRICE_2": "",
+            "FID_VOL_CNT": "",
+            "FID_INPUT_DATE_1": "",
+        }
+        try:
+            j = request("GET", VOLUME_RANK_PATH, VOLUME_RANK_TR_ID, params=params)
+            for k in ("output", "output1", "output2"):
+                rows = j.get(k)
+                if isinstance(rows, list):
+                    return rows[:LEADER_RADAR_POOL_TOPK]
+        except Exception:
+            return []
+        return []
+
+    def _parse_row_symbol_price(self, row: dict) -> tuple[str, float]:
+        sym = str(row.get("mksc_shrn_iscd") or row.get("stck_shrn_iscd") or row.get("hts_kor_isnm") or "").strip()
+        if sym and not sym.isdigit():
+            sym = str(row.get("stck_shrn_iscd") or row.get("mksc_shrn_iscd") or "").strip()
+        px = 0.0
+        for k in ("stck_prpr", "stck_clpr", "prpr", "price", "cur_prc"):
+            try:
+                px = float(row.get(k, 0) or 0)
+                if px > 0:
+                    break
+            except Exception:
+                pass
+        return sym, px
+
+    def _leader_radar_symbols(self, now: float, excluded: set[str]) -> set[str]:
+        if (not LEADER_RADAR_ENABLE) or LEADER_RADAR_MAX_SUBS <= 0:
+            self.leader_radar_active_until.clear()
+            return set()
+
+        if (now - self._leader_radar_last_poll_ts) >= max(0.2, LEADER_RADAR_POLL_SEC):
+            self._leader_radar_last_poll_ts = now
+            for m in LEADER_RADAR_MARKETS:
+                rows = self._fetch_volume_rank_rows(m)
+                for row in rows:
+                    sym, px = self._parse_row_symbol_price(row)
+                    if (not sym) or (px <= 0):
+                        continue
+                    h = self.leader_radar_price_hist.setdefault(sym, [])
+                    h.append((now, px))
+                    cutoff = now - 4.0
+                    while h and h[0][0] < cutoff:
+                        h.pop(0)
+                    base = next((p for t, p in h if (now - t) >= 3.0), h[0][1] if h else px)
+                    if base > 0:
+                        ret3 = (px / base - 1.0) * 100.0
+                        if ret3 >= LEADER_RADAR_RET3S_PCT and sym not in excluded:
+                            self.leader_radar_active_until[sym] = now + LEADER_RADAR_HOLD_SEC
+
+        # expire
+        expired = [sym for sym, until in self.leader_radar_active_until.items() if until <= now]
+        for sym in expired:
+            self.leader_radar_active_until.pop(sym, None)
+
+        # enforce max slots by remaining ttl
+        ranked = sorted(self.leader_radar_active_until.items(), key=lambda kv: kv[1], reverse=True)
+        keep_syms = {sym for sym, _ in ranked[:LEADER_RADAR_MAX_SUBS]}
+        for sym in list(self.leader_radar_active_until.keys()):
+            if sym not in keep_syms:
+                self.leader_radar_active_until.pop(sym, None)
+
+        return keep_syms
 
     def start(self):
         _ensure_dir(OUT_FILE)
