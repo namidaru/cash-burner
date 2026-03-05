@@ -1567,36 +1567,52 @@ class EngineReal:
             "price": price,
         }
 
-    def position_size(self, price: float, cash: float) -> int:
+    def position_size(self, price: float, cash: float, position_pct: float | None = None) -> int:
         if price <= 0:
             return 0
-        return int((cash * self.position_pct) // price)
+        pct = self.position_pct if position_pct is None else max(0.0, position_pct)
+        return int((cash * pct) // price)
 
-    def enter_position(self, sym: str, price: float, ts_epoch: float, feat: Dict[str, float], dayrise: float, spread: float, imb: float) -> None:
+    def enter_position(
+        self,
+        sym: str,
+        price: float,
+        ts_epoch: float,
+        feat: Dict[str, float],
+        dayrise: float,
+        spread: float,
+        imb: float,
+        position_pct: float | None = None,
+        entry_score: float | None = None,
+    ) -> bool:
         try:
             cash = self._buyable_cash(sym)
         except Exception as e:
             self._log(ts_epoch, "BUY", sym, 0, price, "buyable_cash_error", "EX", f"{type(e).__name__}:{e}")
             self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, imb, spread, dayrise, "buyable_cash_error")
-            return
-        qty = self.position_size(price, cash)
+            return False
+        qty = self.position_size(price, cash, position_pct=position_pct)
         if qty <= 0:
             self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, imb, spread, dayrise, f"qty=0 cash={cash:.0f}")
-            return
+            return False
 
         ord_dvsn, ord_unpr, order_detail = self._build_buy_order(sym, ts_epoch, price)
         if not ord_dvsn:
             self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, imb, spread, dayrise, order_detail)
-            return
+            return False
 
-        reason = f"entry ign/rebreak ret10={feat['ret10']:.2f} trv10={feat['trv10']:.0f} ofi={feat['ofi']:.2f} depth={feat['depth_ratio']:.2f}"
+        pct_used = self.position_pct if position_pct is None else max(0.0, position_pct)
+        reason = f"entry score ret10={feat['ret10']:.2f} trv10={feat['trv10']:.0f} ofi={feat['ofi']:.2f} depth={feat['depth_ratio']:.2f} pos={pct_used:.2f}"
+        if entry_score is not None:
+            reason += f" score={entry_score:.1f}"
         if self.paper_trade_mode:
             if sym in self.pending_orders:
-                return
+                return False
             limit_px = self._limit_with_slippage("BUY", price)
             if self._submit_pending_order("BUY", sym, qty, limit_px, ts_epoch, reason, order_detail):
                 self._log_signal_diag(ts_epoch, sym, price, feat['ret10'], 0, feat['trv10'], imb, spread, dayrise, "BUY_PEND", f"qty={qty}")
-            return
+                return True
+            return False
 
         j = self._safe_order("BUY", sym, qty, ts_epoch, price, reason, ord_dvsn=ord_dvsn, ord_unpr=ord_unpr)
         if j.get("rt_cd") == "0":
@@ -1608,39 +1624,53 @@ class EngineReal:
             self.day_buy_count += 1
             self._log_signal_diag(ts_epoch, sym, price, feat['ret10'], 0, feat['trv10'], imb, spread, dayrise, "BUY_TRY", f"qty={qty}")
             self._notify_buy(sym, qty, price, feat['ret10'], 0, feat['trv10'], imb, spread, dayrise, 0.0, ts_epoch, 0.0)
+            return True
+        return False
 
-    def try_entry(self, sym: str, price: float, ts_epoch: float, feat: Dict[str, float], dayrise: float, spread: float, imb: float):
-        if feat["ret10"] > 0.22 and feat["trv10"] > 30000000:
-            if sym not in self.ignition_ts:
-                self.ignition_ts[sym] = ts_epoch
-                self.ignition_price[sym] = price
-                self.pb_seen[sym] = False
-                self.pb_low[sym] = price
-                self.rebreak_ready[sym] = False
+    def try_entry(self, sym: str, price: float, ts_epoch: float, feat: Dict[str, float], dayrise: float, spread: float, imb: float, sweep_score: float = 0.0) -> bool:
+        ret10 = float(feat.get("ret10", 0.0))
+        trv10 = float(feat.get("trv10", 0.0))
+        if ret10 <= 0.15 or trv10 <= 20_000_000:
+            return False
 
-        if sym not in self.ignition_ts:
-            return
-        if feat["ofi"] < 1.8:
-            return
-        if feat["depth_ratio"] < 1.35:
-            return
+        ofi = float(feat.get("ofi", 0.0))
+        depth_ratio = float(feat.get("depth_ratio", 0.0))
+        score = 0.0
+        score += min(ret10, 1.2) * 50.0
+        score += max(0.0, ofi - 1.0) * 20.0
+        score += max(0.0, depth_ratio - 1.0) * 30.0
+        score += max(0.0, sweep_score) * 25.0
+        score += math.log1p(max(0.0, trv10)) * 2.0
 
-        peak = max(self.ignition_price.get(sym, price), price)
-        self.ignition_price[sym] = peak
-        pb_thr = peak * 0.9945
-        if price <= pb_thr:
-            self.pb_seen[sym] = True
-            self.pb_low[sym] = min(self.pb_low.get(sym, price), price)
+        dq = self.ticks.get(sym, deque())
+        _, trv2, _ = self._window_stats(dq, ts_epoch, 2.0)
+        breakout_ref = max(self.ignition_price.get(sym, price), price)
+        self.ignition_price[sym] = breakout_ref
+        _fake_ok, fake_score, _fake_detail = self._fake_breakout_filter(price, breakout_ref, trv2, depth_ratio, ofi)
+        if fake_score >= 2:
+            score -= 40.0
 
-        if not self.pb_seen.get(sym, False):
-            return
+        if score <= 120.0:
+            return False
 
-        rebound_thr = self.pb_low.get(sym, price) * 1.0018
-        if price < rebound_thr:
-            return
+        if score > 170.0:
+            position_pct = 0.30
+        elif score > 140.0:
+            position_pct = 0.20
+        else:
+            position_pct = 0.10
 
-        self.rebreak_ready[sym] = True
-        self.enter_position(sym, price, ts_epoch, feat, dayrise, spread, imb)
+        return self.enter_position(
+            sym,
+            price,
+            ts_epoch,
+            feat,
+            dayrise,
+            spread,
+            imb,
+            position_pct=position_pct,
+            entry_score=score,
+        )
 
     def _execute_sell_action(self, sym: str, p: Position, price: float, ts_epoch: float, reason: str, detail: str, qty_target: int | None = None, cleanup_if_flat: bool = True) -> bool:
         qty_sell = self._sellable_qty(sym)
@@ -1916,9 +1946,10 @@ class EngineReal:
             self.manage_position(sym, price, ts_epoch, feat)
             return
 
-        self.try_entry(sym, price, ts_epoch, feat, dayrise, spread, imb)
-        return
+        if self.try_entry(sym, price, ts_epoch, feat, dayrise, spread, imb, sweep_score=sweep_score):
+            return
 
+        # Entry path is unified below; keep feature computation shared with position management.
         c0 = self.candidate_since.get(sym)
         session = self._session_name(ts_epoch)
 
