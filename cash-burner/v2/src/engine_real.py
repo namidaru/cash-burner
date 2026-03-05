@@ -182,6 +182,14 @@ class EngineReal:
         self.early_imb_keep_sec = float(os.getenv("EARLY_IMB_KEEP_SEC", "2.0"))
         self.early_imb_keep_min = float(os.getenv("EARLY_IMB_KEEP_MIN", "0.65"))
         self.early_spread_ref_pct = float(os.getenv("EARLY_SPREAD_REF_PCT", "0.25"))
+        self.imb_early_entry_enabled = os.getenv("IMB_EARLY_ENTRY_ENABLED", "1") == "1"
+        self.imb_early_min = float(os.getenv("IMB_EARLY_MIN", "0.66"))
+        self.imb_early_keep_sec = float(os.getenv("IMB_EARLY_KEEP_SEC", "3.0"))
+        self.imb_early_keep_ratio = float(os.getenv("IMB_EARLY_KEEP_RATIO", "0.70"))
+        self.imb_early_spread_max = float(os.getenv("IMB_EARLY_SPREAD_MAX", "0.25"))
+        self.imb_early_ofi_min = float(os.getenv("IMB_EARLY_OFI_MIN", "1.50"))
+        self.imb_early_ret10_min = float(os.getenv("IMB_EARLY_RET10_MIN", "0.00"))
+        self.imb_early_position_pct = float(os.getenv("IMB_EARLY_POSITION_PCT", "0.20"))
 
         self.kill_switch_file = os.getenv("KILL_SWITCH_FILE", os.path.join("data", "kill.switch"))
         self.ledger_file = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
@@ -866,6 +874,46 @@ class EngineReal:
             if (ts_epoch - last_evt) >= self.early_new_high_cooldown_sec:
                 self.new_high_last_ts[sym] = ts_epoch
                 self.new_high_events[sym].append(ts_epoch)
+
+    def _imb_keep_ratio(self, sym: str, ts_epoch: float, min_imb: float, keep_sec: float) -> float:
+        q = self.imb_samples.get(sym, deque())
+        vals = [v for t, v in q if (ts_epoch - t) <= max(0.1, keep_sec)]
+        if not vals:
+            return 0.0
+        return sum(1.0 for v in vals if v >= min_imb) / max(1, len(vals))
+
+    def _try_imbalance_early_entry(self, sym: str, price: float, ts_epoch: float, feat: Dict[str, float], dayrise: float, spread: float, imb: float) -> bool:
+        if not self.imb_early_entry_enabled:
+            return False
+        if spread <= 0 or spread > self.imb_early_spread_max:
+            return False
+        ret10 = float(feat.get("ret10", 0.0))
+        ofi = float(feat.get("ofi", 0.0))
+        if ret10 <= self.imb_early_ret10_min:
+            return False
+        if ofi < self.imb_early_ofi_min:
+            return False
+        if imb < self.imb_early_min:
+            return False
+        keep_ratio = self._imb_keep_ratio(sym, ts_epoch, self.imb_early_min, self.imb_early_keep_sec)
+        if keep_ratio < self.imb_early_keep_ratio:
+            return False
+
+        early_score = (imb * 100.0) + (ofi * 10.0) + (ret10 * 50.0)
+        ok = self.enter_position(
+            sym,
+            price,
+            ts_epoch,
+            feat,
+            dayrise,
+            spread,
+            imb,
+            position_pct=max(0.05, min(self.imb_early_position_pct, 0.30)),
+            entry_score=early_score,
+        )
+        if ok:
+            self._log_signal_diag(ts_epoch, sym, price, ret10, 0, float(feat.get("trv10", 0.0)), imb, spread, dayrise, "EARLY_IMB", f"keep={keep_ratio:.2f} ofi={ofi:.2f}")
+        return ok
 
     def _calc_early_score(self, sym: str, ts_epoch: float, price: float, spread: float, imb: float, trv_prev: float) -> tuple[float, Dict[str, float]]:
         dq = self.ticks.get(sym, deque())
@@ -1753,6 +1801,7 @@ class EngineReal:
             elif price < prev_px:
                 self.sell_vol[sym] += max(0.0, vol)
         self.last_trade_price[sym] = price
+        self._update_early_microstructure(sym, ts_epoch, price, imb)
 
         feat = self.compute_features(sym, dq, (ob if (ob and not ob_stale) else None), ts_epoch, price)
         if sym in self.pos:
@@ -1761,6 +1810,9 @@ class EngineReal:
 
         if len(self.pos) >= self.max_positions:
             self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"max_positions reached={len(self.pos)} limit={self.max_positions}")
+            return
+
+        if self._try_imbalance_early_entry(sym, price, ts_epoch, feat, dayrise, spread, imb):
             return
 
         if self.try_entry(sym, price, ts_epoch, feat, dayrise, spread, imb, sweep_score=sweep_score):
@@ -1853,7 +1905,6 @@ class EngineReal:
             self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"fake_breakout score={fake_score} {fake_detail}")
             return
 
-        self._update_early_microstructure(sym, ts_epoch, price, imb)
         early_score, early_meta = self._calc_early_score(sym, ts_epoch, price, spread, imb, trv_prev)
         early_floor = self.early_score_min
         if session == "OPEN":
