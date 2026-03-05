@@ -90,6 +90,7 @@ class EngineReal:
         self.vi_cooldown_sec = float(os.getenv("VI_COOLDOWN_SEC", "120"))
 
         self.position_pct = float(os.getenv("POSITION_PCT", "0.30"))
+        self.max_positions = max(1, int(os.getenv("MAX_POSITIONS", "3")))
         self.entry_score_min = float(os.getenv("ENTRY_SCORE_MIN", "120"))
         self.open_entry_score_min = float(os.getenv("OPEN_ENTRY_SCORE_MIN", "150"))
         self.mid_entry_score_min = float(os.getenv("MID_ENTRY_SCORE_MIN", "135"))
@@ -1756,6 +1757,10 @@ class EngineReal:
         feat = self.compute_features(sym, dq, (ob if (ob and not ob_stale) else None), ts_epoch, price)
         if sym in self.pos:
             self.manage_position(sym, price, ts_epoch, feat)
+            return
+
+        if len(self.pos) >= self.max_positions:
+            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"max_positions reached={len(self.pos)} limit={self.max_positions}")
             return
 
         if self.try_entry(sym, price, ts_epoch, feat, dayrise, spread, imb, sweep_score=sweep_score):
