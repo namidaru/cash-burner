@@ -464,7 +464,11 @@ class EngineReal:
             self._notify_sell(sym, qty_ord, po.limit_price, "PENDING_LIMIT", po.reason, p, ts_epoch)
             self._log_auto_position(ts_epoch, "SELL", sym, p, ref_price=po.limit_price, note="PENDING_FILL")
             self.pending_orders.pop(sym, None)
-            self._cleanup_symbol_state(sym)
+            p.qty = max(0, p.qty - qty_ord)
+            if p.qty <= 0:
+                self._cleanup_symbol_state(sym)
+            else:
+                self._save_positions_state()
 
     def _verify_startup_cash_or_block(self):
         now = time.time()
@@ -1848,15 +1852,17 @@ class EngineReal:
         if sym in self.pending_orders:
             self._try_fill_pending_order(sym, price, ts_epoch)
 
+        holding_position = sym in self.pos
+
         # manage position after feature computation to keep a single feature path
 
-        if not self.trade_ready:
+        if (not holding_position) and (not self.trade_ready):
             self._refresh_trade_ready(ts_epoch)
             if not self.trade_ready:
                 self._note_no_buy(ts_epoch, sym, price, 0.0, 0, 0.0, 0.0, 0.0, self._day_rise_pct(sym, price), f"trade_blocked {self.trade_block_reason[:120]}")
                 return
 
-        if not self._is_entry_window(ts_epoch):
+        if (not holding_position) and (not self._is_entry_window(ts_epoch)):
             self._note_no_buy(ts_epoch, sym, price, 0.0, 0, 0.0, 0.0, 0.0, self._day_rise_pct(sym, price), "outside_entry_window")
             return
 
@@ -1870,18 +1876,19 @@ class EngineReal:
         orderbook_ratio_min = float(p.get("orderbook_ratio_min", self.orderbook_ratio_min))
         confirm_sec = float(p.get("confirm_sec", self.confirm_sec))
         cooldown_sec = float(p.get("cooldown_sec", self.cooldown_sec))
-        if ts_epoch - self.last_entry_ts.get(sym, 0.0) < cooldown_sec:
-            self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, 0, f"cooldown<{cooldown_sec:.0f}s")
-            return
         dayrise = self._day_rise_pct(sym, price)
-        if dayrise > 7.0:
-            self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, dayrise, "dayrise_hard_block>7")
-            return
+        if not holding_position:
+            if ts_epoch - self.last_entry_ts.get(sym, 0.0) < cooldown_sec:
+                self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, 0, f"cooldown<{cooldown_sec:.0f}s")
+                return
+            if dayrise > 7.0:
+                self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, dayrise, "dayrise_hard_block>7")
+                return
 
-        blocked, block_detail = self._is_buy_blocked_after_fail(sym, ts_epoch)
-        if blocked:
-            self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, dayrise, block_detail)
-            return
+            blocked, block_detail = self._is_buy_blocked_after_fail(sym, ts_epoch)
+            if blocked:
+                self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, dayrise, block_detail)
+                return
 
         dq = self.ticks[sym]
         dq.append((ts_epoch, price, vol))
