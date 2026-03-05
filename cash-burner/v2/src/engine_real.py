@@ -190,6 +190,14 @@ class EngineReal:
         self.imb_early_ofi_min = float(os.getenv("IMB_EARLY_OFI_MIN", "1.50"))
         self.imb_early_ret10_min = float(os.getenv("IMB_EARLY_RET10_MIN", "0.00"))
         self.imb_early_position_pct = float(os.getenv("IMB_EARLY_POSITION_PCT", "0.20"))
+        self.vi_early_entry_enabled = os.getenv("VI_EARLY_ENTRY_ENABLED", "1") == "1"
+        self.vi_near_gap_pct = float(os.getenv("VI_NEAR_GAP_PCT", "0.30"))
+        self.vi_release_gap_pct = float(os.getenv("VI_RELEASE_GAP_PCT", "0.35"))
+        self.vi_early_hold_sec = float(os.getenv("VI_EARLY_HOLD_SEC", "150"))
+        self.vi_early_imb_min = float(os.getenv("VI_EARLY_IMB_MIN", "0.65"))
+        self.vi_early_ofi_min = float(os.getenv("VI_EARLY_OFI_MIN", "1.50"))
+        self.vi_early_spread_max = float(os.getenv("VI_EARLY_SPREAD_MAX", "0.30"))
+        self.vi_early_position_pct = float(os.getenv("VI_EARLY_POSITION_PCT", "0.25"))
 
         self.kill_switch_file = os.getenv("KILL_SWITCH_FILE", os.path.join("data", "kill.switch"))
         self.ledger_file = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
@@ -278,6 +286,8 @@ class EngineReal:
         self.new_high_events: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=256))
         self.new_high_last_ts: Dict[str, float] = {}
         self.vi_last_ts: Dict[str, float] = {}
+        self.vi_near_armed_ts: Dict[str, float] = {}
+        self.vi_armed_ref_price: Dict[str, float] = {}
         self._score_pick_bucket_start = 0.0
         self._score_pick_candidates: list[Dict[str, Any]] = []
         self.score_pick_top_n = max(1, int(os.getenv("SCORE_PICK_TOP_N", "3")))
@@ -570,6 +580,8 @@ class EngineReal:
         self.new_high_last_ts.pop(sym, None)
         self.last_entry_ts.pop(sym, None)
         self.vi_last_ts.pop(sym, None)
+        self.vi_near_armed_ts.pop(sym, None)
+        self.vi_armed_ref_price.pop(sym, None)
         self._last_diag_ts.pop(sym, None)
         self.book.pop(sym, None)
         self.book_ts.pop(sym, None)
@@ -913,6 +925,65 @@ class EngineReal:
         )
         if ok:
             self._log_signal_diag(ts_epoch, sym, price, ret10, 0, float(feat.get("trv10", 0.0)), imb, spread, dayrise, "EARLY_IMB", f"keep={keep_ratio:.2f} ofi={ofi:.2f}")
+        return ok
+
+    def _try_vi_early_entry(
+        self,
+        sym: str,
+        price: float,
+        ts_epoch: float,
+        feat: Dict[str, float],
+        dayrise: float,
+        spread: float,
+        imb: float,
+        vi_std: float,
+        vi_gap: float,
+        prev_px: float | None,
+    ) -> bool:
+        if (not self.vi_early_entry_enabled) or vi_std <= 0:
+            return False
+
+        ofi = float(feat.get("ofi", 0.0))
+        if spread <= 0 or spread > self.vi_early_spread_max:
+            return False
+        if imb < self.vi_early_imb_min or ofi < self.vi_early_ofi_min:
+            return False
+
+        # arm near VI 기준가
+        if vi_gap <= self.vi_near_gap_pct:
+            self.vi_near_armed_ts[sym] = ts_epoch
+            self.vi_armed_ref_price[sym] = price
+            return False
+
+        armed_ts = self.vi_near_armed_ts.get(sym)
+        if armed_ts is None:
+            return False
+        if (ts_epoch - armed_ts) > self.vi_early_hold_sec:
+            self.vi_near_armed_ts.pop(sym, None)
+            self.vi_armed_ref_price.pop(sym, None)
+            return False
+
+        # VI 근접 이후 첫 상승틱 + gap 이탈 시 진입
+        first_uptick = (prev_px is not None) and (price > prev_px)
+        if (vi_gap < self.vi_release_gap_pct) or (not first_uptick):
+            return False
+
+        early_score = 140.0 + (imb * 20.0) + (ofi * 10.0)
+        ok = self.enter_position(
+            sym,
+            price,
+            ts_epoch,
+            feat,
+            dayrise,
+            spread,
+            imb,
+            position_pct=max(0.05, min(self.vi_early_position_pct, 0.35)),
+            entry_score=early_score,
+        )
+        if ok:
+            self.vi_near_armed_ts.pop(sym, None)
+            self.vi_armed_ref_price.pop(sym, None)
+            self._log_signal_diag(ts_epoch, sym, price, float(feat.get("ret10", 0.0)), 0, float(feat.get("trv10", 0.0)), imb, spread, dayrise, "EARLY_VI", f"vi_gap={vi_gap:.2f}% ofi={ofi:.2f}")
         return ok
 
     def _calc_early_score(self, sym: str, ts_epoch: float, price: float, spread: float, imb: float, trv_prev: float) -> tuple[float, Dict[str, float]]:
@@ -1810,6 +1881,9 @@ class EngineReal:
 
         if len(self.pos) >= self.max_positions:
             self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"max_positions reached={len(self.pos)} limit={self.max_positions}")
+            return
+
+        if self._try_vi_early_entry(sym, price, ts_epoch, feat, dayrise, spread, imb, vi_std, vi_gap, prev_px):
             return
 
         if self._try_imbalance_early_entry(sym, price, ts_epoch, feat, dayrise, spread, imb):
