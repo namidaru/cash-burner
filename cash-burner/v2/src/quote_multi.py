@@ -92,12 +92,17 @@ def score_item(it: Dict[str, Any]) -> float:
             spread_penalty = min(2.0, (spr_pct - 0.30) * 2.0)  # 최대 2점 감점
 
     # 4) 점수 조합
-    # - r: 모멘텀 (가중치 크게)
+    # - r_capped: 3%까지는 모멘텀 가점, 그 이상은 과열 추격 감점
     # - log(tr_value): 유동성 (과열/잡주 제거에 효과)
     # - log(vol): 활동성(틱/체결 빈도 proxy)
+    if r <= 3.0:
+        r_capped = r
+    else:
+        r_capped = 3.0 - ((r - 3.0) * 0.5)
+
     log_tv = math.log1p(max(tr_value, 0.0))
     log_vol = math.log1p(max(vol, 0.0))
 
-    score = (r * 2.0) + (log_tv * 0.8) + (log_vol * 0.2) - spread_penalty
+    score = (r_capped * 2.0) + (log_tv * 0.8) + (log_vol * 0.2) - spread_penalty
 
     return score
