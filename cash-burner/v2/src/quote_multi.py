@@ -12,11 +12,11 @@ PATH = "/uapi/domestic-stock/v1/quotations/intstock-multprice"
 # market code default (J=KOSPI, Q=KOSDAQ etc). You can change via env.
 DEFAULT_MRKT = os.getenv("FID_COND_MRKT_DIV_CODE_1", "J")
 
-# 실전용 과열 차단(+12% 이상 진입 금지)과도 정합
-ENTRY_BLOCK_DAYRISE_PCT = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "12.0"))
+# 실전용 과열 차단(+5% 이상 진입 금지)과도 정합
+ENTRY_BLOCK_DAYRISE_PCT = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "5.0"))
 
 # 거래대금(원) 너무 작은 종목은 제외(유동성 쓰레기 필터)
-MIN_TRADE_VALUE = float(os.getenv("WATCH_MIN_TR_VALUE", "300000000"))  # 3억 기본(원하는대로 조절)
+MIN_TRADE_VALUE = float(os.getenv("WATCH_MIN_TR_VALUE", "1200000000"))  # 3억 기본(원하는대로 조절)
 
 def chunk(lst: List[str], n: int):
     for i in range(0, len(lst), n):
@@ -43,10 +43,24 @@ def multi_quote(symbols: List[str]) -> List[Dict[str, Any]]:
             out.extend(items)
     return out
 
+
+
+def volume_acceleration(it: Dict[str, Any]) -> float:
+    """거래대금 가속도 proxy (당일 누적대금 / 전일 거래량)."""
+    tr_value = _get_first(it, [
+        "acml_tr_pbmn", "ACML_TR_PBMN", "stck_acml_tr_pbmn", "STCK_ACML_TR_PBMN"
+    ], 0.0)
+    prev_vol = _get_first(it, [
+        "prdy_vol", "PRDY_VOL", "prev_vol", "PRDY_ACML_VOL"
+    ], 1.0)
+    if prev_vol <= 0:
+        return 0.0
+    return tr_value / prev_vol
+
 def score_item(it: Dict[str, Any]) -> float:
     """
     실전 수익형 워치리스트 점수:
-    - 너무 과열(+12% 이상)은 제외 (score = -inf)
+    - 과열(+3.5% 이상) 및 저유동 체결량은 제외 (score = -inf)
     - 거래대금(유동성) + 등락률(모멘텀) + 거래량을 섞어서 점수화
     - 거래대금이 너무 작으면 제외
 
@@ -59,8 +73,8 @@ def score_item(it: Dict[str, Any]) -> float:
         "stck_prdy_ctrt", "STCK_PRDY_CTRT"
     ], 0.0)
 
-    # 과열 차단(+12% 이상)
-    if r >= ENTRY_BLOCK_DAYRISE_PCT:
+    # 과열 차단(+3.5% 이상 즉시 제외, +5% 차단과 별도로 더 보수적으로 운용)
+    if r > 2.5 or r >= ENTRY_BLOCK_DAYRISE_PCT:
         return float("-inf")
 
     # 2) 거래대금/거래량 (유동성)
@@ -74,9 +88,17 @@ def score_item(it: Dict[str, Any]) -> float:
         "vol", "VOL"
     ], 0.0)
 
+    # 체결량 하한 필터(너무 얇은 종목 제거)
+    if vol > 0 and vol < 50000:
+        return float("-inf")
+
     # 유동성 하한 필터(거래대금 너무 적은 후보는 워치리스트에서 제외)
     if tr_value > 0 and tr_value < MIN_TRADE_VALUE:
         return float("-inf")
+
+    strength = _get_first(it, [
+        "tday_rltv", "exec_str", "trade_strength", "cntrg", "cttr", "power"
+    ], 0.0)
 
     # 3) 스프레드/호가 품질(있으면 가산/감점)
     # 멀티시세에 ask/bid가 안 올 수도 있음 → 있으면만 사용
@@ -91,18 +113,19 @@ def score_item(it: Dict[str, Any]) -> float:
         if spr_pct > 0.30:
             spread_penalty = min(2.0, (spr_pct - 0.30) * 2.0)  # 최대 2점 감점
 
-    # 4) 점수 조합
-    # - r_capped: 3%까지는 모멘텀 가점, 그 이상은 과열 추격 감점
-    # - log(tr_value): 유동성 (과열/잡주 제거에 효과)
-    # - log(vol): 활동성(틱/체결 빈도 proxy)
-    if r <= 3.0:
-        r_capped = r
-    else:
-        r_capped = 3.0 - ((r - 3.0) * 0.5)
+    # 4) 점수 조합 (급등 초입 탐지형)
+    # - volume_accel: 거래대금 가속도 중심
+    # - strength_score: 체결강도 100 기준 정규화
+    # - liquidity_score: 절대 유동성 보정
+    accel = min(volume_acceleration(it), 3.0)
+    strength_score = max(0.0, (strength - 100.0) / 20.0)
+    liquidity_score = math.log1p(max(tr_value, 0.0))
 
-    log_tv = math.log1p(max(tr_value, 0.0))
-    log_vol = math.log1p(max(vol, 0.0))
-
-    score = (r_capped * 2.0) + (log_tv * 0.8) + (log_vol * 0.2) - spread_penalty
+    score = (
+        (accel * 3.0)
+        + (strength_score * 1.8)
+        + (liquidity_score * 1.0)
+        - spread_penalty
+    )
 
     return score
