@@ -6,19 +6,14 @@ import time
 import threading
 from typing import List
 
-PAPER_TRADE_MODE = os.getenv("PAPER_TRADE_MODE", "1") == "1"
-
-def _set_mode_default_env(key: str, real_path: str, paper_path: str):
-    os.environ.setdefault(key, paper_path if PAPER_TRADE_MODE else real_path)
-
-_set_mode_default_env("OUT_FILE", os.path.join("data", "ws_dump.log"), os.path.join("data", "ws_dump_paper.log"))
-_set_mode_default_env("CONTROL_FILE", os.path.join("data", "ws_control.log"), os.path.join("data", "ws_control_paper.log"))
-_set_mode_default_env("LEDGER_FILE", os.path.join("data", "ledger_real.csv"), os.path.join("data", "ledger_paper.csv"))
-_set_mode_default_env("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"), os.path.join("data", "watchlist_paper.txt"))
-_set_mode_default_env("POSITION_STATE_FILE", os.path.join("data", "positions_real.json"), os.path.join("data", "positions_paper.json"))
-_set_mode_default_env("AUTO_POSITION_LOG_FILE", os.path.join("data", "auto_positions_real.csv"), os.path.join("data", "auto_positions_paper.csv"))
-_set_mode_default_env("SIGNAL_DIAG_FILE", os.path.join("data", "signal_diag.log"), os.path.join("data", "signal_diag_paper.log"))
-_set_mode_default_env("WATCHLIST_DEBUG", os.path.join("data", "watchlist_debug.log"), os.path.join("data", "watchlist_debug_paper.log"))
+os.environ.setdefault("OUT_FILE", os.path.join("data", "ws_dump.log"))
+os.environ.setdefault("CONTROL_FILE", os.path.join("data", "ws_control.log"))
+os.environ.setdefault("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
+os.environ.setdefault("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
+os.environ.setdefault("POSITION_STATE_FILE", os.path.join("data", "positions_real.json"))
+os.environ.setdefault("AUTO_POSITION_LOG_FILE", os.path.join("data", "auto_positions_real.csv"))
+os.environ.setdefault("SIGNAL_DIAG_FILE", os.path.join("data", "signal_diag.log"))
+os.environ.setdefault("WATCHLIST_DEBUG", os.path.join("data", "watchlist_debug.log"))
 
 from scanner_company_rank import build_watchlist, get_last_build_meta, check_watchlist_integrity, get_last_source_map
 from quote_basic import ensure_prev_close

@@ -777,7 +777,7 @@ def build_watchlist() -> List[str]:
             momentum_score = chg
             liquidity_score = math.log1p(max(tv, 0.0))
             volume_score = math.log1p(max(vol, 0.0))
-            volume_accel = tv / max(vol, 1.0)
+            volume_accel = min(max(volume_acceleration(it), 0.0), 3.0)
 
             score = (
                 (momentum_score * 2.0)
@@ -893,7 +893,7 @@ def build_watchlist() -> List[str]:
         momentum_score = chg
         liquidity_score = math.log1p(max(tv, 0.0))
         volume_score = math.log1p(max(vol, 0.0))
-        volume_accel = tv / max(vol, 1.0)
+        volume_accel = min(max(volume_acceleration(it), 0.0), 3.0)
 
         score = (
             (momentum_score * 2.0)

@@ -29,15 +29,6 @@ class Position:
     partial_taken: bool = False
 
 
-@dataclass
-class PendingOrder:
-    side: str
-    symbol: str
-    qty: int
-    limit_price: float
-    created_ts: float
-    reason: str
-    order_detail: str = ""
 
 
 class EngineReal:
@@ -191,25 +182,13 @@ class EngineReal:
         self.early_imb_keep_min = float(os.getenv("EARLY_IMB_KEEP_MIN", "0.65"))
         self.early_spread_ref_pct = float(os.getenv("EARLY_SPREAD_REF_PCT", "0.25"))
 
-        self.paper_trade_mode = os.getenv("PAPER_TRADE_MODE", "1") == "1"
-
-        def _mode_default(real_path: str, paper_path: str) -> str:
-            return paper_path if self.paper_trade_mode else real_path
-
-        self.kill_switch_file = os.getenv("KILL_SWITCH_FILE", _mode_default(os.path.join("data", "kill.switch"), os.path.join("data", "kill_paper.switch")))
-        self.ledger_file = os.getenv("LEDGER_FILE", _mode_default(os.path.join("data", "ledger_real.csv"), os.path.join("data", "ledger_paper.csv")))
-        self.position_state_file = os.getenv("POSITION_STATE_FILE", _mode_default(os.path.join("data", "positions_real.json"), os.path.join("data", "positions_paper.json")))
-        self.auto_position_log_file = os.getenv("AUTO_POSITION_LOG_FILE", _mode_default(os.path.join("data", "auto_positions_real.csv"), os.path.join("data", "auto_positions_paper.csv")))
-
-        self.paper_cash_file = os.getenv("PAPER_CASH_FILE", os.path.join("data", "paper_cash.json"))
-        self.paper_start_cash = float(os.getenv("PAPER_START_CASH", "3000000"))
-        self.paper_cash = 0.0
+        self.kill_switch_file = os.getenv("KILL_SWITCH_FILE", os.path.join("data", "kill.switch"))
+        self.ledger_file = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
+        self.position_state_file = os.getenv("POSITION_STATE_FILE", os.path.join("data", "positions_real.json"))
+        self.auto_position_log_file = os.getenv("AUTO_POSITION_LOG_FILE", os.path.join("data", "auto_positions_real.csv"))
         self.afterhours_enabled = os.getenv("AFTERHOURS_ENABLED", "1") == "1"
-        self.pending_cancel_dev_pct = float(os.getenv("PENDING_CANCEL_DEV_PCT", "3.0"))
-        self.pending_timeout_sec = float(os.getenv("PENDING_TIMEOUT_SEC", "180"))
-        self.limit_slippage_ticks = max(0, int(os.getenv("LIMIT_SLIPPAGE_TICKS", "2")))
 
-        self.signal_diag_file = os.getenv("SIGNAL_DIAG_FILE", _mode_default(os.path.join("data", "signal_diag.log"), os.path.join("data", "signal_diag_paper.log")))
+        self.signal_diag_file = os.getenv("SIGNAL_DIAG_FILE", os.path.join("data", "signal_diag.log"))
         self.signal_diag_sec = float(os.getenv("SIGNAL_DIAG_SEC", "20"))
         self._last_diag_ts: Dict[str, float] = {}
 
@@ -232,8 +211,6 @@ class EngineReal:
         self.trade_ready = False
         self.trade_block_reason = "startup_cash_unchecked"
         self._last_cash_check_ts = 0.0
-        if self.paper_trade_mode:
-            self._init_paper_cash_state()
         self._lat_sum = 0.0
         self._lat_cnt = 0
         self._lat_max = 0.0
@@ -266,7 +243,6 @@ class EngineReal:
         self.max_price: Dict[str, float] = {}
         self.partial_taken: set[str] = set()
         self.pos: Dict[str, Position] = {}
-        self.pending_orders: Dict[str, PendingOrder] = {}
         self.loaded_carry_positions = 0
         self.last_entry_ts: Dict[str, float] = {}
         self.candidate_since: Dict[str, float] = {}
@@ -294,75 +270,17 @@ class EngineReal:
         self._init_ledger()
         self._init_auto_position_log()
         self._init_diag()
-        if self.paper_trade_mode:
-            self._init_paper_cash_state()
         self._load_positions_state()
         self._verify_startup_cash_or_block()
 
 
-    def _init_paper_cash_state(self):
-        d = os.path.dirname(self.paper_cash_file)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        if os.path.exists(self.paper_cash_file):
-            try:
-                with open(self.paper_cash_file, "r", encoding="utf-8") as f:
-                    payload = json.load(f)
-                self.paper_cash = float(payload.get("cash", self.paper_start_cash))
-                return
-            except Exception:
-                pass
-        self.paper_cash = float(self.paper_start_cash)
-        self._save_paper_cash_state()
-
-    def _save_paper_cash_state(self):
-        d = os.path.dirname(self.paper_cash_file)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        with open(self.paper_cash_file, "w", encoding="utf-8") as f:
-            json.dump({"updated_at": time.time(), "cash": float(self.paper_cash)}, f, ensure_ascii=False, indent=2)
-
-    def _paper_account_buying_power(self) -> float:
-        return max(0.0, float(self.paper_cash))
-
-    def _paper_sellable_qty(self, sym: str) -> int:
-        p = self.pos.get(sym)
-        return int(p.qty) if p else 0
-
-    def _paper_order_cash(self, side: str, symbol: str, qty: int, price: float) -> dict:
-        side_u = side.upper()
-        if qty <= 0 or price <= 0:
-            return {"rt_cd": "1", "msg1": "invalid_qty_or_price"}
-        if side_u == "BUY":
-            cost = float(qty) * float(price)
-            if cost > self.paper_cash:
-                return {"rt_cd": "1", "msg1": f"paper_cash_insufficient need={cost:.0f} have={self.paper_cash:.0f}"}
-            self.paper_cash -= cost
-            self._save_paper_cash_state()
-            return {"rt_cd": "0", "msg1": "paper_buy_ok"}
-        if side_u == "SELL":
-            p = self.pos.get(symbol)
-            if (not p) or p.qty < qty:
-                return {"rt_cd": "1", "msg1": f"paper_qty_insufficient have={p.qty if p else 0}"}
-            proceeds = float(qty) * float(price)
-            self.paper_cash += proceeds
-            self._save_paper_cash_state()
-            return {"rt_cd": "0", "msg1": "paper_sell_ok"}
-        return {"rt_cd": "1", "msg1": f"unknown_side:{side}"}
-
     def _account_buying_power(self) -> float:
-        if self.paper_trade_mode:
-            return self._paper_account_buying_power()
         return account_buying_power(symbol=self.health_cash_symbol, ord_dvsn="01", price="0")
 
     def _buyable_cash(self, sym: str) -> float:
-        if self.paper_trade_mode:
-            return self._paper_account_buying_power()
         return buyable_cash(sym, ord_dvsn="01", price="0")
 
     def _sellable_qty(self, sym: str) -> int:
-        if self.paper_trade_mode:
-            return self._paper_sellable_qty(sym)
         return int(sellable_qty(sym))
 
     def _tick_size(self, price: float) -> float:
@@ -379,96 +297,6 @@ class EngineReal:
         if price < 500000:
             return 500.0
         return 1000.0
-
-    def _limit_with_slippage(self, side: str, ref_price: float) -> float:
-        px = max(1.0, float(ref_price))
-        tick = self._tick_size(px)
-        delta = tick * float(self.limit_slippage_ticks)
-        if side.upper() == "BUY":
-            return px + delta
-        return max(1.0, px - delta)
-
-    def _is_afterhours_window(self, ts_epoch: float) -> bool:
-        hhmm = int(time.strftime("%H%M", time.localtime(ts_epoch)))
-        return (800 <= hhmm < 850) or (1500 <= hhmm < 2000)
-
-    def _is_entry_window(self, ts_epoch: float) -> bool:
-        hhmm = int(time.strftime("%H%M", time.localtime(ts_epoch)))
-        in_regular = 900 <= hhmm < 1530
-        return in_regular or (self.afterhours_enabled and self._is_afterhours_window(ts_epoch))
-
-    def _submit_pending_order(self, side: str, sym: str, qty: int, limit_price: float, ts_epoch: float, reason: str, order_detail: str = "") -> bool:
-        if qty <= 0 or limit_price <= 0:
-            return False
-        self.pending_orders[sym] = PendingOrder(
-            side=side.upper(),
-            symbol=sym,
-            qty=int(qty),
-            limit_price=float(limit_price),
-            created_ts=float(ts_epoch),
-            reason=reason,
-            order_detail=order_detail,
-        )
-        self._log(ts_epoch, f"{side.upper()}_PEND", sym, qty, limit_price, reason, "PEND", order_detail)
-        return True
-
-    def _cancel_pending_order(self, sym: str, ts_epoch: float, reason: str):
-        po = self.pending_orders.pop(sym, None)
-        if not po:
-            return
-        self._log(ts_epoch, f"{po.side}_CXL", sym, po.qty, po.limit_price, reason, "CXL", po.order_detail)
-
-    def _try_fill_pending_order(self, sym: str, price: float, ts_epoch: float):
-        po = self.pending_orders.get(sym)
-        if not po:
-            return
-        side = po.side
-        dev_pct = ((price / po.limit_price) - 1.0) * 100.0 if po.limit_price > 0 else 0.0
-        if (ts_epoch - po.created_ts) >= self.pending_timeout_sec:
-            self._cancel_pending_order(sym, ts_epoch, f"timeout>{self.pending_timeout_sec:.0f}s")
-            return
-        if side == "BUY" and dev_pct >= self.pending_cancel_dev_pct:
-            self._cancel_pending_order(sym, ts_epoch, f"dev_up>{self.pending_cancel_dev_pct:.1f}%")
-            return
-        if side == "SELL" and dev_pct <= -self.pending_cancel_dev_pct:
-            self._cancel_pending_order(sym, ts_epoch, f"dev_dn>{self.pending_cancel_dev_pct:.1f}%")
-            return
-
-        can_fill = (side == "BUY" and price <= po.limit_price) or (side == "SELL" and price >= po.limit_price)
-        if not can_fill:
-            return
-
-        if side == "BUY":
-            j = self._safe_order("BUY", sym, po.qty, ts_epoch, po.limit_price, f"pending_fill {po.reason}", ord_dvsn="00", ord_unpr=str(int(po.limit_price)))
-            if j.get("rt_cd") == "0":
-                self.pos[sym] = Position(qty=po.qty, entry_price=po.limit_price, entry_ts=ts_epoch, max_price=po.limit_price, trail_armed=False)
-                self._log_auto_position(ts_epoch, "BUY", sym, self.pos[sym], ref_price=po.limit_price, note="PENDING_FILL")
-                self._save_positions_state()
-                self.last_entry_ts[sym] = ts_epoch
-                self.day_buy_count += 1
-                self._send_day_start_summary(ts_epoch)
-                self._notify_buy(sym, po.qty, po.limit_price, 0.0, 0, 0.0, 0.0, 0.0, self._day_rise_pct(sym, po.limit_price), 0.0, ts_epoch, 0.0)
-                self.pending_orders.pop(sym, None)
-            return
-
-        p = self.pos.get(sym)
-        if not p:
-            self.pending_orders.pop(sym, None)
-            return
-        qty_ord = min(po.qty, p.qty)
-        if qty_ord <= 0:
-            self.pending_orders.pop(sym, None)
-            return
-        j = self._safe_order("SELL", sym, qty_ord, ts_epoch, po.limit_price, f"pending_fill {po.reason}", ord_dvsn="00", ord_unpr=str(int(po.limit_price)))
-        if j.get("rt_cd") == "0":
-            self._notify_sell(sym, qty_ord, po.limit_price, "PENDING_LIMIT", po.reason, p, ts_epoch)
-            self._log_auto_position(ts_epoch, "SELL", sym, p, ref_price=po.limit_price, note="PENDING_FILL")
-            self.pending_orders.pop(sym, None)
-            p.qty = max(0, p.qty - qty_ord)
-            if p.qty <= 0:
-                self._cleanup_symbol_state(sym)
-            else:
-                self._save_positions_state()
 
     def _verify_startup_cash_or_block(self):
         now = time.time()
@@ -636,10 +464,7 @@ class EngineReal:
     def _safe_order(self, side: str, sym: str, qty: int, ts_epoch: float, price: float, reason: str, ord_dvsn: str = "01", ord_unpr: str = "0"):
         self._health_order_tries += 1
         try:
-            if self.paper_trade_mode:
-                j = self._paper_order_cash(side, sym, qty, price)
-            else:
-                j = order_cash(side, sym, qty, ord_dvsn=ord_dvsn, ord_unpr=ord_unpr)
+            j = order_cash(side, sym, qty, ord_dvsn=ord_dvsn, ord_unpr=ord_unpr)
             self._log(ts_epoch, side, sym, qty, price, reason, j.get("rt_cd", ""), j.get("msg1", ""))
             if j.get("rt_cd") != "0":
                 self._health_failures += 1
@@ -772,17 +597,14 @@ class EngineReal:
                 dropped += 1
                 continue
 
-            if self.paper_trade_mode:
+            try:
+                qty_live = self._sellable_qty(sym)
+            except Exception:
                 qty_live = qty
-            else:
-                try:
-                    qty_live = self._sellable_qty(sym)
-                except Exception:
-                    qty_live = qty
-                if qty_live <= 0:
-                    dropped += 1
-                    continue
-                qty = min(qty, qty_live)
+            if qty_live <= 0:
+                dropped += 1
+                continue
+            qty = min(qty, qty_live)
             self.pos[sym] = Position(
                 qty=qty,
                 entry_price=entry_price,
@@ -1092,7 +914,7 @@ class EngineReal:
     ):
         kst = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_epoch))
         self.notifier.send(
-            title=f"✅ 매수 체결 {sym}{' (모의매수)' if self.paper_trade_mode else ''}",
+            title=f"✅ 매수 체결 {sym}",
             color=0x2ECC71,
             lines=[
                 f"시간: {kst}",
@@ -1126,7 +948,7 @@ class EngineReal:
         color = 0x3498DB if pnl_amt >= 0 else 0xE74C3C
         kst = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_epoch))
         self.notifier.send(
-            title=f"{icon} 매도 체결 {sym} ({reason}){' (모의매도)' if self.paper_trade_mode else ''}",
+            title=f"{icon} 매도 체결 {sym} ({reason})",
             color=color,
             lines=[
                 f"시간: {kst}",
@@ -1162,15 +984,12 @@ class EngineReal:
         self._lat_max = 0.0
         self._nobuy_reason_counts.clear()
         self._buy_fail_by_symbol.clear()
-        self.pending_orders.clear()
         self._last_buyable_cash = 0.0
         self._last_buyable_cash_ts = 0.0
         self.cash_check_retry_sec = float(os.getenv("CASH_CHECK_RETRY_SEC", "30"))
         self.trade_ready = False
         self.trade_block_reason = "startup_cash_unchecked"
         self._last_cash_check_ts = 0.0
-        if self.paper_trade_mode:
-            self._init_paper_cash_state()
 
     def _event_latency_update(self, ts_epoch: float):
         lag = max(0.0, time.time() - ts_epoch)
@@ -1286,21 +1105,6 @@ class EngineReal:
             lines=[f"시간: {kst}"] + self._day_summary_lines() + self._auto_holdings_lines(),
         )
 
-    def _paper_realtime_pnl(self) -> tuple[float, float, float, float]:
-        if not self.paper_trade_mode:
-            return 0.0, 0.0, 0.0, 0.0
-        unrealized = 0.0
-        market_value = 0.0
-        for sym, p in self.pos.items():
-            now = self._latest_trade_price(sym)
-            if now <= 0:
-                now = p.entry_price
-            market_value += now * p.qty
-            unrealized += (now - p.entry_price) * p.qty
-        total = self.day_realized_pnl + unrealized
-        equity = self.paper_cash + market_value
-        return unrealized, total, equity, self.paper_cash
-
     def _send_health_check(self, ts_epoch: float):
         if self.health_check_sec <= 0:
             return
@@ -1339,14 +1143,7 @@ class EngineReal:
             f"미체결 주원인: {top_reason} ({top_cnt}회)",
             f"지연: avg {lat_avg:.3f}s / max {self._lat_max:.3f}s",
             f"당일 승률: {win_rate:.1f}% ({self.day_win_count}승 {self.day_loss_count}패)",
-            f"대기주문: {len(self.pending_orders)}건",
         ]
-        if self.paper_trade_mode:
-            unrealized, mock_total, equity, cash_now = self._paper_realtime_pnl()
-            lines.extend([
-                f"실시간 모의순익: {mock_total:,.0f}원 (실현 {self.day_realized_pnl:,.0f} / 미실현 {unrealized:,.0f})",
-                f"모의자산: {equity:,.0f}원 / 모의현금: {cash_now:,.0f}원",
-            ])
         self.notifier.send(
             title="🩺 정기 헬스체크",
             color=0x5865F2,
@@ -1609,15 +1406,6 @@ class EngineReal:
         reason = f"entry score ret10={feat['ret10']:.2f} trv10={feat['trv10']:.0f} ofi={feat['ofi']:.2f} depth={feat['depth_ratio']:.2f} pos={pct_used:.2f}"
         if entry_score is not None:
             reason += f" score={entry_score:.1f}"
-        if self.paper_trade_mode:
-            if sym in self.pending_orders:
-                return False
-            limit_px = self._limit_with_slippage("BUY", price)
-            if self._submit_pending_order("BUY", sym, qty, limit_px, ts_epoch, reason, order_detail):
-                self._log_signal_diag(ts_epoch, sym, price, feat['ret10'], 0, feat['trv10'], imb, spread, dayrise, "BUY_PEND", f"qty={qty}")
-                return True
-            return False
-
         j = self._safe_order("BUY", sym, qty, ts_epoch, price, reason, ord_dvsn=ord_dvsn, ord_unpr=ord_unpr)
         if j.get("rt_cd") == "0":
             self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, trail_armed=False)
@@ -1684,12 +1472,6 @@ class EngineReal:
         qty_ord = min(qty_sell, target_qty)
         if qty_ord <= 0:
             return False
-        if self.paper_trade_mode:
-            if sym in self.pending_orders:
-                return False
-            limit_px = self._limit_with_slippage("SELL", price)
-            self._submit_pending_order("SELL", sym, qty_ord, limit_px, ts_epoch, detail)
-            return True
         j = self._safe_order("SELL", sym, qty_ord, ts_epoch, price, detail)
         if j.get("rt_cd") != "0":
             return False
@@ -1711,45 +1493,44 @@ class EngineReal:
             p.max_price = max(p.max_price, price)
 
         entry = p.entry_price
-        if (not p.partial_taken) and price >= entry * 1.03:
-            qty_part = int(max(1, math.floor(p.qty * 0.5)))
+        if (not p.partial_taken) and price >= entry * (1.0 + self.partial_take_pct / 100.0):
+            qty_part = int(max(1, math.floor(p.qty * self.partial_take_qty_ratio)))
             if self._execute_sell_action(sym, p, price, ts_epoch, "PARTIAL_TP", "partial_take", qty_target=qty_part, cleanup_if_flat=False):
                 p.partial_taken = True
                 self.partial_taken.add(sym)
                 self._save_positions_state()
                 return
 
-        if (ts_epoch - p.entry_ts) > 8 and price <= entry * 0.972:
+        if (ts_epoch - p.entry_ts) > self.protect_grace_sec and price <= entry * (1.0 - self.protect_stop_pct / 100.0):
             self._execute_sell_action(sym, p, price, ts_epoch, "PROTECT_STOP", "protect_stop")
             return
 
-        if feat.get("ret5", 0.0) < -1.2:
+        if feat.get("ret5", 0.0) <= self.momentum_exit_ret5:
             self._execute_sell_action(sym, p, price, ts_epoch, "MOMENTUM_EXIT", f"ret5={feat.get('ret5',0.0):.2f}")
             return
 
-        if feat.get("depth_ratio", 0.0) > 0 and feat.get("depth_ratio", 0.0) < 0.7:
+        if feat.get("depth_ratio", 0.0) > 0 and feat.get("depth_ratio", 0.0) < self.liquidity_collapse_depth:
             self._execute_sell_action(sym, p, price, ts_epoch, "LIQUIDITY_EXIT", f"depth={feat.get('depth_ratio',0.0):.2f}")
             return
 
         high_60 = max((px for t, px, _ in self.ticks.get(sym, []) if (ts_epoch - t) <= 60.0), default=price)
-        if high_60 > 0 and price >= high_60 * 0.998 and feat.get("ofi", 0.0) < 1.2:
+        if high_60 > 0 and price >= high_60 * self.exhaustion_high_band and feat.get("ofi", 0.0) < self.exhaustion_ofi_max:
             self._execute_sell_action(sym, p, price, ts_epoch, "FLOW_EXIT", f"ofi={feat.get('ofi',0.0):.2f}")
             return
 
-        stop = self.max_price.get(sym, p.max_price) * 0.978
-        if price <= stop:
-            self._execute_sell_action(sym, p, price, ts_epoch, "TRAIL_STOP", f"stop={stop:.2f}")
-            return
+        if (not p.trail_armed) and price >= entry * (1.0 + self.spike_trail_arm_pct / 100.0):
+            p.trail_armed = True
+            self._save_positions_state()
+        if p.trail_armed:
+            stop = self.max_price.get(sym, p.max_price) * (1.0 - self.spike_trail_drop_pct / 100.0)
+            if price <= stop:
+                self._execute_sell_action(sym, p, price, ts_epoch, "TRAIL_STOP", f"stop={stop:.2f}")
+                return
 
     def _maybe_exit(self, sym: str, price: float, ts_epoch: float):
         p = self.pos.get(sym)
         if not p:
             return
-        po = self.pending_orders.get(sym)
-        if po and po.side == "SELL":
-            self._try_fill_pending_order(sym, price, ts_epoch)
-            return
-
         dq = self.ticks[sym]
         dq.append((ts_epoch, price, 0.0))
         while dq and ts_epoch - dq[0][0] > 300.0:
@@ -1777,12 +1558,6 @@ class EngineReal:
             qty_ord = min(qty_sell, target_qty)
             if qty_ord <= 0:
                 return False
-            if self.paper_trade_mode:
-                if sym in self.pending_orders:
-                    return False
-                limit_px = self._limit_with_slippage("SELL", price)
-                self._submit_pending_order("SELL", sym, qty_ord, limit_px, ts_epoch, detail)
-                return True
             j = self._safe_order("SELL", sym, qty_ord, ts_epoch, price, detail)
             if j.get("rt_cd") != "0":
                 return False
@@ -1848,9 +1623,6 @@ class EngineReal:
         is_cum_vol = row.get("CNTG_VOL_CUM", "0") == "1"
         if price <= 0:
             return
-
-        if sym in self.pending_orders:
-            self._try_fill_pending_order(sym, price, ts_epoch)
 
         holding_position = sym in self.pos
 
@@ -2177,14 +1949,6 @@ class EngineReal:
             f"dayrise={dayrise:.2f} score={score:.1f} early={early_score:.1f} base_ready={int(baseline_ready)} "
             f"ob_stale={int(ob_stale)} ob_age={ob_age:.2f}s {order_detail}"
         )
-        if self.paper_trade_mode:
-            if sym in self.pending_orders:
-                return
-            limit_px = self._limit_with_slippage("BUY", price)
-            if self._submit_pending_order("BUY", sym, qty, limit_px, ts_epoch, buy_reason, order_detail):
-                self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "BUY_PEND", f"qty={qty} limit={limit_px:.1f} score={score:.1f}")
-            return
-
         j = self._safe_order("BUY", sym, qty, ts_epoch, price, buy_reason, ord_dvsn=ord_dvsn, ord_unpr=ord_unpr)
         if j.get("rt_cd") == "0":
             self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, trail_armed=False)
