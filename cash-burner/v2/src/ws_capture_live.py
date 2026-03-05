@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os, json, time, threading, csv, queue, re
+from dataclasses import dataclass
 import requests, websocket
 
 APP_KEY = os.getenv("KOREA_INVEST_APP_KEY","")
@@ -9,8 +10,13 @@ APP_SECRET = os.getenv("KOREA_INVEST_APP_SECRET","")
 WS_URL = os.getenv("KIS_WS_URL", "ws://ops.koreainvestment.com:21000")
 BASE_URL = os.getenv("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443")
 
+PAPER_TRADE_MODE = os.getenv("PAPER_TRADE_MODE", "1") == "1"
+
+def _mode_default(real_path: str, paper_path: str) -> str:
+    return paper_path if PAPER_TRADE_MODE else real_path
+
 def _dated_out_file() -> str:
-    raw = os.getenv("OUT_FILE", os.path.join("data", "ws_dump.log"))
+    raw = os.getenv("OUT_FILE", _mode_default(os.path.join("data", "ws_dump.log"), os.path.join("data", "ws_dump_paper.log")))
     ymd = time.strftime("%Y%m%d")
     if "{date}" in raw:
         return raw.replace("{date}", ymd)
@@ -21,9 +27,9 @@ def _dated_out_file() -> str:
 
 
 OUT_FILE = _dated_out_file()
-CONTROL_FILE = os.getenv("CONTROL_FILE", os.path.join("data", "ws_control.log"))
-WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
-LEDGER_FILE = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
+CONTROL_FILE = os.getenv("CONTROL_FILE", _mode_default(os.path.join("data", "ws_control.log"), os.path.join("data", "ws_control_paper.log")))
+WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", _mode_default(os.path.join("data", "watchlist.txt"), os.path.join("data", "watchlist_paper.txt")))
+LEDGER_FILE = os.getenv("LEDGER_FILE", _mode_default(os.path.join("data", "ledger_real.csv"), os.path.join("data", "ledger_paper.csv")))
 PREOPEN_TRACK_MIN = int(os.getenv("PREOPEN_TRACK_MIN", "15"))
 PREOPEN_START_HHMM = int(os.getenv("PREOPEN_START_HHMM", "900"))
 
@@ -134,12 +140,24 @@ def _held_symbols_from_ledger() -> set[str]:
     return {sym for sym, qty in qty_by_symbol.items() if qty > 0}
 
 
+@dataclass(frozen=True)
+class OutgoingWSMessage:
+    payload: str
+    tr_id: str | None = None
+    tr_key: str | None = None
+    tr_type: str | None = None
+
+    @property
+    def is_subscription(self) -> bool:
+        return bool(self.tr_id and self.tr_key and self.tr_type)
+
+
 class WSCapture:
     def __init__(self):
         self.approval_key = None
         self.ws = None
         self.ws_thread = None
-        self.ws_send_queue: queue.Queue[str] = queue.Queue(maxsize=10000)
+        self.ws_send_queue: queue.Queue[OutgoingWSMessage] = queue.Queue(maxsize=10000)
         self.ws_send_thread = None
         self.stop_evt = threading.Event()
         self.reconnect_evt = threading.Event()
@@ -196,13 +214,18 @@ class WSCapture:
         def _send_loop():
             while not self.stop_evt.is_set():
                 try:
-                    payload = self.ws_send_queue.get(timeout=0.5)
+                    msg = self.ws_send_queue.get(timeout=0.5)
                 except Exception:
                     continue
                 try:
                     ws_ref = self.ws
                     if ws_ref is not None:
-                        ws_ref.send(payload)
+                        if msg.is_subscription:
+                            ok, reason = self._validate_sub_request(msg.tr_id or "", msg.tr_key or "", msg.tr_type or "")
+                            if not ok:
+                                _append(CONTROL_FILE, f"{_ts()}	SEND_DROP {reason}")
+                                continue
+                        ws_ref.send(msg.payload)
                 except Exception as e:
                     _append(CONTROL_FILE, f"{_ts()}	SEND_ERR {type(e).__name__}: {e}")
 
@@ -304,7 +327,7 @@ class WSCapture:
 
     def _enqueue_ws_raw(self, payload: str):
         try:
-            self.ws_send_queue.put_nowait(payload)
+            self.ws_send_queue.put_nowait(OutgoingWSMessage(payload=payload))
         except Exception:
             _append(CONTROL_FILE, f"{_ts()}	SEND_DROP queue_full")
 
@@ -324,7 +347,14 @@ class WSCapture:
             return False
         try:
             payload = build_msg(self.approval_key, tr_id, sym, tr_type)
-            self._enqueue_ws_raw(payload)
+            self.ws_send_queue.put_nowait(
+                OutgoingWSMessage(
+                    payload=payload,
+                    tr_id=tr_id,
+                    tr_key=sym,
+                    tr_type=tr_type,
+                )
+            )
             return True
         except Exception as e:
             _append(CONTROL_FILE, f"{_ts()}	SUB_BUILD_ERR {type(e).__name__}: {e}")
