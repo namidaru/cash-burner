@@ -705,8 +705,8 @@ def build_watchlist() -> List[str]:
     want_n = int(os.getenv("WATCH_TOP_N", "30"))
     min_price = float(os.getenv("WATCH_MIN_PRICE", "10000"))
     max_price = float(os.getenv("WATCH_MAX_PRICE", "500000"))
-    min_chg = float(os.getenv("WATCH_MIN_CHANGE_PCT", "2.0"))
-    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "24.0"))
+    min_chg = float(os.getenv("WATCH_MIN_CHANGE_PCT", "-1.0"))
+    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "5.0"))
     min_tv = float(os.getenv("WATCH_MIN_TR_VALUE", "300000000"))
     max_spread_pct = float(os.getenv("WATCH_MAX_SPREAD_PCT", "0.45"))
 
