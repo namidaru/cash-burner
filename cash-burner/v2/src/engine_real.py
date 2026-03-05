@@ -90,6 +90,7 @@ class EngineReal:
         self.vi_cooldown_sec = float(os.getenv("VI_COOLDOWN_SEC", "120"))
 
         self.position_pct = float(os.getenv("POSITION_PCT", "0.30"))
+        self.max_positions = max(1, int(os.getenv("MAX_POSITIONS", "3")))
         self.entry_score_min = float(os.getenv("ENTRY_SCORE_MIN", "120"))
         self.open_entry_score_min = float(os.getenv("OPEN_ENTRY_SCORE_MIN", "150"))
         self.mid_entry_score_min = float(os.getenv("MID_ENTRY_SCORE_MIN", "135"))
@@ -181,6 +182,22 @@ class EngineReal:
         self.early_imb_keep_sec = float(os.getenv("EARLY_IMB_KEEP_SEC", "2.0"))
         self.early_imb_keep_min = float(os.getenv("EARLY_IMB_KEEP_MIN", "0.65"))
         self.early_spread_ref_pct = float(os.getenv("EARLY_SPREAD_REF_PCT", "0.25"))
+        self.imb_early_entry_enabled = os.getenv("IMB_EARLY_ENTRY_ENABLED", "1") == "1"
+        self.imb_early_min = float(os.getenv("IMB_EARLY_MIN", "0.66"))
+        self.imb_early_keep_sec = float(os.getenv("IMB_EARLY_KEEP_SEC", "3.0"))
+        self.imb_early_keep_ratio = float(os.getenv("IMB_EARLY_KEEP_RATIO", "0.70"))
+        self.imb_early_spread_max = float(os.getenv("IMB_EARLY_SPREAD_MAX", "0.25"))
+        self.imb_early_ofi_min = float(os.getenv("IMB_EARLY_OFI_MIN", "1.50"))
+        self.imb_early_ret10_min = float(os.getenv("IMB_EARLY_RET10_MIN", "0.00"))
+        self.imb_early_position_pct = float(os.getenv("IMB_EARLY_POSITION_PCT", "0.20"))
+        self.vi_early_entry_enabled = os.getenv("VI_EARLY_ENTRY_ENABLED", "1") == "1"
+        self.vi_near_gap_pct = float(os.getenv("VI_NEAR_GAP_PCT", "0.30"))
+        self.vi_release_gap_pct = float(os.getenv("VI_RELEASE_GAP_PCT", "0.35"))
+        self.vi_early_hold_sec = float(os.getenv("VI_EARLY_HOLD_SEC", "150"))
+        self.vi_early_imb_min = float(os.getenv("VI_EARLY_IMB_MIN", "0.65"))
+        self.vi_early_ofi_min = float(os.getenv("VI_EARLY_OFI_MIN", "1.50"))
+        self.vi_early_spread_max = float(os.getenv("VI_EARLY_SPREAD_MAX", "0.30"))
+        self.vi_early_position_pct = float(os.getenv("VI_EARLY_POSITION_PCT", "0.25"))
 
         self.kill_switch_file = os.getenv("KILL_SWITCH_FILE", os.path.join("data", "kill.switch"))
         self.ledger_file = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
@@ -203,6 +220,9 @@ class EngineReal:
         self._health_failures = 0
         self.buy_fail_cooldown_sec = float(os.getenv("BUY_FAIL_COOLDOWN_SEC", "30"))
         self.buy_fail_state_ttl_sec = float(os.getenv("BUY_FAIL_STATE_TTL_SEC", "1800"))
+        self.reentry_cooldown_stop_sec = float(os.getenv("REENTRY_COOLDOWN_STOP_SEC", "120"))
+        self.reentry_cooldown_take_sec = float(os.getenv("REENTRY_COOLDOWN_TAKE_SEC", "10"))
+        self.reentry_cooldown_default_sec = float(os.getenv("REENTRY_COOLDOWN_DEFAULT_SEC", "30"))
         self._buy_fail_by_symbol = {}
         self.health_cash_symbol = os.getenv("HEALTH_CASH_SYMBOL", "005930").strip() or "005930"
         self._last_buyable_cash = 0.0
@@ -245,6 +265,8 @@ class EngineReal:
         self.pos: Dict[str, Position] = {}
         self.loaded_carry_positions = 0
         self.last_entry_ts: Dict[str, float] = {}
+        self.next_entry_allowed_ts: Dict[str, float] = {}
+        self.last_exit_reason: Dict[str, str] = {}
         self.candidate_since: Dict[str, float] = {}
         self.candidate_peak_price: Dict[str, float] = {}
         self.candidate_pullback_seen: Dict[str, bool] = {}
@@ -264,8 +286,11 @@ class EngineReal:
         self.new_high_events: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=256))
         self.new_high_last_ts: Dict[str, float] = {}
         self.vi_last_ts: Dict[str, float] = {}
+        self.vi_near_armed_ts: Dict[str, float] = {}
+        self.vi_armed_ref_price: Dict[str, float] = {}
         self._score_pick_bucket_start = 0.0
-        self._score_pick_best: Dict[str, Any] | None = None
+        self._score_pick_candidates: list[Dict[str, Any]] = []
+        self.score_pick_top_n = max(1, int(os.getenv("SCORE_PICK_TOP_N", "3")))
 
         self._init_ledger()
         self._init_auto_position_log()
@@ -282,6 +307,30 @@ class EngineReal:
 
     def _sellable_qty(self, sym: str) -> int:
         return int(sellable_qty(sym))
+
+    def _cooldown_for_exit_reason(self, reason: str, fallback_sec: float) -> float:
+        r = (reason or "").upper()
+        stop_reasons = {"PROTECT_STOP", "MOMENTUM_EXIT", "LIQUIDITY_EXIT"}
+        take_reasons = {"PARTIAL_TP", "TRAIL_STOP", "FLOW_EXIT"}
+        if r in stop_reasons:
+            return max(0.0, self.reentry_cooldown_stop_sec)
+        if r in take_reasons:
+            return max(0.0, self.reentry_cooldown_take_sec)
+        return max(0.0, self.reentry_cooldown_default_sec if self.reentry_cooldown_default_sec > 0 else fallback_sec)
+
+    def _mark_exit_cooldown(self, sym: str, reason: str, ts_epoch: float, fallback_sec: float):
+        cd = self._cooldown_for_exit_reason(reason, fallback_sec)
+        self.last_exit_reason[sym] = reason
+        self.next_entry_allowed_ts[sym] = ts_epoch + cd
+
+    def _entry_cooldown_remaining(self, sym: str, ts_epoch: float, fallback_sec: float) -> tuple[float, str]:
+        until = self.next_entry_allowed_ts.get(sym)
+        reason = self.last_exit_reason.get(sym, "")
+        if until is None:
+            until = self.last_entry_ts.get(sym, 0.0) + max(0.0, fallback_sec)
+            reason = reason or "entry"
+        remain = until - ts_epoch
+        return remain, reason
 
     def _tick_size(self, price: float) -> float:
         if price < 2000:
@@ -531,6 +580,8 @@ class EngineReal:
         self.new_high_last_ts.pop(sym, None)
         self.last_entry_ts.pop(sym, None)
         self.vi_last_ts.pop(sym, None)
+        self.vi_near_armed_ts.pop(sym, None)
+        self.vi_armed_ref_price.pop(sym, None)
         self._last_diag_ts.pop(sym, None)
         self.book.pop(sym, None)
         self.book_ts.pop(sym, None)
@@ -835,6 +886,105 @@ class EngineReal:
             if (ts_epoch - last_evt) >= self.early_new_high_cooldown_sec:
                 self.new_high_last_ts[sym] = ts_epoch
                 self.new_high_events[sym].append(ts_epoch)
+
+    def _imb_keep_ratio(self, sym: str, ts_epoch: float, min_imb: float, keep_sec: float) -> float:
+        q = self.imb_samples.get(sym, deque())
+        vals = [v for t, v in q if (ts_epoch - t) <= max(0.1, keep_sec)]
+        if not vals:
+            return 0.0
+        return sum(1.0 for v in vals if v >= min_imb) / max(1, len(vals))
+
+    def _try_imbalance_early_entry(self, sym: str, price: float, ts_epoch: float, feat: Dict[str, float], dayrise: float, spread: float, imb: float) -> bool:
+        if not self.imb_early_entry_enabled:
+            return False
+        if spread <= 0 or spread > self.imb_early_spread_max:
+            return False
+        ret10 = float(feat.get("ret10", 0.0))
+        ofi = float(feat.get("ofi", 0.0))
+        if ret10 <= self.imb_early_ret10_min:
+            return False
+        if ofi < self.imb_early_ofi_min:
+            return False
+        if imb < self.imb_early_min:
+            return False
+        keep_ratio = self._imb_keep_ratio(sym, ts_epoch, self.imb_early_min, self.imb_early_keep_sec)
+        if keep_ratio < self.imb_early_keep_ratio:
+            return False
+
+        early_score = (imb * 100.0) + (ofi * 10.0) + (ret10 * 50.0)
+        ok = self.enter_position(
+            sym,
+            price,
+            ts_epoch,
+            feat,
+            dayrise,
+            spread,
+            imb,
+            position_pct=max(0.05, min(self.imb_early_position_pct, 0.30)),
+            entry_score=early_score,
+        )
+        if ok:
+            self._log_signal_diag(ts_epoch, sym, price, ret10, 0, float(feat.get("trv10", 0.0)), imb, spread, dayrise, "EARLY_IMB", f"keep={keep_ratio:.2f} ofi={ofi:.2f}")
+        return ok
+
+    def _try_vi_early_entry(
+        self,
+        sym: str,
+        price: float,
+        ts_epoch: float,
+        feat: Dict[str, float],
+        dayrise: float,
+        spread: float,
+        imb: float,
+        vi_std: float,
+        vi_gap: float,
+        prev_px: float | None,
+    ) -> bool:
+        if (not self.vi_early_entry_enabled) or vi_std <= 0:
+            return False
+
+        ofi = float(feat.get("ofi", 0.0))
+        if spread <= 0 or spread > self.vi_early_spread_max:
+            return False
+        if imb < self.vi_early_imb_min or ofi < self.vi_early_ofi_min:
+            return False
+
+        # arm near VI 기준가
+        if vi_gap <= self.vi_near_gap_pct:
+            self.vi_near_armed_ts[sym] = ts_epoch
+            self.vi_armed_ref_price[sym] = price
+            return False
+
+        armed_ts = self.vi_near_armed_ts.get(sym)
+        if armed_ts is None:
+            return False
+        if (ts_epoch - armed_ts) > self.vi_early_hold_sec:
+            self.vi_near_armed_ts.pop(sym, None)
+            self.vi_armed_ref_price.pop(sym, None)
+            return False
+
+        # VI 근접 이후 첫 상승틱 + gap 이탈 시 진입
+        first_uptick = (prev_px is not None) and (price > prev_px)
+        if (vi_gap < self.vi_release_gap_pct) or (not first_uptick):
+            return False
+
+        early_score = 140.0 + (imb * 20.0) + (ofi * 10.0)
+        ok = self.enter_position(
+            sym,
+            price,
+            ts_epoch,
+            feat,
+            dayrise,
+            spread,
+            imb,
+            position_pct=max(0.05, min(self.vi_early_position_pct, 0.35)),
+            entry_score=early_score,
+        )
+        if ok:
+            self.vi_near_armed_ts.pop(sym, None)
+            self.vi_armed_ref_price.pop(sym, None)
+            self._log_signal_diag(ts_epoch, sym, price, float(feat.get("ret10", 0.0)), 0, float(feat.get("trv10", 0.0)), imb, spread, dayrise, "EARLY_VI", f"vi_gap={vi_gap:.2f}% ofi={ofi:.2f}")
+        return ok
 
     def _calc_early_score(self, sym: str, ts_epoch: float, price: float, spread: float, imb: float, trv_prev: float) -> tuple[float, Dict[str, float]]:
         dq = self.ticks.get(sym, deque())
@@ -1170,42 +1320,26 @@ class EngineReal:
     def _score_pick_update(self, ts_epoch: float, sym: str, score: float, price: float, ret: float, tick_count: int, trv: float, imb: float, spread: float, dayrise: float, ret10: float, baseline_ready: bool, early_score: float = 0.0):
         if self._score_pick_bucket_start <= 0:
             self._score_pick_bucket_start = ts_epoch
-            self._score_pick_best = {
-                "sym": sym,
-                "score": score,
-                "price": price,
-                "ret": ret,
-                "tick_count": tick_count,
-                "trv": trv,
-                "imb": imb,
-                "spread": spread,
-                "dayrise": dayrise,
-                "ret10": ret10,
-                "baseline_ready": baseline_ready,
-                "early_score": early_score,
-                "session": self._session_name(ts_epoch),
-                "ts": ts_epoch,
-            }
-            return
 
-        best = self._score_pick_best
-        if (best is None) or (score > float(best.get("score", -1e18))):
-            self._score_pick_best = {
-                "sym": sym,
-                "score": score,
-                "price": price,
-                "ret": ret,
-                "tick_count": tick_count,
-                "trv": trv,
-                "imb": imb,
-                "spread": spread,
-                "dayrise": dayrise,
-                "ret10": ret10,
-                "baseline_ready": baseline_ready,
-                "early_score": early_score,
-                "session": self._session_name(ts_epoch),
-                "ts": ts_epoch,
-            }
+        cand = {
+            "sym": sym,
+            "score": score,
+            "price": price,
+            "ret": ret,
+            "tick_count": tick_count,
+            "trv": trv,
+            "imb": imb,
+            "spread": spread,
+            "dayrise": dayrise,
+            "ret10": ret10,
+            "baseline_ready": baseline_ready,
+            "early_score": early_score,
+            "session": self._session_name(ts_epoch),
+            "ts": ts_epoch,
+        }
+
+        self._score_pick_candidates = [c for c in self._score_pick_candidates if str(c.get("sym", "")) != sym]
+        self._score_pick_candidates.append(cand)
 
     def _entry_pick_window_for_ts(self, ts_epoch: float) -> float:
         ses = self._session_name(ts_epoch)
@@ -1220,11 +1354,104 @@ class EngineReal:
             return False
         return (ts_epoch - self._score_pick_bucket_start) >= self._entry_pick_window_for_ts(ts_epoch)
 
-    def _score_pick_take(self) -> Dict[str, Any] | None:
-        best = self._score_pick_best
-        self._score_pick_best = None
+    def _score_pick_take(self) -> list[Dict[str, Any]]:
+        cands = sorted(self._score_pick_candidates, key=lambda c: float(c.get("score", -1e18)), reverse=True)
+        out = cands[: self.score_pick_top_n]
+        self._score_pick_candidates = []
         self._score_pick_bucket_start = 0.0
-        return best
+        return out
+
+    def _try_buy_from_candidate(
+        self,
+        best: Dict[str, Any],
+        ts_epoch: float,
+        ofi: float,
+        trv_10s: float,
+        trv_2s: float,
+        sweep_max: float,
+        sweep_count: int,
+        avg_depth_ratio: float,
+        ob_stale: bool,
+        ob_age: float,
+    ) -> bool:
+        sym = str(best.get("sym", ""))
+        if not sym or sym in self.pos:
+            return False
+        price = float(best.get("price", 0.0))
+        if price <= 0:
+            return False
+        ret = float(best.get("ret", 0.0))
+        tick_count = int(best.get("tick_count", 0))
+        trv = float(best.get("trv", 0.0))
+        imb = float(best.get("imb", 0.0))
+        spread = float(best.get("spread", 999.0))
+        dayrise = float(best.get("dayrise", 0.0))
+        score = float(best.get("score", 0.0))
+        ret10 = float(best.get("ret10", 0.0))
+        baseline_ready = bool(best.get("baseline_ready", False))
+        early_score = float(best.get("early_score", 0.0))
+        session = str(best.get("session", self._session_name(ts_epoch)))
+
+        dq_best = self.ticks.get(sym, [])
+        high_60 = max((px for t, px, _ in dq_best if (ts_epoch - t) < 60.0), default=price)
+        if high_60 > 0 and price >= high_60 * 0.998:
+            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"near_60s_high cur={price:.2f} high60={high_60:.2f}")
+            return False
+
+        if not self.rebreak_ready.get(sym, False):
+            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "rebreak_not_ready")
+            return False
+
+        try:
+            cash = self._buyable_cash(sym)
+        except Exception as e:
+            self._log(ts_epoch, "BUY", sym, 0, price, "buyable_cash_error", "EX", f"{type(e).__name__}:{e}")
+            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "buyable_cash_error")
+            return False
+        target = cash * self.position_pct
+        qty = int(math.floor(target / price))
+        if qty <= 0:
+            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"qty=0 cash={cash:.0f} target={target:.0f}")
+            return False
+
+        ord_dvsn, ord_unpr, order_detail = self._build_buy_order(sym, ts_epoch, price)
+        if not ord_dvsn:
+            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, order_detail)
+            return False
+        buy_reason = (
+            f"signal ses={session} ret={ret:.2f} ret10={ret10:.2f} ofi={ofi:.2f} trv10={trv_10s:.0f} trv2s={trv_2s:.0f} sweep_max={sweep_max:.2f} sweep_cnt={sweep_count} imb={imb:.2f} spr={spread:.2f} depth_avg={avg_depth_ratio:.2f} "
+            f"dayrise={dayrise:.2f} score={score:.1f} early={early_score:.1f} base_ready={int(baseline_ready)} "
+            f"ob_stale={int(ob_stale)} ob_age={ob_age:.2f}s {order_detail}"
+        )
+        j = self._safe_order("BUY", sym, qty, ts_epoch, price, buy_reason, ord_dvsn=ord_dvsn, ord_unpr=ord_unpr)
+        if j.get("rt_cd") != "0":
+            self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "BUY_FAIL", j.get("msg1", ""))
+            return False
+
+        self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, trail_armed=False)
+        self._log_auto_position(ts_epoch, "BUY", sym, self.pos[sym], ref_price=price, note=f"score={score:.1f}")
+        self._save_positions_state()
+        self.last_entry_ts[sym] = ts_epoch
+        self.next_entry_allowed_ts.pop(sym, None)
+        self.last_exit_reason.pop(sym, None)
+        self.day_buy_count += 1
+        self._send_day_start_summary(ts_epoch)
+        self.candidate_since.pop(sym, None)
+        self.candidate_peak_price.pop(sym, None)
+        self.candidate_pullback_seen.pop(sym, None)
+        self.retest_peak_price.pop(sym, None)
+        self.retest_pullback_seen.pop(sym, None)
+        self.retest_ready.pop(sym, None)
+        self.ignition_ts.pop(sym, None)
+        self.ignition_price.pop(sym, None)
+        self.pb_seen.pop(sym, None)
+        self.pb_low.pop(sym, None)
+        self.rebreak_ready.pop(sym, None)
+        self.breakout_ts.pop(sym, None)
+        self.breakout_price.pop(sym, None)
+        self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "BUY_TRY", f"qty={qty} score={score:.1f}")
+        self._notify_buy(sym, qty, price, ret, tick_count, trv, imb, spread, dayrise, score, ts_epoch, early_score)
+        return True
 
     def _orderbook_best_quote(self, sym: str, ts_epoch: float) -> tuple[float, float, float, bool, float]:
         ob = self.book.get(sym)
@@ -1234,6 +1461,12 @@ class EngineReal:
         bid1 = _f(ob.get("BIDP1")) if ob and not ob_stale else 0.0
         mid = (ask1 + bid1) / 2.0 if (ask1 > 0 and bid1 > 0) else 0.0
         return bid1, ask1, mid, ob_stale, ob_age
+
+    def _risk_exit_price(self, sym: str, trade_price: float, ts_epoch: float) -> tuple[float, float, bool]:
+        bid1, _ask1, _mid, ob_stale, _ob_age = self._orderbook_best_quote(sym, ts_epoch)
+        if bid1 > 0 and not ob_stale:
+            return min(trade_price, bid1), bid1, True
+        return trade_price, bid1, False
 
     def _build_buy_order(self, sym: str, ts_epoch: float, fallback_price: float) -> tuple[str, str, str]:
         bid1, ask1, mid, ob_stale, ob_age = self._orderbook_best_quote(sym, ts_epoch)
@@ -1413,6 +1646,8 @@ class EngineReal:
             self.partial_taken.discard(sym)
             self._save_positions_state()
             self.last_entry_ts[sym] = ts_epoch
+            self.next_entry_allowed_ts.pop(sym, None)
+            self.last_exit_reason.pop(sym, None)
             self.day_buy_count += 1
             self._log_signal_diag(ts_epoch, sym, price, feat['ret10'], 0, feat['trv10'], imb, spread, dayrise, "BUY_TRY", f"qty={qty}")
             self._notify_buy(sym, qty, price, feat['ret10'], 0, feat['trv10'], imb, spread, dayrise, 0.0, ts_epoch, 0.0)
@@ -1479,6 +1714,7 @@ class EngineReal:
         self._log_auto_position(ts_epoch, "SELL", sym, p, ref_price=price, note=reason)
         p.qty = max(0, p.qty - qty_ord)
         if cleanup_if_flat and p.qty <= 0:
+            self._mark_exit_cooldown(sym, reason, ts_epoch, self.cooldown_sec)
             self._cleanup_symbol_state(sym)
         else:
             self._save_positions_state()
@@ -1493,118 +1729,42 @@ class EngineReal:
             p.max_price = max(p.max_price, price)
 
         entry = p.entry_price
-        if (not p.partial_taken) and price >= entry * (1.0 + self.partial_take_pct / 100.0):
+        exit_price, bid1, bid_used = self._risk_exit_price(sym, price, ts_epoch)
+        px_note = f"trade={price:.2f} bid1={bid1:.2f} use_bid={int(bid_used)}"
+        if (not p.partial_taken) and exit_price >= entry * (1.0 + self.partial_take_pct / 100.0):
             qty_part = int(max(1, math.floor(p.qty * self.partial_take_qty_ratio)))
-            if self._execute_sell_action(sym, p, price, ts_epoch, "PARTIAL_TP", "partial_take", qty_target=qty_part, cleanup_if_flat=False):
+            if self._execute_sell_action(sym, p, exit_price, ts_epoch, "PARTIAL_TP", f"partial_take {px_note}", qty_target=qty_part, cleanup_if_flat=False):
                 p.partial_taken = True
                 self.partial_taken.add(sym)
                 self._save_positions_state()
                 return
 
-        if (ts_epoch - p.entry_ts) > self.protect_grace_sec and price <= entry * (1.0 - self.protect_stop_pct / 100.0):
-            self._execute_sell_action(sym, p, price, ts_epoch, "PROTECT_STOP", "protect_stop")
+        if (ts_epoch - p.entry_ts) > self.protect_grace_sec and exit_price <= entry * (1.0 - self.protect_stop_pct / 100.0):
+            self._execute_sell_action(sym, p, exit_price, ts_epoch, "PROTECT_STOP", f"protect_stop {px_note}")
             return
 
         if feat.get("ret5", 0.0) <= self.momentum_exit_ret5:
-            self._execute_sell_action(sym, p, price, ts_epoch, "MOMENTUM_EXIT", f"ret5={feat.get('ret5',0.0):.2f}")
+            self._execute_sell_action(sym, p, exit_price, ts_epoch, "MOMENTUM_EXIT", f"ret5={feat.get('ret5',0.0):.2f} {px_note}")
             return
 
         if feat.get("depth_ratio", 0.0) > 0 and feat.get("depth_ratio", 0.0) < self.liquidity_collapse_depth:
-            self._execute_sell_action(sym, p, price, ts_epoch, "LIQUIDITY_EXIT", f"depth={feat.get('depth_ratio',0.0):.2f}")
+            self._execute_sell_action(sym, p, exit_price, ts_epoch, "LIQUIDITY_EXIT", f"depth={feat.get('depth_ratio',0.0):.2f} {px_note}")
             return
 
         high_60 = max((px for t, px, _ in self.ticks.get(sym, []) if (ts_epoch - t) <= 60.0), default=price)
-        if high_60 > 0 and price >= high_60 * self.exhaustion_high_band and feat.get("ofi", 0.0) < self.exhaustion_ofi_max:
-            self._execute_sell_action(sym, p, price, ts_epoch, "FLOW_EXIT", f"ofi={feat.get('ofi',0.0):.2f}")
+        if high_60 > 0 and exit_price >= high_60 * self.exhaustion_high_band and feat.get("ofi", 0.0) < self.exhaustion_ofi_max:
+            self._execute_sell_action(sym, p, exit_price, ts_epoch, "FLOW_EXIT", f"ofi={feat.get('ofi',0.0):.2f} {px_note}")
             return
 
-        if (not p.trail_armed) and price >= entry * (1.0 + self.spike_trail_arm_pct / 100.0):
+        if (not p.trail_armed) and exit_price >= entry * (1.0 + self.spike_trail_arm_pct / 100.0):
             p.trail_armed = True
             self._save_positions_state()
         if p.trail_armed:
             stop = self.max_price.get(sym, p.max_price) * (1.0 - self.spike_trail_drop_pct / 100.0)
-            if price <= stop:
-                self._execute_sell_action(sym, p, price, ts_epoch, "TRAIL_STOP", f"stop={stop:.2f}")
+            if exit_price <= stop:
+                self._execute_sell_action(sym, p, exit_price, ts_epoch, "TRAIL_STOP", f"stop={stop:.2f} {px_note}")
                 return
 
-    def _maybe_exit(self, sym: str, price: float, ts_epoch: float):
-        p = self.pos.get(sym)
-        if not p:
-            return
-        dq = self.ticks[sym]
-        dq.append((ts_epoch, price, 0.0))
-        while dq and ts_epoch - dq[0][0] > 300.0:
-            dq.popleft()
-
-        if price > p.max_price:
-            p.max_price = price
-        if (not p.trail_armed) and price >= p.entry_price * (1.0 + self.spike_trail_arm_pct / 100.0):
-            p.trail_armed = True
-
-        ob = self.book.get(sym)
-        ob_age = ts_epoch - self.book_ts.get(sym, 0.0)
-        ob_stale = (not ob) or (ob_age > self.orderbook_max_age_sec)
-        depth_ratio = self._depth3_ratio(ob if (ob and not ob_stale) else None)
-        ofi, _trv10, _buy10, _sell10 = self._compute_ofi_window(dq, ts_epoch, 10.0)
-        ret5, trv_5s, _ = self._window_stats(dq, ts_epoch, 5.0)
-        _ret2, trv_2s, _ = self._window_stats(dq, ts_epoch, 2.0)
-        high_60 = max((px for t, px, _ in dq if (ts_epoch - t) <= 60.0), default=price)
-
-        def _execute_sell(reason: str, detail: str, qty_target: int | None = None, cleanup_if_flat: bool = True) -> bool:
-            qty_sell = self._sellable_qty(sym)
-            if qty_sell <= 0:
-                return False
-            target_qty = p.qty if qty_target is None else max(1, qty_target)
-            qty_ord = min(qty_sell, target_qty)
-            if qty_ord <= 0:
-                return False
-            j = self._safe_order("SELL", sym, qty_ord, ts_epoch, price, detail)
-            if j.get("rt_cd") != "0":
-                return False
-            self._notify_sell(sym, qty_ord, price, reason, detail, p, ts_epoch)
-            self._log_auto_position(ts_epoch, "SELL", sym, p, ref_price=price, note=reason)
-            p.qty = max(0, p.qty - qty_ord)
-            if cleanup_if_flat and p.qty <= 0:
-                self._cleanup_symbol_state(sym)
-            else:
-                self._save_positions_state()
-            return True
-
-        # Partial take profit: +3%에서 50% 익절
-        if (not p.partial_taken) and price >= p.entry_price * (1.0 + self.partial_take_pct / 100.0):
-            qty_part = int(max(1, math.floor(p.qty * self.partial_take_qty_ratio)))
-            if _execute_sell("PARTIAL_TP", f"partial_take={self.partial_take_pct:.2f}% qty_ratio={self.partial_take_qty_ratio:.2f}", qty_target=qty_part, cleanup_if_flat=False):
-                p.partial_taken = True
-                self._save_positions_state()
-                return
-
-        # Layer 1: Protection Stop
-        if (ts_epoch - p.entry_ts) > self.protect_grace_sec:
-            if price <= p.entry_price * (1.0 - self.protect_stop_pct / 100.0):
-                _execute_sell("PROTECT_STOP", f"protect_stop={self.protect_stop_pct:.2f}% grace={self.protect_grace_sec:.1f}s")
-                return
-
-        # Layer 2: Momentum Exit
-        if ret5 <= self.momentum_exit_ret5:
-            _execute_sell("MOMENTUM_EXIT", f"ret5={ret5:.2f}% thr={self.momentum_exit_ret5:.2f}% trv5s={trv_5s:.0f} trv2s={trv_2s:.0f}")
-            return
-
-        # Liquidity collapse exit
-        if depth_ratio > 0 and depth_ratio < self.liquidity_collapse_depth:
-            _execute_sell("LIQUIDITY_EXIT", f"depth_ratio={depth_ratio:.2f} thr={self.liquidity_collapse_depth:.2f}")
-            return
-
-        # High exhaustion exit
-        if high_60 > 0 and price >= high_60 * self.exhaustion_high_band and ofi < self.exhaustion_ofi_max:
-            _execute_sell("FLOW_EXIT", f"high60={high_60:.2f} band={self.exhaustion_high_band:.3f} ofi={ofi:.2f} max={self.exhaustion_ofi_max:.2f}")
-            return
-
-        # Layer 3: Trailing Exit
-        if p.trail_armed:
-            stop = p.max_price * (1.0 - self.spike_trail_drop_pct / 100.0)
-            if price <= stop:
-                _execute_sell("TRAIL_STOP", f"trail_drop={self.spike_trail_drop_pct:.2f}% stop={stop:.2f}")
-                return
 
     def on_trade(self, row: Dict[str, str], ts_epoch: float):
         self._ensure_day_roll(ts_epoch)
@@ -1650,8 +1810,9 @@ class EngineReal:
         cooldown_sec = float(p.get("cooldown_sec", self.cooldown_sec))
         dayrise = self._day_rise_pct(sym, price)
         if not holding_position:
-            if ts_epoch - self.last_entry_ts.get(sym, 0.0) < cooldown_sec:
-                self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, 0, f"cooldown<{cooldown_sec:.0f}s")
+            remain_cd, cd_reason = self._entry_cooldown_remaining(sym, ts_epoch, cooldown_sec)
+            if remain_cd > 0:
+                self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, 0, f"cooldown<{remain_cd:.0f}s reason={cd_reason}")
                 return
             if dayrise > 7.0:
                 self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, dayrise, "dayrise_hard_block>7")
@@ -1719,10 +1880,21 @@ class EngineReal:
             elif price < prev_px:
                 self.sell_vol[sym] += max(0.0, vol)
         self.last_trade_price[sym] = price
+        self._update_early_microstructure(sym, ts_epoch, price, imb)
 
         feat = self.compute_features(sym, dq, (ob if (ob and not ob_stale) else None), ts_epoch, price)
         if sym in self.pos:
             self.manage_position(sym, price, ts_epoch, feat)
+            return
+
+        if len(self.pos) >= self.max_positions:
+            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"max_positions reached={len(self.pos)} limit={self.max_positions}")
+            return
+
+        if self._try_vi_early_entry(sym, price, ts_epoch, feat, dayrise, spread, imb, vi_std, vi_gap, prev_px):
+            return
+
+        if self._try_imbalance_early_entry(sym, price, ts_epoch, feat, dayrise, spread, imb):
             return
 
         if self.try_entry(sym, price, ts_epoch, feat, dayrise, spread, imb, sweep_score=sweep_score):
@@ -1815,7 +1987,6 @@ class EngineReal:
             self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"fake_breakout score={fake_score} {fake_detail}")
             return
 
-        self._update_early_microstructure(sym, ts_epoch, price, imb)
         early_score, early_meta = self._calc_early_score(sym, ts_epoch, price, spread, imb, trv_prev)
         early_floor = self.early_score_min
         if session == "OPEN":
@@ -1899,78 +2070,20 @@ class EngineReal:
         self._score_pick_update(ts_epoch, sym, score, price, ret, tick_count, trv, imb, spread, dayrise, ret10, baseline_ready, early_score)
         if not self._score_pick_ready(ts_epoch):
             return
-        best = self._score_pick_take()
-        if not best:
+        candidates = self._score_pick_take()
+        if not candidates:
             return
-        sym = str(best.get("sym", sym))
-        if sym in self.pos:
-            return
-        price = float(best.get("price", price))
-        ret = float(best.get("ret", ret))
-        tick_count = int(best.get("tick_count", tick_count))
-        trv = float(best.get("trv", trv))
-        imb = float(best.get("imb", imb))
-        spread = float(best.get("spread", spread))
-        dayrise = float(best.get("dayrise", dayrise))
-        score = float(best.get("score", score))
-        ret10 = float(best.get("ret10", ret10))
-        baseline_ready = bool(best.get("baseline_ready", baseline_ready))
-        early_score = float(best.get("early_score", early_score if "early_score" in locals() else 0.0))
-        session = str(best.get("session", self._session_name(ts_epoch)))
-
-        dq_best = self.ticks.get(sym, [])
-        high_60 = max((px for t, px, _ in dq_best if (ts_epoch - t) < 60.0), default=price)
-        if high_60 > 0 and price >= high_60 * 0.998:
-            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"near_60s_high cur={price:.2f} high60={high_60:.2f}")
-            return
-
-        if not self.rebreak_ready.get(sym, False):
-            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "rebreak_not_ready")
-            return
-
-        try:
-            cash = self._buyable_cash(sym)
-        except Exception as e:
-            self._log(ts_epoch, "BUY", sym, 0, price, "buyable_cash_error", "EX", f"{type(e).__name__}:{e}")
-            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "buyable_cash_error")
-            return
-        target = cash * self.position_pct
-        qty = int(math.floor(target / price))
-        if qty <= 0:
-            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"qty=0 cash={cash:.0f} target={target:.0f}")
-            return
-
-        ord_dvsn, ord_unpr, order_detail = self._build_buy_order(sym, ts_epoch, price)
-        if not ord_dvsn:
-            self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, order_detail)
-            return
-        buy_reason = (
-            f"signal ses={session} ret={ret:.2f} ret10={ret10:.2f} ofi={ofi:.2f} trv10={trv_10s:.0f} trv2s={trv_2s:.0f} sweep_max={sweep_max:.2f} sweep_cnt={sweep_count} imb={imb:.2f} spr={spread:.2f} depth_avg={avg_depth_ratio:.2f} "
-            f"dayrise={dayrise:.2f} score={score:.1f} early={early_score:.1f} base_ready={int(baseline_ready)} "
-            f"ob_stale={int(ob_stale)} ob_age={ob_age:.2f}s {order_detail}"
-        )
-        j = self._safe_order("BUY", sym, qty, ts_epoch, price, buy_reason, ord_dvsn=ord_dvsn, ord_unpr=ord_unpr)
-        if j.get("rt_cd") == "0":
-            self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, trail_armed=False)
-            self._log_auto_position(ts_epoch, "BUY", sym, self.pos[sym], ref_price=price, note=f"score={score:.1f}")
-            self._save_positions_state()
-            self.last_entry_ts[sym] = ts_epoch
-            self.day_buy_count += 1
-            self._send_day_start_summary(ts_epoch)
-            self.candidate_since.pop(sym, None)
-            self.candidate_peak_price.pop(sym, None)
-            self.candidate_pullback_seen.pop(sym, None)
-            self.retest_peak_price.pop(sym, None)
-            self.retest_pullback_seen.pop(sym, None)
-            self.retest_ready.pop(sym, None)
-            self.ignition_ts.pop(sym, None)
-            self.ignition_price.pop(sym, None)
-            self.pb_seen.pop(sym, None)
-            self.pb_low.pop(sym, None)
-            self.rebreak_ready.pop(sym, None)
-            self.breakout_ts.pop(sym, None)
-            self.breakout_price.pop(sym, None)
-            self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "BUY_TRY", f"qty={qty} score={score:.1f}")
-            self._notify_buy(sym, qty, price, ret, tick_count, trv, imb, spread, dayrise, score, ts_epoch, early_score)
-        else:
-            self._log_signal_diag(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "BUY_FAIL", j.get("msg1", ""))
+        for cand in candidates:
+            if self._try_buy_from_candidate(
+                cand,
+                ts_epoch,
+                ofi=ofi,
+                trv_10s=trv_10s,
+                trv_2s=trv_2s,
+                sweep_max=sweep_max,
+                sweep_count=sweep_count,
+                avg_depth_ratio=avg_depth_ratio,
+                ob_stale=ob_stale,
+                ob_age=ob_age,
+            ):
+                return
