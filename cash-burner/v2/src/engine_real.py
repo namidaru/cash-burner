@@ -1462,6 +1462,12 @@ class EngineReal:
         mid = (ask1 + bid1) / 2.0 if (ask1 > 0 and bid1 > 0) else 0.0
         return bid1, ask1, mid, ob_stale, ob_age
 
+    def _risk_exit_price(self, sym: str, trade_price: float, ts_epoch: float) -> tuple[float, float, bool]:
+        bid1, _ask1, _mid, ob_stale, _ob_age = self._orderbook_best_quote(sym, ts_epoch)
+        if bid1 > 0 and not ob_stale:
+            return min(trade_price, bid1), bid1, True
+        return trade_price, bid1, False
+
     def _build_buy_order(self, sym: str, ts_epoch: float, fallback_price: float) -> tuple[str, str, str]:
         bid1, ask1, mid, ob_stale, ob_age = self._orderbook_best_quote(sym, ts_epoch)
         ord_dvsn = "01"
@@ -1723,38 +1729,40 @@ class EngineReal:
             p.max_price = max(p.max_price, price)
 
         entry = p.entry_price
-        if (not p.partial_taken) and price >= entry * (1.0 + self.partial_take_pct / 100.0):
+        exit_price, bid1, bid_used = self._risk_exit_price(sym, price, ts_epoch)
+        px_note = f"trade={price:.2f} bid1={bid1:.2f} use_bid={int(bid_used)}"
+        if (not p.partial_taken) and exit_price >= entry * (1.0 + self.partial_take_pct / 100.0):
             qty_part = int(max(1, math.floor(p.qty * self.partial_take_qty_ratio)))
-            if self._execute_sell_action(sym, p, price, ts_epoch, "PARTIAL_TP", "partial_take", qty_target=qty_part, cleanup_if_flat=False):
+            if self._execute_sell_action(sym, p, exit_price, ts_epoch, "PARTIAL_TP", f"partial_take {px_note}", qty_target=qty_part, cleanup_if_flat=False):
                 p.partial_taken = True
                 self.partial_taken.add(sym)
                 self._save_positions_state()
                 return
 
-        if (ts_epoch - p.entry_ts) > self.protect_grace_sec and price <= entry * (1.0 - self.protect_stop_pct / 100.0):
-            self._execute_sell_action(sym, p, price, ts_epoch, "PROTECT_STOP", "protect_stop")
+        if (ts_epoch - p.entry_ts) > self.protect_grace_sec and exit_price <= entry * (1.0 - self.protect_stop_pct / 100.0):
+            self._execute_sell_action(sym, p, exit_price, ts_epoch, "PROTECT_STOP", f"protect_stop {px_note}")
             return
 
         if feat.get("ret5", 0.0) <= self.momentum_exit_ret5:
-            self._execute_sell_action(sym, p, price, ts_epoch, "MOMENTUM_EXIT", f"ret5={feat.get('ret5',0.0):.2f}")
+            self._execute_sell_action(sym, p, exit_price, ts_epoch, "MOMENTUM_EXIT", f"ret5={feat.get('ret5',0.0):.2f} {px_note}")
             return
 
         if feat.get("depth_ratio", 0.0) > 0 and feat.get("depth_ratio", 0.0) < self.liquidity_collapse_depth:
-            self._execute_sell_action(sym, p, price, ts_epoch, "LIQUIDITY_EXIT", f"depth={feat.get('depth_ratio',0.0):.2f}")
+            self._execute_sell_action(sym, p, exit_price, ts_epoch, "LIQUIDITY_EXIT", f"depth={feat.get('depth_ratio',0.0):.2f} {px_note}")
             return
 
         high_60 = max((px for t, px, _ in self.ticks.get(sym, []) if (ts_epoch - t) <= 60.0), default=price)
-        if high_60 > 0 and price >= high_60 * self.exhaustion_high_band and feat.get("ofi", 0.0) < self.exhaustion_ofi_max:
-            self._execute_sell_action(sym, p, price, ts_epoch, "FLOW_EXIT", f"ofi={feat.get('ofi',0.0):.2f}")
+        if high_60 > 0 and exit_price >= high_60 * self.exhaustion_high_band and feat.get("ofi", 0.0) < self.exhaustion_ofi_max:
+            self._execute_sell_action(sym, p, exit_price, ts_epoch, "FLOW_EXIT", f"ofi={feat.get('ofi',0.0):.2f} {px_note}")
             return
 
-        if (not p.trail_armed) and price >= entry * (1.0 + self.spike_trail_arm_pct / 100.0):
+        if (not p.trail_armed) and exit_price >= entry * (1.0 + self.spike_trail_arm_pct / 100.0):
             p.trail_armed = True
             self._save_positions_state()
         if p.trail_armed:
             stop = self.max_price.get(sym, p.max_price) * (1.0 - self.spike_trail_drop_pct / 100.0)
-            if price <= stop:
-                self._execute_sell_action(sym, p, price, ts_epoch, "TRAIL_STOP", f"stop={stop:.2f}")
+            if exit_price <= stop:
+                self._execute_sell_action(sym, p, exit_price, ts_epoch, "TRAIL_STOP", f"stop={stop:.2f} {px_note}")
                 return
 
 
