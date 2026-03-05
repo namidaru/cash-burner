@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
+import math
 import re
 import datetime as _dt
 from typing import Any, Dict, List, Tuple
 
 from kis_http import request
 from scanner_conditions import scan as scan_conditions
-from quote_multi import multi_quote, score_item
+from quote_multi import multi_quote, score_item, volume_acceleration
 
 PATH = "/uapi/domestic-stock/v1/ranking/traded-by-company"
 STRENGTH_PATH = "/uapi/domestic-stock/v1/ranking/volume-power"
@@ -387,6 +388,10 @@ def _passes_quality(item: Dict[str, Any], min_price: float, max_price: float, mi
     if st > 0 and (st < min_strength or st > max_strength):
         return False
 
+    min_accel = float(os.getenv("WATCH_MIN_VOLUME_ACCEL", "1.4"))
+    if volume_acceleration(item) <= min_accel:
+        return False
+
     return True
 
 
@@ -638,7 +643,7 @@ def check_watchlist_integrity(symbols: List[str]) -> Dict[str, int]:
     - 형식(6자리 숫자), 중복, 저가 필터 위반
     - 가능하면 멀티시세로 현재가 확인하여 저가/미응답 개수도 집계
     """
-    min_price = float(os.getenv("WATCH_MIN_PRICE", "10000"))
+    min_price = float(os.getenv("WATCH_MIN_PRICE", "1000"))
 
     total = len(symbols)
     bad_format = 0
@@ -692,6 +697,11 @@ def check_watchlist_integrity(symbols: List[str]) -> Dict[str, int]:
     }
 
 
+
+
+def _radar_mode_enabled() -> bool:
+    return os.getenv("WATCH_RADAR_MODE", "0") == "1"
+
 def build_watchlist() -> List[str]:
     """REST 데이터로 1차 선별 후 점수 상위 종목만 워치리스트에 반영.
 
@@ -702,13 +712,13 @@ def build_watchlist() -> List[str]:
     """
     global _LAST_BUILD_META, _LAST_SOURCE_MAP
 
-    want_n = int(os.getenv("WATCH_TOP_N", "30"))
-    min_price = float(os.getenv("WATCH_MIN_PRICE", "10000"))
-    max_price = float(os.getenv("WATCH_MAX_PRICE", "500000"))
-    min_chg = float(os.getenv("WATCH_MIN_CHANGE_PCT", "2.0"))
-    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "24.0"))
-    min_tv = float(os.getenv("WATCH_MIN_TR_VALUE", "300000000"))
-    max_spread_pct = float(os.getenv("WATCH_MAX_SPREAD_PCT", "0.45"))
+    want_n = int(os.getenv("WATCH_TOP_N", "12"))
+    min_price = float(os.getenv("WATCH_MIN_PRICE", "1000"))
+    max_price = float(os.getenv("WATCH_MAX_PRICE", "200000"))
+    min_chg = float(os.getenv("WATCH_MIN_CHANGE_PCT", "-0.5"))
+    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "2.5"))
+    min_tv = float(os.getenv("WATCH_MIN_TR_VALUE", "1200000000"))
+    max_spread_pct = float(os.getenv("WATCH_MAX_SPREAD_PCT", "0.35"))
 
     markets = [m.strip() for m in os.getenv("RANK_MARKETS", "J,NX").split(",") if m.strip()]
     seqs = [x.strip() for x in os.getenv("WATCH_COND_SEQS", "").split(",") if x.strip()]
@@ -716,6 +726,86 @@ def build_watchlist() -> List[str]:
     src_map: Dict[str, str] = {}
     meta: List[str] = []
     raw_by_sym: Dict[str, Dict[str, Any]] = {}
+
+    if _radar_mode_enabled():
+        radar_markets = [m.strip() for m in os.getenv("RADAR_VOLUME_MARKETS", os.getenv("VOLUME_RANK_MARKETS", "J")).split(",") if m.strip()]
+        radar_pool = int(os.getenv("RADAR_VOLUME_TOPK", "100"))
+        dropped = {"price": 0, "chg": 0, "heat": 0, "tv": 0, "vol": 0, "spread": 0, "score": 0}
+        scored: List[Tuple[float, str]] = []
+
+        for m in radar_markets:
+            rows, dbg = fetch_volume_rank(m)
+            meta.extend(dbg)
+            if radar_pool > 0:
+                rows = rows[:radar_pool]
+            for it in rows:
+                sym = _parse_sym(it)
+                if not sym or sym in raw_by_sym:
+                    continue
+                raw_by_sym[sym] = it
+                src_map[sym] = "volume_rank"
+
+        for sym, it in raw_by_sym.items():
+            px = _parse_price(it)
+            if (min_price > 0 and px > 0 and px < min_price) or (max_price > 0 and px > max_price):
+                dropped["price"] += 1
+                continue
+
+            chg = _parse_float(it, "prdy_ctrt", 0.0)
+            if chg > 3.0:
+                dropped["heat"] += 1
+                continue
+            if chg < min_chg or chg > max_chg:
+                dropped["chg"] += 1
+                continue
+
+            tv = _parse_float(it, "acml_tr_pbmn", 0.0)
+            if tv > 0 and tv < min_tv:
+                dropped["tv"] += 1
+                continue
+
+            vol = _parse_float(it, "acml_vol", 0.0)
+            if vol > 0 and vol < 50000:
+                dropped["vol"] += 1
+                continue
+
+            spread_pct = _parse_spread_pct(it, max_spread_pct * 0.8)
+            if spread_pct >= max_spread_pct:
+                dropped["spread"] += 1
+                continue
+
+            momentum_score = chg
+            liquidity_score = math.log1p(max(tv, 0.0))
+            volume_score = math.log1p(max(vol, 0.0))
+            volume_accel = tv / max(vol, 1.0)
+
+            score = (
+                (momentum_score * 2.0)
+                + (liquidity_score * 0.7)
+                + (volume_score * 0.3)
+                + (volume_accel * 1.8)
+                - (spread_pct * 2.5)
+            )
+            if not math.isfinite(score):
+                dropped["score"] += 1
+                continue
+            scored.append((score, sym))
+
+        scored.sort(reverse=True)
+        out = [sym for _, sym in scored[:want_n]]
+        if not out:
+            fb = _fallback_symbols()[:want_n]
+            _LAST_BUILD_META = f"radar_volume empty drop={dropped} -> fallback"
+            _LAST_SOURCE_MAP = {sym: "fallback" for sym in fb}
+            return fb
+
+        _LAST_BUILD_META = (
+            f"radar_volume markets={radar_markets} pool={len(raw_by_sym)} selected={len(out)} "
+            f"drop_price={dropped['price']} drop_chg={dropped['chg']} drop_heat={dropped['heat']} "
+            f"drop_tv={dropped['tv']} drop_vol={dropped['vol']} drop_spread={dropped['spread']} drop_score={dropped['score']}"
+        )
+        _LAST_SOURCE_MAP = {sym: src_map.get(sym, "volume_rank") for sym in out}
+        return out
 
     for m in markets:
         rows, dbg = fetch_volume_rank(m)
@@ -767,7 +857,7 @@ def build_watchlist() -> List[str]:
             by_sym_q[sym] = it
 
     scored: List[Tuple[float, str]] = []
-    dropped = {"price": 0, "chg": 0, "tv": 0, "spread": 0, "score": 0}
+    dropped = {"price": 0, "chg": 0, "heat": 0, "tv": 0, "vol": 0, "spread": 0, "score": 0}
 
     for sym in syms:
         it = by_sym_q.get(sym) or raw_by_sym.get(sym) or {}
@@ -778,6 +868,9 @@ def build_watchlist() -> List[str]:
             continue
 
         chg = _parse_float(it, "prdy_ctrt", 0.0)
+        if chg > 3.0:
+            dropped["heat"] += 1
+            continue
         if chg < min_chg or chg > max_chg:
             dropped["chg"] += 1
             continue
@@ -787,17 +880,32 @@ def build_watchlist() -> List[str]:
             dropped["tv"] += 1
             continue
 
-        spread = _parse_spread_pct(it, max_spread_pct * 0.8)
-        if spread > max_spread_pct:
+        vol = _parse_float(it, "acml_vol", 0.0)
+        if vol > 0 and vol < 50000:
+            dropped["vol"] += 1
+            continue
+
+        spread_pct = _parse_spread_pct(it, max_spread_pct * 0.8)
+        if spread_pct >= max_spread_pct:
             dropped["spread"] += 1
             continue
 
-        base = score_item(it)
-        if base == float("-inf"):
+        momentum_score = chg
+        liquidity_score = math.log1p(max(tv, 0.0))
+        volume_score = math.log1p(max(vol, 0.0))
+        volume_accel = tv / max(vol, 1.0)
+
+        score = (
+            (momentum_score * 2.0)
+            + (liquidity_score * 0.7)
+            + (volume_score * 0.3)
+            + (volume_accel * 1.8)
+            - (spread_pct * 2.5)
+        )
+        if not math.isfinite(score):
             dropped["score"] += 1
             continue
 
-        score = base + min(3.0, tv / 50000000000.0)
         scored.append((score, sym))
 
     scored.sort(reverse=True)
@@ -816,8 +924,8 @@ def build_watchlist() -> List[str]:
 
     _LAST_BUILD_META = (
         f"simple_rest pool={len(raw_by_sym)} quote={len(by_sym_q)} selected={len(out)} "
-        f"drop_price={dropped['price']} drop_chg={dropped['chg']} "
-        f"drop_tv={dropped['tv']} drop_spread={dropped['spread']} drop_score={dropped['score']}"
+        f"drop_price={dropped['price']} drop_chg={dropped['chg']} drop_heat={dropped['heat']} "
+        f"drop_tv={dropped['tv']} drop_vol={dropped['vol']} drop_spread={dropped['spread']} drop_score={dropped['score']}"
     )
     _LAST_SOURCE_MAP = {sym: src_map.get(sym, "rest") for sym in out}
     return out
