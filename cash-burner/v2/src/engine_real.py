@@ -203,6 +203,9 @@ class EngineReal:
         self._health_failures = 0
         self.buy_fail_cooldown_sec = float(os.getenv("BUY_FAIL_COOLDOWN_SEC", "30"))
         self.buy_fail_state_ttl_sec = float(os.getenv("BUY_FAIL_STATE_TTL_SEC", "1800"))
+        self.reentry_cooldown_stop_sec = float(os.getenv("REENTRY_COOLDOWN_STOP_SEC", "120"))
+        self.reentry_cooldown_take_sec = float(os.getenv("REENTRY_COOLDOWN_TAKE_SEC", "10"))
+        self.reentry_cooldown_default_sec = float(os.getenv("REENTRY_COOLDOWN_DEFAULT_SEC", "30"))
         self._buy_fail_by_symbol = {}
         self.health_cash_symbol = os.getenv("HEALTH_CASH_SYMBOL", "005930").strip() or "005930"
         self._last_buyable_cash = 0.0
@@ -245,6 +248,8 @@ class EngineReal:
         self.pos: Dict[str, Position] = {}
         self.loaded_carry_positions = 0
         self.last_entry_ts: Dict[str, float] = {}
+        self.next_entry_allowed_ts: Dict[str, float] = {}
+        self.last_exit_reason: Dict[str, str] = {}
         self.candidate_since: Dict[str, float] = {}
         self.candidate_peak_price: Dict[str, float] = {}
         self.candidate_pullback_seen: Dict[str, bool] = {}
@@ -283,6 +288,30 @@ class EngineReal:
 
     def _sellable_qty(self, sym: str) -> int:
         return int(sellable_qty(sym))
+
+    def _cooldown_for_exit_reason(self, reason: str, fallback_sec: float) -> float:
+        r = (reason or "").upper()
+        stop_reasons = {"PROTECT_STOP", "MOMENTUM_EXIT", "LIQUIDITY_EXIT"}
+        take_reasons = {"PARTIAL_TP", "TRAIL_STOP", "FLOW_EXIT"}
+        if r in stop_reasons:
+            return max(0.0, self.reentry_cooldown_stop_sec)
+        if r in take_reasons:
+            return max(0.0, self.reentry_cooldown_take_sec)
+        return max(0.0, self.reentry_cooldown_default_sec if self.reentry_cooldown_default_sec > 0 else fallback_sec)
+
+    def _mark_exit_cooldown(self, sym: str, reason: str, ts_epoch: float, fallback_sec: float):
+        cd = self._cooldown_for_exit_reason(reason, fallback_sec)
+        self.last_exit_reason[sym] = reason
+        self.next_entry_allowed_ts[sym] = ts_epoch + cd
+
+    def _entry_cooldown_remaining(self, sym: str, ts_epoch: float, fallback_sec: float) -> tuple[float, str]:
+        until = self.next_entry_allowed_ts.get(sym)
+        reason = self.last_exit_reason.get(sym, "")
+        if until is None:
+            until = self.last_entry_ts.get(sym, 0.0) + max(0.0, fallback_sec)
+            reason = reason or "entry"
+        remain = until - ts_epoch
+        return remain, reason
 
     def _tick_size(self, price: float) -> float:
         if price < 2000:
@@ -1283,6 +1312,8 @@ class EngineReal:
         self._log_auto_position(ts_epoch, "BUY", sym, self.pos[sym], ref_price=price, note=f"score={score:.1f}")
         self._save_positions_state()
         self.last_entry_ts[sym] = ts_epoch
+        self.next_entry_allowed_ts.pop(sym, None)
+        self.last_exit_reason.pop(sym, None)
         self.day_buy_count += 1
         self._send_day_start_summary(ts_epoch)
         self.candidate_since.pop(sym, None)
@@ -1489,6 +1520,8 @@ class EngineReal:
             self.partial_taken.discard(sym)
             self._save_positions_state()
             self.last_entry_ts[sym] = ts_epoch
+            self.next_entry_allowed_ts.pop(sym, None)
+            self.last_exit_reason.pop(sym, None)
             self.day_buy_count += 1
             self._log_signal_diag(ts_epoch, sym, price, feat['ret10'], 0, feat['trv10'], imb, spread, dayrise, "BUY_TRY", f"qty={qty}")
             self._notify_buy(sym, qty, price, feat['ret10'], 0, feat['trv10'], imb, spread, dayrise, 0.0, ts_epoch, 0.0)
@@ -1555,6 +1588,7 @@ class EngineReal:
         self._log_auto_position(ts_epoch, "SELL", sym, p, ref_price=price, note=reason)
         p.qty = max(0, p.qty - qty_ord)
         if cleanup_if_flat and p.qty <= 0:
+            self._mark_exit_cooldown(sym, reason, ts_epoch, self.cooldown_sec)
             self._cleanup_symbol_state(sym)
         else:
             self._save_positions_state()
@@ -1648,8 +1682,9 @@ class EngineReal:
         cooldown_sec = float(p.get("cooldown_sec", self.cooldown_sec))
         dayrise = self._day_rise_pct(sym, price)
         if not holding_position:
-            if ts_epoch - self.last_entry_ts.get(sym, 0.0) < cooldown_sec:
-                self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, 0, f"cooldown<{cooldown_sec:.0f}s")
+            remain_cd, cd_reason = self._entry_cooldown_remaining(sym, ts_epoch, cooldown_sec)
+            if remain_cd > 0:
+                self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, 0, f"cooldown<{remain_cd:.0f}s reason={cd_reason}")
                 return
             if dayrise > 7.0:
                 self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, 0, 0, dayrise, "dayrise_hard_block>7")
