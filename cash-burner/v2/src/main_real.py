@@ -40,7 +40,9 @@ def _resolve_in_file() -> str:
 
 IN_FILE = _resolve_in_file()
 LIVE_POLL_SEC = float(os.getenv("LIVE_POLL_SEC", "0.2"))
-SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "10"))
+SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "2"))
+RADAR_SCAN_INTERVAL_SEC = float(os.getenv("RADAR_SCAN_INTERVAL_SEC", "1.0"))
+WATCH_RADAR_MODE = os.getenv("WATCH_RADAR_MODE", "0") == "1"
 WATCHLIST_DEBUG = os.getenv("WATCHLIST_DEBUG", os.path.join("data", "watchlist_debug.log"))
 PREVCLOSE_WARMUP = os.getenv("PREVCLOSE_WARMUP", "0") == "1"
 
@@ -113,7 +115,7 @@ def scanner_loop():
     while True:
         try:
             raw_watch = build_watchlist()
-            watch = _stabilize_watchlist(last_watch, raw_watch)
+            watch = raw_watch if WATCH_RADAR_MODE else _stabilize_watchlist(last_watch, raw_watch)
             _log(f"rank raw_watch n={len(raw_watch)} head={raw_watch[:10]}")
             _log(f"rank stable_watch n={len(watch)} head={watch[:10]}")
             integ = check_watchlist_integrity(watch)
@@ -159,7 +161,7 @@ def scanner_loop():
                     _log("WARN empty watchlist (rank api returned none) - no previous list")
         except Exception as e:
             _log(f"ERR {type(e).__name__}: {e}")
-        time.sleep(SCAN_INTERVAL_SEC)
+        time.sleep(RADAR_SCAN_INTERVAL_SEC if WATCH_RADAR_MODE else SCAN_INTERVAL_SEC)
 
 def main():
     threading.Thread(target=scanner_loop, daemon=True).start()
