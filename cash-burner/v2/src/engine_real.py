@@ -213,8 +213,10 @@ class EngineReal:
         self.notifier = DiscordNotifier()
 
         self.health_check_sec = float(os.getenv("HEALTH_CHECK_SEC", "1800"))
+        self.afterhours_health_min_sec = float(os.getenv("AFTERHOURS_HEALTH_MIN_SEC", "600"))
         self.ws_stale_sec = float(os.getenv("WS_STALE_SEC", "20"))
         self._last_health_ts = 0.0
+        self._last_afterhours_health_ts = 0.0
         self._health_signal_hits = 0
         self._health_order_tries = 0
         self._health_failures = 0
@@ -352,6 +354,15 @@ class EngineReal:
         if price < 500000:
             return 500.0
         return 1000.0
+
+    def _is_afterhours_window(self, ts_epoch: float) -> bool:
+        hhmm = int(time.strftime("%H%M", time.localtime(ts_epoch)))
+        return (800 <= hhmm < 850) or (1500 <= hhmm < 2000)
+
+    def _is_entry_window(self, ts_epoch: float) -> bool:
+        hhmm = int(time.strftime("%H%M", time.localtime(ts_epoch)))
+        in_regular = 900 <= hhmm < 1530
+        return in_regular or (self.afterhours_enabled and self._is_afterhours_window(ts_epoch))
 
     def _verify_startup_cash_or_block(self):
         now = time.time()
@@ -1261,10 +1272,10 @@ class EngineReal:
             lines=[f"시간: {kst}"] + self._day_summary_lines() + self._auto_holdings_lines(),
         )
 
-    def _send_health_check(self, ts_epoch: float):
-        if self.health_check_sec <= 0:
+    def _send_health_check(self, ts_epoch: float, force: bool = False, title: str = "🩺 정기 헬스체크"):
+        if (not force) and self.health_check_sec <= 0:
             return
-        if (ts_epoch - self._last_health_ts) < self.health_check_sec:
+        if (not force) and ((ts_epoch - self._last_health_ts) < self.health_check_sec):
             return
         self._last_health_ts = ts_epoch
         if self.ws_last_event_ts > 0:
@@ -1301,7 +1312,7 @@ class EngineReal:
             f"당일 승률: {win_rate:.1f}% ({self.day_win_count}승 {self.day_loss_count}패)",
         ]
         self.notifier.send(
-            title="🩺 정기 헬스체크",
+            title=title,
             color=0x5865F2,
             lines=lines + self._auto_holdings_lines(),
         )
@@ -1321,7 +1332,8 @@ class EngineReal:
             self._send_day_start_summary(ts_epoch)
         if hhmm >= 1530:
             self._send_day_close_summary(ts_epoch)
-        self._send_health_check(ts_epoch)
+        else:
+            self._send_health_check(ts_epoch)
 
     def _score_pick_update(self, ts_epoch: float, sym: str, score: float, price: float, ret: float, tick_count: int, trv: float, imb: float, spread: float, dayrise: float, ret10: float, baseline_ready: bool, early_score: float = 0.0):
         if self._score_pick_bucket_start <= 0:
@@ -1776,7 +1788,13 @@ class EngineReal:
         self._ensure_day_roll(ts_epoch)
         self.ws_last_event_ts = ts_epoch
         self._event_latency_update(ts_epoch)
-        self._send_health_check(ts_epoch)
+        hhmm = int(time.strftime("%H%M", time.localtime(ts_epoch)))
+        if hhmm < 1530:
+            self._send_health_check(ts_epoch)
+        elif self.afterhours_enabled and self._is_afterhours_window(ts_epoch):
+            if (ts_epoch - self._last_afterhours_health_ts) >= max(1.0, self.afterhours_health_min_sec):
+                self._last_afterhours_health_ts = ts_epoch
+                self._send_health_check(ts_epoch, force=True, title="🌙 장외 체결 헬스체크")
         if self._kill_active():
             return
 
