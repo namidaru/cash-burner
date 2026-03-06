@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import math
 import re
+import json
 import datetime as _dt
 from typing import Any, Dict, List, Tuple
 
@@ -18,6 +19,57 @@ DEFAULT_STRENGTH_TR_IDS = "FHPST01710000,VHPST01710000"
 DEFAULT_VOLUME_TR_IDS = "FHPST01710000,VHPST01710000"
 _LAST_BUILD_META: str = ""
 _LAST_SOURCE_MAP: Dict[str, str] = {}
+_WATCH_STATUS_FILE = os.getenv("WATCH_STATUS_FILE", os.path.join("data", "watch_status.json"))
+
+
+def _write_watch_status(payload: Dict[str, Any]):
+    try:
+        d = os.path.dirname(_WATCH_STATUS_FILE)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(_WATCH_STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _operator_summary_watch(selected: int, want_n: int, filtered_total: int, pool_size: int, top5_scores: List[Tuple[float, str]]) -> str:
+    watch_ok = selected >= max(3, want_n // 2)
+    filter_ratio = (filtered_total / max(1, pool_size)) if pool_size > 0 else 0.0
+    avg_top_score = sum(sc for sc, _ in top5_scores) / max(1, len(top5_scores))
+
+    if selected <= max(2, want_n // 3) and filter_ratio >= 0.70:
+        return "watch_small and scanner_overfiltered"
+    if watch_ok and avg_top_score < 20.0:
+        return "watch_ok but score_blocked"
+    if watch_ok and avg_top_score >= 20.0 and filter_ratio >= 0.50:
+        return "scores_ok but hard_gates_blocking"
+    if watch_ok and avg_top_score >= 20.0 and filter_ratio < 0.50:
+        return "buying_normally"
+    return "watch_ok monitoring"
+
+
+def _emit_watch_status(pool_size: int, selected: int, want_n: int, dropped: Dict[str, int], scored: List[Tuple[float, str]], quote_count: int):
+    top5 = [{"symbol": sym, "score": round(float(sc), 3)} for sc, sym in scored[:5]]
+    filtered_total = int(sum(int(v) for v in dropped.values()))
+    filter_ratio = (filtered_total / max(1, pool_size)) if pool_size > 0 else 0.0
+    payload = {
+        "ts": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "scanner_pool_summary": {
+            "pool_size": int(pool_size),
+            "quote_count": int(quote_count),
+            "selected": int(selected),
+            "want_n": int(want_n),
+        },
+        "scanner_drop_summary": {
+            **{k: int(v) for k, v in dropped.items()},
+            "filtered_total": filtered_total,
+            "filter_ratio": round(filter_ratio, 4),
+        },
+        "top5_scores": top5,
+        "operator_summary": _operator_summary_watch(selected, want_n, filtered_total, pool_size, scored[:5]),
+    }
+    _write_watch_status(payload)
 
 
 def _time_hhmm() -> int:
@@ -847,6 +899,7 @@ def build_watchlist() -> List[str]:
             fb = _fallback_symbols()[:want_n]
             _LAST_BUILD_META = f"radar_volume empty drop={dropped} -> fallback"
             _LAST_SOURCE_MAP = {sym: "fallback" for sym in fb}
+            _emit_watch_status(len(raw_by_sym), len(fb), want_n, dropped, scored, len(raw_by_sym))
             return fb
 
         _LAST_BUILD_META = (
@@ -856,6 +909,7 @@ def build_watchlist() -> List[str]:
             f"drop_tv={dropped['tv']} drop_vol={dropped['vol']} drop_spread={dropped['spread']} drop_score={dropped['score']}"
         )
         _LAST_SOURCE_MAP = {sym: src_map.get(sym, "volume_rank") for sym in out}
+        _emit_watch_status(len(raw_by_sym), len(out), want_n, dropped, scored, len(raw_by_sym))
         return out
 
     for m in markets:
@@ -884,6 +938,7 @@ def build_watchlist() -> List[str]:
         fb = _fallback_symbols()[:want_n]
         _LAST_BUILD_META = "empty_pool -> fallback"
         _LAST_SOURCE_MAP = {sym: "fallback" for sym in fb}
+        _emit_watch_status(0, len(fb), want_n, {"price": 0, "chg": 0, "heat": 0, "tv": 0, "vol": 0, "spread": 0, "score": 0}, [], 0)
         return fb
 
     syms = list(raw_by_sym.keys())
@@ -962,6 +1017,7 @@ def build_watchlist() -> List[str]:
         fb = _fallback_symbols()[:want_n]
         _LAST_BUILD_META = f"all_filtered drop={dropped} -> fallback"
         _LAST_SOURCE_MAP = {sym: "fallback" for sym in fb}
+        _emit_watch_status(len(raw_by_sym), len(fb), want_n, dropped, scored, len(by_sym_q))
         return fb
 
     _LAST_BUILD_META = (
@@ -970,6 +1026,7 @@ def build_watchlist() -> List[str]:
         f"drop_tv={dropped['tv']} drop_vol={dropped['vol']} drop_spread={dropped['spread']} drop_score={dropped['score']}"
     )
     _LAST_SOURCE_MAP = {sym: src_map.get(sym, "rest") for sym in out}
+    _emit_watch_status(len(raw_by_sym), len(out), want_n, dropped, scored, len(by_sym_q))
     return out
 
 
