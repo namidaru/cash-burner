@@ -33,28 +33,46 @@ def _to_float(v: Any) -> float | None:
 
 
 def _extract_buyable_cash_strict(payload: Dict[str, Any]) -> float:
-    """주문가능금액은 단일 canonical 필드(ord_psbl_cash)로만 해석한다.
+    """주문가능금액을 KIS 응답 변형(output/output1/output2)에서 엄격 추출한다."""
+    cash_keys = (
+        "ord_psbl_cash",
+        "ORD_PSBL_CASH",
+        "ord_psbl_cash_icdc",
+        "ORD_PSBL_CASH_ICDC",
+        "nrcvb_buy_amt",
+        "NRCVB_BUY_AMT",
+        "max_buy_amt",
+        "MAX_BUY_AMT",
+    )
 
-    파싱 실패시 fallback 하지 않고 예외를 발생시켜 상위에서 거래 중단 판단을 하게 한다.
-    """
-    out = payload.get("output")
-    if not isinstance(out, dict):
+    candidates: list[Dict[str, Any]] = []
+    for root_key in ("output", "output1", "output2"):
+        out = payload.get(root_key)
+        if isinstance(out, dict):
+            candidates.append(out)
+        elif isinstance(out, list):
+            for it in out:
+                if isinstance(it, dict):
+                    candidates.append(it)
+
+    if not candidates:
         raise ValueError(
-            f"buyable_cash_parse_error: missing output(dict), top_keys={sorted(payload.keys())[:12]}"
+            f"buyable_cash_parse_error: missing output payload, top_keys={sorted(payload.keys())[:12]}"
         )
 
-    raw = out.get("ord_psbl_cash")
-    if raw is None:
-        raw = out.get("ORD_PSBL_CASH")
+    for out in candidates:
+        for k in cash_keys:
+            val = _to_float(out.get(k))
+            if val is not None:
+                return val
 
-    val = _to_float(raw)
-    if val is None:
-        rt_cd = str(payload.get("rt_cd", ""))
-        msg1 = str(payload.get("msg1", ""))
-        raise ValueError(
-            f"buyable_cash_parse_error: output.ord_psbl_cash missing/invalid, output_keys={sorted(out.keys())[:20]}, rt_cd={rt_cd}, msg1={msg1[:120]}"
-        )
-    return val
+    sample_keys = sorted({k for out in candidates for k in out.keys()})[:24]
+    rt_cd = str(payload.get("rt_cd", ""))
+    msg1 = str(payload.get("msg1", payload.get("msg", "")))
+    raise ValueError(
+        "buyable_cash_parse_error: no cash field found "
+        f"(tried={cash_keys}), output_keys={sample_keys}, rt_cd={rt_cd}, msg1={msg1[:120]}"
+    )
 
 
 def buyable_cash(symbol: str, ord_dvsn: str="01", price: str="0") -> float:
