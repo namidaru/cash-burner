@@ -53,6 +53,7 @@ class EngineSimple:
         self.state_file = os.getenv("POSITION_STATE_FILE", os.path.join("data", "positions_simple.json"))
         self.watchlist_file = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
         self.signal_diag_file = os.getenv("SIGNAL_DIAG_FILE", os.path.join("data", "signal_diag_simple.log"))
+        self.runtime_status_file = os.getenv("RUNTIME_STATUS_FILE", os.path.join("data", "runtime_status.json"))
 
         # buy / score
         self.position_pct = float(os.getenv("POSITION_PCT", "0.30"))
@@ -94,15 +95,27 @@ class EngineSimple:
         self._last_candidate_log_ts: Dict[str, float] = {}
         self._last_health_ts = 0.0
         self._skip_reason_counts: Dict[str, int] = defaultdict(int)
+        self._score_eval_total = 0
+        self._score_pass_total = 0
+        self._gate_block_counts: Dict[str, int] = defaultdict(int)
+        self._last_buy_time = 0.0
+        self._last_sell_time = 0.0
+        self._last_buy_symbol = ""
+        self._last_sell_symbol = ""
+        self._recent_events: Deque[Dict[str, Any]] = deque(maxlen=10)
+        self._last_runtime_snapshot_ts = 0.0
+        self._last_orderable_cash: float | None = None
+        self._last_orderable_cash_ts = 0.0
 
         self.prev_close_cache = load_cache()
         self.notifier = DiscordNotifier()
         self._init_files()
         self._load_state()
+        self._prime_cash_status()
 
     # ---------- infra ----------
     def _init_files(self):
-        for p in (self.ledger_file, self.signal_diag_file, self.state_file):
+        for p in (self.ledger_file, self.signal_diag_file, self.state_file, self.runtime_status_file):
             d = os.path.dirname(p)
             if d:
                 os.makedirs(d, exist_ok=True)
@@ -262,6 +275,48 @@ class EngineSimple:
             self._log_ledger(ts_epoch, side, sym, qty, price, reason, "EX", f"{type(e).__name__}:{e}")
             return {"rt_cd": "EX", "msg1": str(e)}
 
+    def _is_afterhours_window(self, ts_epoch: float) -> bool:
+        hhmm = int(time.strftime("%H%M", time.localtime(ts_epoch)))
+        return not (900 <= hhmm < 1530)
+
+    def _prime_cash_status(self):
+        now = time.time()
+        self._refresh_orderable_cash(now, use_fallback=False)
+        self._refresh_orderable_cash(now, use_fallback=True)
+
+    def _refresh_orderable_cash(self, ts_epoch: float, use_fallback: bool = True) -> float | None:
+        orderable = None
+        try:
+            snap = account_cash_snapshot()
+        except Exception:
+            snap = {}
+
+        if isinstance(snap, dict):
+            for k in ("orderable", "ord_psbl_cash"):
+                v = _f(snap.get(k), -1.0)
+                if v > 0:
+                    orderable = v
+                    break
+
+        if orderable is None and use_fallback:
+            try:
+                bp = float(account_buying_power(symbol=self.health_cash_symbol, ord_dvsn="01", price="0"))
+                if bp > 0:
+                    orderable = bp
+            except Exception:
+                orderable = None
+
+        # 초기 비정상 표기 방지: 매우 작은 fallback 값은 버리고 마지막 정상값 유지
+        if orderable is not None and orderable >= 10000:
+            self._last_orderable_cash = orderable
+            self._last_orderable_cash_ts = ts_epoch
+        elif orderable is not None and self._last_orderable_cash is None and not use_fallback:
+            # account_cash_snapshot이 실제로 작은 값을 주는 경우는 그대로 허용
+            self._last_orderable_cash = orderable
+            self._last_orderable_cash_ts = ts_epoch
+
+        return self._last_orderable_cash
+
     def _effective_buying_power(self) -> float:
         try:
             return float(account_buying_power(symbol=self.health_cash_symbol, ord_dvsn="01", price="0"))
@@ -353,6 +408,7 @@ class EngineSimple:
         return score, reasons, metrics
 
     def should_buy(self, sym: str, score: float, metrics: Dict[str, float], ts_epoch: float) -> tuple[bool, str]:
+        self._score_eval_total += 1
         if sym not in self.watch:
             return False, "watchlist_out"
         if sym in self.pos:
@@ -367,6 +423,7 @@ class EngineSimple:
             return False, "trv10_too_low"
         if score < self.entry_score_threshold:
             return False, f"score<{self.entry_score_threshold:.1f}"
+        self._score_pass_total += 1
         return True, "pass"
 
     def _top_factor_strings(self, metrics: Dict[str, float]) -> tuple[str, str]:
@@ -401,6 +458,9 @@ class EngineSimple:
             return
 
         self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, score=score, reasons=reasons[:5])
+        self._last_buy_time = ts_epoch
+        self._last_buy_symbol = sym
+        self._record_event(ts_epoch, "BUY", sym, f"score={score:.1f} qty={qty}")
         self._save_state()
         self._log_diag(
             ts_epoch,
@@ -465,6 +525,9 @@ class EngineSimple:
 
         self.cooldown_until[sym] = ts_epoch + self.cooldown_sec
         self.pos.pop(sym, None)
+        self._last_sell_time = ts_epoch
+        self._last_sell_symbol = sym
+        self._record_event(ts_epoch, "SELL", sym, reason)
         self._save_state()
 
         self._log_diag(
@@ -526,9 +589,59 @@ class EngineSimple:
 
         if not ok:
             self._skip_reason_counts[why] += 1
+            self._gate_block_counts[why] += 1
+            self._record_event(ts_epoch, "DROP", sym, why)
             return
 
         self.enter_position(sym, price, score, reasons, metrics, ts_epoch)
+
+    def _record_event(self, ts_epoch: float, event: str, sym: str, detail: str = ""):
+        self._recent_events.append({
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_epoch)),
+            "event": event,
+            "symbol": sym,
+            "detail": (detail or "")[:120],
+        })
+
+    def _operator_summary_runtime(self, watch_n: int, score_pass_rate: float) -> str:
+        hard_block = sum(v for k, v in self._gate_block_counts.items() if (not k.startswith("watch")) and (not k.startswith("score<")) and k != "pass")
+        watch_ok = watch_n >= max(3, self.max_positions * 2)
+        if watch_n < max(3, self.max_positions):
+            return "watch_small and scanner_overfiltered"
+        if watch_ok and score_pass_rate < 0.10:
+            return "watch_ok but score_blocked"
+        if score_pass_rate >= 0.10 and hard_block > self._score_pass_total:
+            return "scores_ok but hard_gates_blocking"
+        if self._last_buy_time > 0 and (time.time() - self._last_buy_time) < 900:
+            return "buying_normally"
+        return "watch_ok monitoring"
+
+    def _write_runtime_status(self, ts_epoch: float):
+        top_gate = sorted(self._gate_block_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        score_pass_rate = (self._score_pass_total / max(1, self._score_eval_total))
+        payload = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_epoch)),
+            "watch_count": len(self.watch),
+            "position_count": len(self.pos),
+            "orderable_cash": self._last_orderable_cash,
+            "orderable_cash_text": _fmt_won(self._last_orderable_cash),
+            "top_gate_blockers": [{"reason": k, "count": int(v)} for k, v in top_gate],
+            "score_pass_rate": round(score_pass_rate, 4),
+            "last_buy_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._last_buy_time)) if self._last_buy_time > 0 else "",
+            "last_sell_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._last_sell_time)) if self._last_sell_time > 0 else "",
+            "last_buy_symbol": self._last_buy_symbol,
+            "last_sell_symbol": self._last_sell_symbol,
+            "recent_events": list(self._recent_events),
+            "operator_summary": self._operator_summary_runtime(len(self.watch), score_pass_rate),
+        }
+        try:
+            d = os.path.dirname(self.runtime_status_file)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(self.runtime_status_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def _send_health(self, ts_epoch: float):
         if self.health_check_sec <= 0:
@@ -536,20 +649,23 @@ class EngineSimple:
         if (ts_epoch - self._last_health_ts) < self.health_check_sec:
             return
         self._last_health_ts = ts_epoch
-        try:
-            snap = account_cash_snapshot()
-        except Exception:
-            snap = {}
+
+        # 상태는 갱신하되, 장외에는 외부 health 알림을 보내지 않음
+        self._refresh_orderable_cash(ts_epoch, use_fallback=True)
+        if self._is_afterhours_window(ts_epoch):
+            return
+
+        orderable_s = _fmt_won(self._last_orderable_cash)
         lines = [
-            f"watch={len(self.watch)} held={len(self.pos)} cooldown={len(self.cooldown_until)}",
-            f"예수금={_fmt_won(snap.get('deposit'))} 출금가능={_fmt_won(snap.get('withdrawable'))}",
-            f"주문가능={_fmt_won(snap.get('orderable'))} D+2={_fmt_won(snap.get('d2_deposit'))}",
+            f"감시 {len(self.watch)} | 보유 {len(self.pos)}",
+            f"주문가능 {orderable_s}",
         ]
-        if self._skip_reason_counts:
-            top = sorted(self._skip_reason_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]
-            lines.append("skip=" + ", ".join(f"{k}:{v}" for k, v in top))
         self.notifier.send(title="🩺 Simple Engine Health", color=0x5865F2, lines=lines)
 
     def on_timer(self, ts_epoch: float):
         self._reload_watchlist(ts_epoch)
+        self._refresh_orderable_cash(ts_epoch, use_fallback=True)
         self._send_health(ts_epoch)
+        if (ts_epoch - self._last_runtime_snapshot_ts) >= 1.0:
+            self._last_runtime_snapshot_ts = ts_epoch
+            self._write_runtime_status(ts_epoch)
