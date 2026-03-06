@@ -123,7 +123,7 @@ class EngineReal:
         self.sweep_threshold = float(os.getenv("SWEEP_THRESHOLD", "1.2"))
         self.sweep_window_sec = float(os.getenv("SWEEP_WINDOW_SEC", "10.0"))
         self.sweep_min_count = int(os.getenv("SWEEP_MIN_COUNT", "2"))
-        self.breakout_hold_sec = float(os.getenv("BREAKOUT_HOLD_SEC", "2.0"))
+        self.breakout_hold_sec = float(os.getenv("BREAKOUT_HOLD_SEC", "1.0"))
         self.fake_trv2s_min = float(os.getenv("FAKE_TRV2S_MIN", "10000000"))
         self.fake_depth_min = float(os.getenv("FAKE_DEPTH_MIN", "1.3"))
         self.fake_ofi_min = float(os.getenv("FAKE_OFI_MIN", "1.5"))
@@ -139,7 +139,7 @@ class EngineReal:
         self.trail_drop_pct = float(os.getenv("TRAIL_DROP_PCT", "3.5"))
 
         # Spike-momentum dedicated exits
-        self.protect_stop_pct = float(os.getenv("PROTECT_STOP_PCT", "2.8"))
+        self.protect_stop_pct = float(os.getenv("PROTECT_STOP_PCT", "2.5"))
         self.protect_grace_sec = float(os.getenv("PROTECT_GRACE_SEC", "8"))
         self.momentum_exit_ret5 = float(os.getenv("MOMENTUM_EXIT_RET5", "-1.2"))
         self.spike_trail_arm_pct = float(os.getenv("SPIKE_TRAIL_ARM_PCT", "3.0"))
@@ -165,7 +165,7 @@ class EngineReal:
         self.pullback_entry_enabled = os.getenv("PULLBACK_ENTRY_ENABLED", "1") == "1"
         self.pullback_pct = float(os.getenv("PULLBACK_PCT", "0.65"))
         self.pullback_rebound_pct = float(os.getenv("PULLBACK_REBOUND_PCT", "0.18"))
-        self.pullback_wait_sec = float(os.getenv("PULLBACK_WAIT_SEC", "12"))
+        self.pullback_wait_sec = float(os.getenv("PULLBACK_WAIT_SEC", "6"))
         self.entry_slip_cap_bps = float(os.getenv("ENTRY_SLIP_CAP_BPS", "12"))
         self.entry_use_limit_price = os.getenv("ENTRY_USE_LIMIT_PRICE", "0") == "1"
 
@@ -1465,7 +1465,7 @@ class EngineReal:
             self._log(ts_epoch, "BUY", sym, 0, price, "buyable_cash_error", "EX", f"{type(e).__name__}:{e}")
             self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "buyable_cash_error")
             return False
-        target = cash * self.position_pct
+        target = cash * self._position_pct_by_score(score)
         qty = int(math.floor(target / price))
         if qty <= 0:
             self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, f"qty=0 cash={cash:.0f} target={target:.0f}")
@@ -1664,6 +1664,13 @@ class EngineReal:
         pct = self.position_pct if position_pct is None else max(0.0, position_pct)
         return int((cash * pct) // price)
 
+    def _position_pct_by_score(self, score: float) -> float:
+        if score > 170.0:
+            return min(self.position_pct, 0.30)
+        if score > 140.0:
+            return min(self.position_pct, 0.20)
+        return min(self.position_pct, 0.10)
+
     def enter_position(
         self,
         sym: str,
@@ -1707,24 +1714,28 @@ class EngineReal:
             self.last_exit_reason.pop(sym, None)
             self.day_buy_count += 1
             self._log_signal_diag(ts_epoch, sym, price, feat['ret10'], 0, feat['trv10'], imb, spread, dayrise, "BUY_TRY", f"qty={qty}")
-            self._notify_buy(sym, qty, price, feat['ret10'], 0, feat['trv10'], imb, spread, dayrise, 0.0, ts_epoch, 0.0)
+            self._notify_buy(sym, qty, price, feat['ret10'], 0, feat['trv10'], imb, spread, dayrise, (float(entry_score) if entry_score is not None else 0.0), ts_epoch, 0.0)
             return True
         return False
 
     def try_entry(self, sym: str, price: float, ts_epoch: float, feat: Dict[str, float], dayrise: float, spread: float, imb: float, sweep_score: float = 0.0) -> bool:
         ret10 = float(feat.get("ret10", 0.0))
+        ret5 = float(feat.get("ret5", 0.0))
         trv10 = float(feat.get("trv10", 0.0))
-        if ret10 <= 0.15 or trv10 <= 20_000_000:
+        if ret10 < 0.30 or ret5 < 0.15 or trv10 < 30_000_000:
             return False
 
         ofi = float(feat.get("ofi", 0.0))
         depth_ratio = float(feat.get("depth_ratio", 0.0))
+        if ofi < 1.4 or imb < 0.60:
+            return False
+
         score = 0.0
-        score += min(ret10, 1.2) * 50.0
-        score += max(0.0, ofi - 1.0) * 20.0
-        score += max(0.0, depth_ratio - 1.0) * 30.0
-        score += max(0.0, sweep_score) * 25.0
-        score += math.log1p(max(0.0, trv10)) * 2.0
+        score += (ret10 * 60.0)
+        score += (math.log1p(max(0.0, trv10)) * 5.0)
+        score += ((imb - 0.5) * 120.0)
+        score += ((depth_ratio - 1.0) * 20.0)
+        score += (max(0.0, sweep_score) * 30.0)
 
         dq = self.ticks.get(sym, deque())
         _, trv2, _ = self._window_stats(dq, ts_epoch, 2.0)
@@ -1737,12 +1748,7 @@ class EngineReal:
         if score <= 120.0:
             return False
 
-        if score > 170.0:
-            position_pct = 0.30
-        elif score > 140.0:
-            position_pct = 0.20
-        else:
-            position_pct = 0.10
+        position_pct = self._position_pct_by_score(score)
 
         return self.enter_position(
             sym,
@@ -1784,6 +1790,10 @@ class EngineReal:
         if price > self.max_price.get(sym, p.max_price):
             self.max_price[sym] = price
             p.max_price = max(p.max_price, price)
+
+        hold_sec = max(0.0, ts_epoch - p.entry_ts)
+        if hold_sec < 3.0:
+            return
 
         entry = p.entry_price
         exit_price, bid1, bid_used = self._risk_exit_price(sym, price, ts_epoch)
@@ -2132,23 +2142,16 @@ class EngineReal:
             )
             return
 
-        self._score_pick_update(ts_epoch, sym, score, price, ret, tick_count, trv, imb, spread, dayrise, ret10, baseline_ready, early_score)
-        if not self._score_pick_ready(ts_epoch):
-            return
-        candidates = self._score_pick_take()
-        if not candidates:
-            return
-        for cand in candidates:
-            if self._try_buy_from_candidate(
-                cand,
-                ts_epoch,
-                ofi=ofi,
-                trv_10s=trv_10s,
-                trv_2s=trv_2s,
-                sweep_max=sweep_max,
-                sweep_count=sweep_count,
-                avg_depth_ratio=avg_depth_ratio,
-                ob_stale=ob_stale,
-                ob_age=ob_age,
-            ):
-                return
+        position_pct = self._position_pct_by_score(score)
+        self.enter_position(
+            sym,
+            price,
+            ts_epoch,
+            feat,
+            dayrise,
+            spread,
+            imb,
+            position_pct=position_pct,
+            entry_score=score,
+        )
+        return

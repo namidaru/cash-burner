@@ -715,8 +715,8 @@ def build_watchlist() -> List[str]:
     want_n = int(os.getenv("WATCH_TOP_N", "12"))
     min_price = float(os.getenv("WATCH_MIN_PRICE", "1000"))
     max_price = float(os.getenv("WATCH_MAX_PRICE", "200000"))
-    min_chg = float(os.getenv("WATCH_MIN_CHANGE_PCT", "-0.5"))
-    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "2.5"))
+    min_chg = float(os.getenv("WATCH_MIN_CHANGE_PCT", "1.0"))
+    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "6.0"))
     min_tv = float(os.getenv("WATCH_MIN_TR_VALUE", "1200000000"))
     max_spread_pct = float(os.getenv("WATCH_MAX_SPREAD_PCT", "0.35"))
 
@@ -800,7 +800,7 @@ def build_watchlist() -> List[str]:
                 continue
 
             chg = _parse_float(it, "prdy_ctrt", 0.0)
-            if chg > 3.0:
+            if chg > 7.0:
                 dropped["heat"] += 1
                 continue
             if chg < min_chg or chg > max_chg:
@@ -908,7 +908,7 @@ def build_watchlist() -> List[str]:
             continue
 
         chg = _parse_float(it, "prdy_ctrt", 0.0)
-        if chg > 3.0:
+        if chg > 7.0:
             dropped["heat"] += 1
             continue
         if chg < min_chg or chg > max_chg:

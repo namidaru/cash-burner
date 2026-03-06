@@ -39,7 +39,7 @@ SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "2"))
 RADAR_SCAN_INTERVAL_SEC = float(os.getenv("RADAR_SCAN_INTERVAL_SEC", "1.0"))
 WATCH_RADAR_MODE = os.getenv("WATCH_RADAR_MODE", "0") == "1"
 WATCHLIST_DEBUG = os.getenv("WATCHLIST_DEBUG", os.path.join("data", "watchlist_debug.log"))
-PREVCLOSE_WARMUP = os.getenv("PREVCLOSE_WARMUP", "0") == "1"
+PREVCLOSE_WARMUP = os.getenv("PREVCLOSE_WARMUP", "1") == "1"
 
 def _log(msg: str):
     try:
