@@ -38,6 +38,7 @@ LIVE_POLL_SEC = float(os.getenv("LIVE_POLL_SEC", "0.2"))
 SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "2"))
 RADAR_SCAN_INTERVAL_SEC = float(os.getenv("RADAR_SCAN_INTERVAL_SEC", "1.0"))
 WATCH_RADAR_MODE = os.getenv("WATCH_RADAR_MODE", "0") == "1"
+WATCH_STABILIZE_ENABLED = os.getenv("WATCH_STABILIZE_ENABLED", "0") == "1"
 WATCHLIST_DEBUG = os.getenv("WATCHLIST_DEBUG", os.path.join("data", "watchlist_debug.log"))
 PREVCLOSE_WARMUP = os.getenv("PREVCLOSE_WARMUP", "1") == "1"
 
@@ -110,7 +111,7 @@ def scanner_loop():
     while True:
         try:
             raw_watch = build_watchlist()
-            watch = raw_watch if WATCH_RADAR_MODE else _stabilize_watchlist(last_watch, raw_watch)
+            watch = _stabilize_watchlist(last_watch, raw_watch) if WATCH_STABILIZE_ENABLED else raw_watch
             _log(f"rank raw_watch n={len(raw_watch)} head={raw_watch[:10]}")
             _log(f"rank stable_watch n={len(watch)} head={watch[:10]}")
             integ = check_watchlist_integrity(watch)

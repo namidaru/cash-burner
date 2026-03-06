@@ -20,6 +20,18 @@ def _f(x: Any, d: float = 0.0) -> float:
         return d
 
 
+def _fmt_won(v: Any) -> str:
+    if v is None:
+        return "-"
+    try:
+        n = float(v)
+    except Exception:
+        return "-"
+    if not math.isfinite(n):
+        return "-"
+    return f"{int(round(n)):,}원"
+
+
 @dataclass
 class Position:
     qty: int
@@ -124,10 +136,18 @@ class EngineSimple:
             self.cooldown_until = {str(k): float(v) for k, v in (j.get("cooldown_until") or {}).items()}
         except Exception:
             self.cooldown_until = {}
+        dirty = False
         for sym, item in (j.get("positions") or {}).items():
             try:
+                qty_state = int(item.get("qty", 0))
+                qty_live = max(0, int(sellable_qty(sym)))
+                qty_use = min(qty_state, qty_live)
+                if qty_use <= 0:
+                    self._log_diag(time.time(), sym, "STATE_CLEAN", "ghost_position_removed")
+                    dirty = True
+                    continue
                 self.pos[sym] = Position(
-                    qty=int(item.get("qty", 0)),
+                    qty=qty_use,
                     entry_price=float(item.get("entry_price", 0.0)),
                     entry_ts=float(item.get("entry_ts", time.time())),
                     max_price=float(item.get("max_price", item.get("entry_price", 0.0))),
@@ -136,8 +156,12 @@ class EngineSimple:
                     score=float(item.get("score", 0.0)),
                     reasons=list(item.get("reasons") or []),
                 )
+                if qty_use != qty_state:
+                    dirty = True
             except Exception:
                 continue
+        if dirty:
+            self._save_state()
 
     def _reload_watchlist(self, ts_epoch: float):
         if (ts_epoch - self._last_watch_reload_ts) < 1.0:
@@ -395,6 +419,10 @@ class EngineSimple:
         qty_sell = max(0, int(sellable_qty(sym)))
         qty = min(qty_sell, p.qty)
         if qty <= 0:
+            self.pos.pop(sym, None)
+            self.cooldown_until[sym] = ts_epoch + self.cooldown_sec
+            self._save_state()
+            self._log_diag(ts_epoch, sym, "STATE_CLEAN", "sellable_qty_zero")
             return
 
         j = self._safe_order("SELL", sym, qty, ts_epoch, price, reason)
@@ -475,8 +503,8 @@ class EngineSimple:
             snap = {}
         lines = [
             f"watch={len(self.watch)} held={len(self.pos)} cooldown={len(self.cooldown_until)}",
-            f"예수금={snap.get('deposit','-')} 출금가능={snap.get('withdrawable','-')}",
-            f"주문가능={snap.get('orderable','-')} D+2={snap.get('d2_deposit','-')}",
+            f"예수금={_fmt_won(snap.get('deposit'))} 출금가능={_fmt_won(snap.get('withdrawable'))}",
+            f"주문가능={_fmt_won(snap.get('orderable'))} D+2={_fmt_won(snap.get('d2_deposit'))}",
         ]
         if self._skip_reason_counts:
             top = sorted(self._skip_reason_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]

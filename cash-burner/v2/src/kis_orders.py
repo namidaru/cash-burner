@@ -135,7 +135,7 @@ def account_cash_snapshot() -> Dict[str, float]:
 
     dep = _pick_first(rows, ("dnca_tot_amt", "DNCA_TOT_AMT"))
     withdrawable = _pick_first(rows, (
-        "wdrw_psbl_amt", "WDRW_PSBL_AMT", "prvs_rcdl_excc_amt", "PRVS_RCDL_EXCC_AMT"
+        "wdrw_psbl_amt", "WDRW_PSBL_AMT", "frcr_wdrw_psbl_amt", "FRCR_WDRW_PSBL_AMT"
     ))
     orderable = _pick_first(rows, (
         "ord_psbl_cash", "ORD_PSBL_CASH", "ord_psbl_amt", "ORD_PSBL_AMT"
