@@ -33,10 +33,12 @@ def _to_float(v: Any) -> float | None:
 
 
 def _extract_buyable_cash_strict(payload: Dict[str, Any]) -> float:
-    """주문가능금액을 KIS 응답 변형(output/output1/output2)에서 엄격 추출한다."""
-    cash_keys = (
-        "ord_psbl_cash",
-        "ORD_PSBL_CASH",
+    """주문가능금액을 KIS 응답 변형(output/output1/output2)에서 엄격 추출한다.
+
+    우선 canonical 키(ord_psbl_cash)만 전 후보에서 먼저 탐색해 오인 파싱을 방지한다.
+    """
+    canonical_keys = ("ord_psbl_cash", "ORD_PSBL_CASH")
+    fallback_keys = (
         "ord_psbl_cash_icdc",
         "ORD_PSBL_CASH_ICDC",
         "nrcvb_buy_amt",
@@ -60,8 +62,14 @@ def _extract_buyable_cash_strict(payload: Dict[str, Any]) -> float:
             f"buyable_cash_parse_error: missing output payload, top_keys={sorted(payload.keys())[:12]}"
         )
 
-    for out in candidates:
-        for k in cash_keys:
+    for k in canonical_keys:
+        for out in candidates:
+            val = _to_float(out.get(k))
+            if val is not None:
+                return val
+
+    for k in fallback_keys:
+        for out in candidates:
             val = _to_float(out.get(k))
             if val is not None:
                 return val
@@ -71,7 +79,7 @@ def _extract_buyable_cash_strict(payload: Dict[str, Any]) -> float:
     msg1 = str(payload.get("msg1", payload.get("msg", "")))
     raise ValueError(
         "buyable_cash_parse_error: no cash field found "
-        f"(tried={cash_keys}), output_keys={sample_keys}, rt_cd={rt_cd}, msg1={msg1[:120]}"
+        f"(tried={canonical_keys + fallback_keys}), output_keys={sample_keys}, rt_cd={rt_cd}, msg1={msg1[:120]}"
     )
 
 
