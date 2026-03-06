@@ -87,40 +87,90 @@ def _extract_buyable_cash_strict(payload: Dict[str, Any]) -> float:
     )
 
 
-def _extract_account_cash_from_balance(payload: Dict[str, Any]) -> float:
-    """계좌 전체 기준 주문가능금액을 잔고조회 응답에서 추출한다."""
+def _balance_rows(payload: Dict[str, Any]) -> list[Dict[str, Any]]:
     output2 = payload.get("output2")
     rows: list[Dict[str, Any]] = []
     if isinstance(output2, dict):
         rows.append(output2)
     elif isinstance(output2, list):
         rows.extend([it for it in output2 if isinstance(it, dict)])
-
     if not rows:
         out = payload.get("output")
         if isinstance(out, dict):
             rows.append(out)
+    return rows
 
+
+def _pick_first(rows: list[Dict[str, Any]], keys: tuple[str, ...]) -> float | None:
+    for k in keys:
+        for row in rows:
+            v = _to_float(row.get(k))
+            if v is not None:
+                return v
+    return None
+
+
+def account_cash_snapshot() -> Dict[str, float]:
+    """계좌 기준 현금 관련 스냅샷 반환(로그/진단용)."""
+    cano, prdt = split_account(ACC_NO)
+    params = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": prdt,
+        "AFHR_FLPR_YN": "N",
+        "OFL_YN": "",
+        "INQR_DVSN": "02",
+        "UNPR_DVSN": "01",
+        "FUND_STTL_ICLD_YN": "Y",
+        "FNCG_AMT_AUTO_RDPT_YN": "N",
+        "PRCS_DVSN": "00",
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": "",
+    }
+    j = request("GET", PATH_BALANCE, TRID_BALANCE, params=params)
+    rows = _balance_rows(j)
+    if not rows:
+        raise ValueError(
+            f"account_cash_parse_error: missing output2/output(dict), top_keys={sorted(j.keys())[:12]}"
+        )
+
+    dep = _pick_first(rows, ("dnca_tot_amt", "DNCA_TOT_AMT"))
+    withdrawable = _pick_first(rows, (
+        "wdrw_psbl_amt", "WDRW_PSBL_AMT", "prvs_rcdl_excc_amt", "PRVS_RCDL_EXCC_AMT"
+    ))
+    orderable = _pick_first(rows, (
+        "ord_psbl_cash", "ORD_PSBL_CASH", "ord_psbl_amt", "ORD_PSBL_AMT"
+    ))
+    d2_dep = _pick_first(rows, (
+        "prvs_rcdl_excc_amt", "PRVS_RCDL_EXCC_AMT", "nxdy_excc_amt", "NXDY_EXCC_AMT"
+    ))
+
+    out: Dict[str, float] = {}
+    if dep is not None:
+        out["deposit"] = dep
+    if withdrawable is not None:
+        out["withdrawable"] = withdrawable
+    if orderable is not None:
+        out["orderable"] = orderable
+    if d2_dep is not None:
+        out["d2_deposit"] = d2_dep
+    return out
+
+
+def _extract_account_cash_from_balance(payload: Dict[str, Any]) -> float:
+    """계좌 전체 기준 주문가능금액(ord_psbl_cash)을 잔고조회 응답에서 추출한다."""
+    rows = _balance_rows(payload)
     if not rows:
         raise ValueError(
             f"account_cash_parse_error: missing output2/output(dict), top_keys={sorted(payload.keys())[:12]}"
         )
 
-    cash_keys = (
-        "dnca_tot_amt", "DNCA_TOT_AMT",  # 예수금총금액
-        "ord_psbl_cash", "ORD_PSBL_CASH",  # 주문가능현금
-        "prvs_rcdl_excc_amt", "PRVS_RCDL_EXCC_AMT",  # D+2 추정가능현금
-    )
-
-    for k in cash_keys:
-        for row in rows:
-            val = _to_float(row.get(k))
-            if val is not None:
-                return val
+    orderable = _pick_first(rows, ("ord_psbl_cash", "ORD_PSBL_CASH", "ord_psbl_amt", "ORD_PSBL_AMT"))
+    if orderable is not None:
+        return orderable
 
     sample_keys = sorted({k for row in rows for k in row.keys()})[:24]
     raise ValueError(
-        f"account_cash_parse_error: no cash key found, output_keys={sample_keys}"
+        f"account_cash_parse_error: ord_psbl_cash missing, output_keys={sample_keys}"
     )
 
 

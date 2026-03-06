@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from collections import defaultdict, deque
 from typing import Dict, Deque, Tuple, Any
 
-from kis_orders import buyable_cash, sellable_qty, order_cash, account_buying_power
+from kis_orders import buyable_cash, sellable_qty, order_cash, account_buying_power, account_cash_snapshot
 from quote_basic import load_cache
 from notifier import DiscordNotifier
 
@@ -148,6 +148,7 @@ class EngineReal:
         self.partial_take_qty_ratio = float(os.getenv("PARTIAL_TAKE_QTY_RATIO", "0.5"))
         self.exhaustion_high_band = float(os.getenv("EXHAUSTION_HIGH_BAND", "0.998"))
         self.exhaustion_ofi_max = float(os.getenv("EXHAUSTION_OFI_MAX", "1.2"))
+        self.min_flow_exit_hold_sec = float(os.getenv("MIN_FLOW_EXIT_HOLD_SEC", "4.0"))
         self.liquidity_collapse_depth = float(os.getenv("LIQUIDITY_COLLAPSE_DEPTH", "0.7"))
 
         self.entry_block_dayrise_pct = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "5.0"))
@@ -314,9 +315,9 @@ class EngineReal:
 
     def _effective_buying_power(self) -> float:
         try:
-            return self._account_buying_power()
+            return float(self._account_buying_power())
         except Exception:
-            return self._buyable_cash(self.health_cash_symbol)
+            return float(self._buyable_cash(self.health_cash_symbol))
 
     def _cooldown_for_exit_reason(self, reason: str, fallback_sec: float) -> float:
         r = (reason or "").upper()
@@ -1295,11 +1296,35 @@ class EngineReal:
             ws_gap = 0.0
             ws_state = "초기화중(이벤트 대기)"
         lat_avg = (self._lat_sum / self._lat_cnt) if self._lat_cnt else 0.0
+        cash_detail = {
+            "deposit": "-",
+            "withdrawable": "-",
+            "orderable": "-",
+            "d2_deposit": "-",
+        }
         try:
-            buyable_cash_now = self._effective_buying_power()
-            self._last_buyable_cash = buyable_cash_now
-            self._last_buyable_cash_ts = ts_epoch
-            cash_state = f"{buyable_cash_now:,.0f}원"
+            snap = account_cash_snapshot()
+            dep = float(snap.get("deposit", 0.0)) if ("deposit" in snap) else None
+            wdr = float(snap.get("withdrawable", 0.0)) if ("withdrawable" in snap) else None
+            ord_psbl = float(snap.get("orderable", 0.0)) if ("orderable" in snap) else None
+            d2 = float(snap.get("d2_deposit", 0.0)) if ("d2_deposit" in snap) else None
+            if dep is not None:
+                cash_detail["deposit"] = f"{dep:,.0f}원"
+            if wdr is not None:
+                cash_detail["withdrawable"] = f"{wdr:,.0f}원"
+            if ord_psbl is not None:
+                cash_detail["orderable"] = f"{ord_psbl:,.0f}원"
+                self._last_buyable_cash = ord_psbl
+                self._last_buyable_cash_ts = ts_epoch
+            if d2 is not None:
+                cash_detail["d2_deposit"] = f"{d2:,.0f}원"
+            cash_state = cash_detail["orderable"]
+            if cash_state == "-":
+                buyable_cash_now = self._effective_buying_power()
+                self._last_buyable_cash = buyable_cash_now
+                self._last_buyable_cash_ts = ts_epoch
+                cash_state = f"{buyable_cash_now:,.0f}원"
+                cash_detail["orderable"] = cash_state
         except Exception as e:
             if self._last_buyable_cash_ts > 0:
                 age = max(0.0, ts_epoch - self._last_buyable_cash_ts)
@@ -1316,6 +1341,10 @@ class EngineReal:
             f"WS 상태: {ws_state}",
             f"최근 이벤트: 신호 {self._health_signal_hits} / 주문 {self._health_order_tries} / 실패 {self._health_failures}",
             f"현재 주문가능금액: {cash_state}",
+            f"예수금: {cash_detail['deposit']}",
+            f"출금가능금액: {cash_detail['withdrawable']}",
+            f"주문가능금액: {cash_detail['orderable']}",
+            f"D+2예수금: {cash_detail['d2_deposit']}",
             f"거래가능 상태: {'ON' if self.trade_ready else 'BLOCKED'} {self.trade_block_reason[:80]}",
             f"미체결 주원인: {top_reason} ({top_cnt}회)",
             f"지연: avg {lat_avg:.3f}s / max {self._lat_max:.3f}s",
@@ -1431,7 +1460,7 @@ class EngineReal:
             return False
 
         try:
-            cash = self._buyable_cash(sym)
+            cash = self._effective_buying_power()
         except Exception as e:
             self._log(ts_epoch, "BUY", sym, 0, price, "buyable_cash_error", "EX", f"{type(e).__name__}:{e}")
             self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "buyable_cash_error")
@@ -1648,7 +1677,7 @@ class EngineReal:
         entry_score: float | None = None,
     ) -> bool:
         try:
-            cash = self._buyable_cash(sym)
+            cash = self._effective_buying_power()
         except Exception as e:
             self._log(ts_epoch, "BUY", sym, 0, price, "buyable_cash_error", "EX", f"{type(e).__name__}:{e}")
             self._note_no_buy(ts_epoch, sym, price, 0, 0, 0, imb, spread, dayrise, "buyable_cash_error")
@@ -1780,8 +1809,9 @@ class EngineReal:
             return
 
         high_60 = max((px for t, px, _ in self.ticks.get(sym, []) if (ts_epoch - t) <= 60.0), default=price)
-        if high_60 > 0 and exit_price >= high_60 * self.exhaustion_high_band and feat.get("ofi", 0.0) < self.exhaustion_ofi_max:
-            self._execute_sell_action(sym, p, exit_price, ts_epoch, "FLOW_EXIT", f"ofi={feat.get('ofi',0.0):.2f} {px_note}")
+        hold_sec = max(0.0, ts_epoch - p.entry_ts)
+        if hold_sec >= self.min_flow_exit_hold_sec and high_60 > 0 and exit_price >= high_60 * self.exhaustion_high_band and feat.get("ofi", 0.0) < self.exhaustion_ofi_max:
+            self._execute_sell_action(sym, p, exit_price, ts_epoch, "FLOW_EXIT", f"ofi={feat.get('ofi',0.0):.2f} hold={hold_sec:.1f}s {px_note}")
             return
 
         if (not p.trail_armed) and exit_price >= entry * (1.0 + self.spike_trail_arm_pct / 100.0):
@@ -2063,7 +2093,7 @@ class EngineReal:
             return
 
         try:
-            cash = self._buyable_cash(sym)
+            cash = self._effective_buying_power()
         except Exception as e:
             self._log(ts_epoch, "BUY", sym, 0, price, "buyable_cash_error", "EX", f"{type(e).__name__}:{e}")
             self._note_no_buy(ts_epoch, sym, price, ret, tick_count, trv, imb, spread, dayrise, "buyable_cash_error")
