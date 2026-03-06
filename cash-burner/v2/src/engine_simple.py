@@ -104,11 +104,14 @@ class EngineSimple:
         self._last_sell_symbol = ""
         self._recent_events: Deque[Dict[str, Any]] = deque(maxlen=10)
         self._last_runtime_snapshot_ts = 0.0
+        self._last_orderable_cash: float | None = None
+        self._last_orderable_cash_ts = 0.0
 
         self.prev_close_cache = load_cache()
         self.notifier = DiscordNotifier()
         self._init_files()
         self._load_state()
+        self._prime_cash_status()
 
     # ---------- infra ----------
     def _init_files(self):
@@ -271,6 +274,48 @@ class EngineSimple:
         except Exception as e:
             self._log_ledger(ts_epoch, side, sym, qty, price, reason, "EX", f"{type(e).__name__}:{e}")
             return {"rt_cd": "EX", "msg1": str(e)}
+
+    def _is_afterhours_window(self, ts_epoch: float) -> bool:
+        hhmm = int(time.strftime("%H%M", time.localtime(ts_epoch)))
+        return not (900 <= hhmm < 1530)
+
+    def _prime_cash_status(self):
+        now = time.time()
+        self._refresh_orderable_cash(now, use_fallback=False)
+        self._refresh_orderable_cash(now, use_fallback=True)
+
+    def _refresh_orderable_cash(self, ts_epoch: float, use_fallback: bool = True) -> float | None:
+        orderable = None
+        try:
+            snap = account_cash_snapshot()
+        except Exception:
+            snap = {}
+
+        if isinstance(snap, dict):
+            for k in ("orderable", "ord_psbl_cash"):
+                v = _f(snap.get(k), -1.0)
+                if v > 0:
+                    orderable = v
+                    break
+
+        if orderable is None and use_fallback:
+            try:
+                bp = float(account_buying_power(symbol=self.health_cash_symbol, ord_dvsn="01", price="0"))
+                if bp > 0:
+                    orderable = bp
+            except Exception:
+                orderable = None
+
+        # 초기 비정상 표기 방지: 매우 작은 fallback 값은 버리고 마지막 정상값 유지
+        if orderable is not None and orderable >= 10000:
+            self._last_orderable_cash = orderable
+            self._last_orderable_cash_ts = ts_epoch
+        elif orderable is not None and self._last_orderable_cash is None and not use_fallback:
+            # account_cash_snapshot이 실제로 작은 값을 주는 경우는 그대로 허용
+            self._last_orderable_cash = orderable
+            self._last_orderable_cash_ts = ts_epoch
+
+        return self._last_orderable_cash
 
     def _effective_buying_power(self) -> float:
         try:
@@ -578,6 +623,8 @@ class EngineSimple:
             "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_epoch)),
             "watch_count": len(self.watch),
             "position_count": len(self.pos),
+            "orderable_cash": self._last_orderable_cash,
+            "orderable_cash_text": _fmt_won(self._last_orderable_cash),
             "top_gate_blockers": [{"reason": k, "count": int(v)} for k, v in top_gate],
             "score_pass_rate": round(score_pass_rate, 4),
             "last_buy_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._last_buy_time)) if self._last_buy_time > 0 else "",
@@ -602,22 +649,22 @@ class EngineSimple:
         if (ts_epoch - self._last_health_ts) < self.health_check_sec:
             return
         self._last_health_ts = ts_epoch
-        try:
-            snap = account_cash_snapshot()
-        except Exception:
-            snap = {}
+
+        # 상태는 갱신하되, 장외에는 외부 health 알림을 보내지 않음
+        self._refresh_orderable_cash(ts_epoch, use_fallback=True)
+        if self._is_afterhours_window(ts_epoch):
+            return
+
+        orderable_s = _fmt_won(self._last_orderable_cash)
         lines = [
-            f"watch={len(self.watch)} held={len(self.pos)} cooldown={len(self.cooldown_until)}",
-            f"예수금={_fmt_won(snap.get('deposit'))} 출금가능={_fmt_won(snap.get('withdrawable'))}",
-            f"주문가능={_fmt_won(snap.get('orderable'))} D+2={_fmt_won(snap.get('d2_deposit'))}",
+            f"감시 {len(self.watch)} | 보유 {len(self.pos)}",
+            f"주문가능 {orderable_s}",
         ]
-        if self._skip_reason_counts:
-            top = sorted(self._skip_reason_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]
-            lines.append("skip=" + ", ".join(f"{k}:{v}" for k, v in top))
         self.notifier.send(title="🩺 Simple Engine Health", color=0x5865F2, lines=lines)
 
     def on_timer(self, ts_epoch: float):
         self._reload_watchlist(ts_epoch)
+        self._refresh_orderable_cash(ts_epoch, use_fallback=True)
         self._send_health(ts_epoch)
         if (ts_epoch - self._last_runtime_snapshot_ts) >= 1.0:
             self._last_runtime_snapshot_ts = ts_epoch

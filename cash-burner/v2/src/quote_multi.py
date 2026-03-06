@@ -19,7 +19,7 @@ ENTRY_BLOCK_DAYRISE_PCT = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "5.0"))
 MIN_TRADE_VALUE = float(os.getenv("WATCH_MIN_TR_VALUE", "600000000"))
 MIN_VOLUME = float(os.getenv("WATCH_MIN_VOLUME", "30000"))
 WATCH_SOFT_HEAT_PCT = float(os.getenv("WATCH_SOFT_HEAT_PCT", "2.5"))
-WATCH_HARD_HEAT_PCT = float(os.getenv("WATCH_HARD_HEAT_PCT", "9.5"))
+WATCH_HARD_HEAT_PCT = float(os.getenv("WATCH_HARD_HEAT_PCT", "14.0"))
 
 def chunk(lst: List[str], n: int):
     for i in range(0, len(lst), n):

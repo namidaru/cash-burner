@@ -695,7 +695,7 @@ def check_watchlist_integrity(symbols: List[str]) -> Dict[str, int]:
     - 형식(6자리 숫자), 중복, 저가 필터 위반
     - 가능하면 멀티시세로 현재가 확인하여 저가/미응답 개수도 집계
     """
-    min_price = float(os.getenv("WATCH_MIN_PRICE", "1000"))
+    min_price = float(os.getenv("WATCH_MIN_PRICE", "5000"))
 
     total = len(symbols)
     bad_format = 0
@@ -765,11 +765,11 @@ def build_watchlist() -> List[str]:
     global _LAST_BUILD_META, _LAST_SOURCE_MAP
 
     want_n = int(os.getenv("WATCH_TOP_N", "12"))
-    min_price = float(os.getenv("WATCH_MIN_PRICE", "1000"))
+    min_price = float(os.getenv("WATCH_MIN_PRICE", "5000"))
     max_price = float(os.getenv("WATCH_MAX_PRICE", "200000"))
     min_chg = float(os.getenv("WATCH_MIN_CHANGE_PCT", "1.0"))
-    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "8.0"))
-    hard_heat = float(os.getenv("WATCH_HARD_HEAT_PCT", "9.5"))
+    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "12.0"))
+    hard_heat = float(os.getenv("WATCH_HARD_HEAT_PCT", "14.0"))
     min_tv = float(os.getenv("WATCH_MIN_TR_VALUE", "600000000"))
     min_vol = float(os.getenv("WATCH_MIN_VOLUME", "30000"))
     max_spread_pct = float(os.getenv("WATCH_MAX_SPREAD_PCT", "0.35"))
