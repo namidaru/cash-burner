@@ -726,6 +726,135 @@ def build_watchlist() -> List[str]:
     src_map: Dict[str, str] = {}
     meta: List[str] = []
     raw_by_sym: Dict[str, Dict[str, Any]] = {}
+    source_seen: Dict[str, set[str]] = {}
+
+    def _add_candidate(it: Dict[str, Any], source: str):
+        sym = _parse_sym(it)
+        if not sym:
+            return
+        source_seen.setdefault(sym, set()).add(source)
+        if sym not in raw_by_sym:
+            raw_by_sym[sym] = it
+        elif source in ("condition", "strength"):
+            # condition/strength row는 quote 필드가 더 풍부한 경우가 많아 우선 반영
+            raw_by_sym[sym] = it
+
+        if "condition" in source_seen[sym]:
+            src_map[sym] = "condition"
+        elif "strength" in source_seen[sym]:
+            src_map[sym] = "strength"
+        else:
+            src_map[sym] = "volume_rank"
+
+    if _radar_mode_enabled():
+        radar_markets = [m.strip() for m in os.getenv("RADAR_VOLUME_MARKETS", os.getenv("VOLUME_RANK_MARKETS", "J")).split(",") if m.strip()]
+        radar_pool = int(os.getenv("RADAR_VOLUME_TOPK", "100"))
+        strength_markets = [m.strip() for m in os.getenv("RADAR_STRENGTH_MARKETS", os.getenv("RANK_MARKETS", "J,NX")).split(",") if m.strip()]
+        strength_pool = int(os.getenv("RADAR_STRENGTH_TOPK", "120"))
+        cond_pool = int(os.getenv("RADAR_CONDITION_TOPK", "80"))
+        src_counts = {"volume_rank": 0, "strength": 0, "condition": 0}
+        dropped = {"price": 0, "chg": 0, "heat": 0, "tv": 0, "vol": 0, "spread": 0, "score": 0}
+        scored: List[Tuple[float, str]] = []
+
+        for m in radar_markets:
+            rows, dbg = fetch_volume_rank(m)
+            meta.extend(dbg)
+            if radar_pool > 0:
+                rows = rows[:radar_pool]
+            for it in rows:
+                before = len(raw_by_sym)
+                _add_candidate(it, "volume_rank")
+                if len(raw_by_sym) > before:
+                    src_counts["volume_rank"] += 1
+
+        for m in strength_markets:
+            rows, dbg = fetch_strength_rank(m)
+            meta.extend(dbg)
+            if strength_pool > 0:
+                rows = rows[:strength_pool]
+            for it in rows:
+                before = len(raw_by_sym)
+                _add_candidate(it, "strength")
+                if len(raw_by_sym) > before:
+                    src_counts["strength"] += 1
+
+        if seqs:
+            try:
+                cond_syms = scan_conditions(seqs)
+                if cond_pool > 0:
+                    cond_syms = cond_syms[:cond_pool]
+                items = multi_quote(cond_syms) if cond_syms else []
+            except Exception as e:
+                meta.append(f"cond err({type(e).__name__})")
+                items = []
+            for it in items:
+                before = len(raw_by_sym)
+                _add_candidate(it, "condition")
+                if len(raw_by_sym) > before:
+                    src_counts["condition"] += 1
+
+        for sym, it in raw_by_sym.items():
+            px = _parse_price(it)
+            if (min_price > 0 and px > 0 and px < min_price) or (max_price > 0 and px > max_price):
+                dropped["price"] += 1
+                continue
+
+            chg = _parse_float(it, "prdy_ctrt", 0.0)
+            if chg > 3.0:
+                dropped["heat"] += 1
+                continue
+            if chg < min_chg or chg > max_chg:
+                dropped["chg"] += 1
+                continue
+
+            tv = _parse_float(it, "acml_tr_pbmn", 0.0)
+            if tv > 0 and tv < min_tv:
+                dropped["tv"] += 1
+                continue
+
+            vol = _parse_float(it, "acml_vol", 0.0)
+            if vol > 0 and vol < 50000:
+                dropped["vol"] += 1
+                continue
+
+            spread_pct = _parse_spread_pct(it, max_spread_pct * 0.8)
+            if spread_pct >= max_spread_pct:
+                dropped["spread"] += 1
+                continue
+
+            momentum_score = chg
+            liquidity_score = math.log1p(max(tv, 0.0))
+            volume_score = math.log1p(max(vol, 0.0))
+            volume_accel = min(max(volume_acceleration(it), 0.0), 3.0)
+
+            score = (
+                (momentum_score * 2.0)
+                + (liquidity_score * 0.7)
+                + (volume_score * 0.3)
+                + (volume_accel * 1.8)
+                - (spread_pct * 2.5)
+            )
+            if not math.isfinite(score):
+                dropped["score"] += 1
+                continue
+            scored.append((score, sym))
+
+        scored.sort(reverse=True)
+        out = [sym for _, sym in scored[:want_n]]
+        if not out:
+            fb = _fallback_symbols()[:want_n]
+            _LAST_BUILD_META = f"radar_volume empty drop={dropped} -> fallback"
+            _LAST_SOURCE_MAP = {sym: "fallback" for sym in fb}
+            return fb
+
+        _LAST_BUILD_META = (
+            f"radar_combo markets={radar_markets} pool={len(raw_by_sym)} selected={len(out)} "
+            f"volume_rank={src_counts['volume_rank']} strength={src_counts['strength']} condition={src_counts['condition']} "
+            f"drop_price={dropped['price']} drop_chg={dropped['chg']} drop_heat={dropped['heat']} "
+            f"drop_tv={dropped['tv']} drop_vol={dropped['vol']} drop_spread={dropped['spread']} drop_score={dropped['score']}"
+        )
+        _LAST_SOURCE_MAP = {sym: src_map.get(sym, "volume_rank") for sym in out}
+        return out
 
     if _radar_mode_enabled():
         radar_markets = [m.strip() for m in os.getenv("RADAR_VOLUME_MARKETS", os.getenv("VOLUME_RANK_MARKETS", "J")).split(",") if m.strip()]
@@ -811,19 +940,13 @@ def build_watchlist() -> List[str]:
         rows, dbg = fetch_volume_rank(m)
         meta.extend(dbg)
         for it in rows:
-            sym = _parse_sym(it)
-            if sym and sym not in raw_by_sym:
-                raw_by_sym[sym] = it
-                src_map[sym] = "volume_rank"
+            _add_candidate(it, "volume_rank")
 
     for m in markets:
         rows, dbg = fetch_strength_rank(m)
         meta.extend(dbg)
         for it in rows:
-            sym = _parse_sym(it)
-            if sym and sym not in raw_by_sym:
-                raw_by_sym[sym] = it
-                src_map[sym] = "strength"
+            _add_candidate(it, "strength")
 
     if seqs:
         try:
@@ -833,10 +956,7 @@ def build_watchlist() -> List[str]:
             meta.append(f"cond err({type(e).__name__})")
             items = []
         for it in items:
-            sym = _parse_sym(it)
-            if sym and sym not in raw_by_sym:
-                raw_by_sym[sym] = it
-                src_map[sym] = "condition"
+            _add_candidate(it, "condition")
 
     if not raw_by_sym:
         fb = _fallback_symbols()[:want_n]

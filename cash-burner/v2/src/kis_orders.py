@@ -12,6 +12,10 @@ PATH_BUYABLE = "/uapi/domestic-stock/v1/trading/inquire-psbl-order"
 TRID_SELLABLE = "TTTC8408R"
 PATH_SELLABLE = "/uapi/domestic-stock/v1/trading/inquire-psbl-sell"
 
+# 잔고/예수금조회 (계좌 전체 주문가능금액 확인용)
+TRID_BALANCE = "TTTC8434R"
+PATH_BALANCE = "/uapi/domestic-stock/v1/trading/inquire-balance"
+
 # 현금주문 (문서 기준)
 TRID_SELL = "TTTC0011U"
 TRID_BUY  = "TTTC0012U"
@@ -83,6 +87,66 @@ def _extract_buyable_cash_strict(payload: Dict[str, Any]) -> float:
     )
 
 
+def _extract_account_cash_from_balance(payload: Dict[str, Any]) -> float:
+    """계좌 전체 기준 주문가능금액을 잔고조회 응답에서 추출한다."""
+    output2 = payload.get("output2")
+    rows: list[Dict[str, Any]] = []
+    if isinstance(output2, dict):
+        rows.append(output2)
+    elif isinstance(output2, list):
+        rows.extend([it for it in output2 if isinstance(it, dict)])
+
+    if not rows:
+        out = payload.get("output")
+        if isinstance(out, dict):
+            rows.append(out)
+
+    if not rows:
+        raise ValueError(
+            f"account_cash_parse_error: missing output2/output(dict), top_keys={sorted(payload.keys())[:12]}"
+        )
+
+    cash_keys = (
+        "dnca_tot_amt", "DNCA_TOT_AMT",  # 예수금총금액
+        "ord_psbl_cash", "ORD_PSBL_CASH",  # 주문가능현금
+        "prvs_rcdl_excc_amt", "PRVS_RCDL_EXCC_AMT",  # D+2 추정가능현금
+    )
+
+    for k in cash_keys:
+        for row in rows:
+            val = _to_float(row.get(k))
+            if val is not None:
+                return val
+
+    sample_keys = sorted({k for row in rows for k in row.keys()})[:24]
+    raise ValueError(
+        f"account_cash_parse_error: no cash key found, output_keys={sample_keys}"
+    )
+
+
+def account_buying_power(symbol: str = "005930", ord_dvsn: str = "01", price: str = "0") -> float:
+    cano, prdt = split_account(ACC_NO)
+    params = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": prdt,
+        "AFHR_FLPR_YN": "N",
+        "OFL_YN": "",
+        "INQR_DVSN": "02",
+        "UNPR_DVSN": "01",
+        "FUND_STTL_ICLD_YN": "Y",
+        "FNCG_AMT_AUTO_RDPT_YN": "N",
+        "PRCS_DVSN": "00",
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": "",
+    }
+    j = request("GET", PATH_BALANCE, TRID_BALANCE, params=params)
+    try:
+        return _extract_account_cash_from_balance(j)
+    except ValueError:
+        # 잔고조회 응답 형식이 예상과 다르면 기존 per-symbol 조회로 폴백
+        return buyable_cash(symbol=symbol, ord_dvsn=ord_dvsn, price=price)
+
+
 def buyable_cash(symbol: str, ord_dvsn: str="01", price: str="0") -> float:
     cano, prdt = split_account(ACC_NO)
     params = {
@@ -116,9 +180,6 @@ def sellable_qty(symbol: str) -> int:
             return int(n)
     return 0
 
-
-def account_buying_power(symbol: str = "005930", ord_dvsn: str = "01", price: str = "0") -> float:
-    return buyable_cash(symbol=symbol, ord_dvsn=ord_dvsn, price=price)
 
 
 def order_cash(side: str, symbol: str, qty: int, ord_dvsn: str="01", ord_unpr: str="0") -> Dict[str,Any]:

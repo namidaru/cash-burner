@@ -176,6 +176,8 @@ class EngineReal:
         self.close_early_score_min = float(os.getenv("CLOSE_EARLY_SCORE_MIN", "112"))
         self.early_trv_short_sec = float(os.getenv("EARLY_TRV_SHORT_SEC", "60"))
         self.early_trv_long_sec = float(os.getenv("EARLY_TRV_LONG_SEC", "300"))
+        if not os.getenv("TICK_HISTORY_SEC", "").strip():
+            self.tick_history_sec = max(self.tick_history_sec, self.early_trv_long_sec + 20.0)
         self.early_dd_ref_pct = float(os.getenv("EARLY_DD_REF_PCT", "1.2"))
         self.early_new_high_cooldown_sec = float(os.getenv("EARLY_NEW_HIGH_COOLDOWN_SEC", "10"))
         self.early_new_high_window_sec = float(os.getenv("EARLY_NEW_HIGH_WINDOW_SEC", "300"))
@@ -312,9 +314,9 @@ class EngineReal:
 
     def _effective_buying_power(self) -> float:
         try:
-            return self._buyable_cash(self.health_cash_symbol)
-        except Exception:
             return self._account_buying_power()
+        except Exception:
+            return self._buyable_cash(self.health_cash_symbol)
 
     def _cooldown_for_exit_reason(self, reason: str, fallback_sec: float) -> float:
         r = (reason or "").upper()
@@ -744,6 +746,14 @@ class EngineReal:
     def _window_stats(self, dq: Deque[Tuple[float, float, float]], ts_epoch: float, sec: float) -> tuple[float, float, int]:
         st = ts_epoch - sec
         return self._window_stats_between(dq, st, ts_epoch)
+
+    def _tick_keep_sec(self) -> float:
+        return max(
+            float(self.window_sec),
+            float(self.tick_history_sec),
+            float(self.early_trv_long_sec) + 5.0,
+            10.0,
+        )
 
     def _update_flow_bucket(self, sym: str, ts_epoch: float, price: float, vol: float, is_cum_vol: bool):
         if self.bucket_sec <= 0:
@@ -1608,7 +1618,7 @@ class EngineReal:
         ret10, trv10, _ = self._window_stats(dq, ts_epoch, 10.0)
         ret5, trv5, _ = self._window_stats(dq, ts_epoch, 5.0)
         depth_ratio = self._depth3_ratio(orderbook) if orderbook else 0.0
-        ofi = self.compute_ofi(sym)
+        ofi, _ofi_trv, _buy_vol, _sell_vol = self._compute_ofi_window(dq, ts_epoch, 10.0)
         return {
             "ret10": ret10,
             "ret5": ret5,
@@ -1854,7 +1864,8 @@ class EngineReal:
         first_ts = self.symbol_first_trade_ts.get(sym)
         if (first_ts is None) or (prev_bucket_ts > 0 and (ts_epoch - prev_bucket_ts) > self.first_trade_reset_gap_sec):
             self.symbol_first_trade_ts[sym] = ts_epoch
-        while dq and ts_epoch - dq[0][0] > self.window_sec:
+        keep_sec = self._tick_keep_sec()
+        while dq and ts_epoch - dq[0][0] > keep_sec:
             dq.popleft()
 
         ret, trv, tick_count = self._window_stats(dq, ts_epoch, float(self.window_sec))
