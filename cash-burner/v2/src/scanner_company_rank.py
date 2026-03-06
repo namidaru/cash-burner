@@ -770,6 +770,7 @@ def build_watchlist() -> List[str]:
     min_chg = float(os.getenv("WATCH_MIN_CHANGE_PCT", "1.0"))
     max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "12.0"))
     hard_heat = float(os.getenv("WATCH_HARD_HEAT_PCT", "14.0"))
+    soft_heat = float(os.getenv("WATCH_SOFT_HEAT_PCT", "10.5"))
     min_tv = float(os.getenv("WATCH_MIN_TR_VALUE", "600000000"))
     min_vol = float(os.getenv("WATCH_MIN_VOLUME", "30000"))
     max_spread_pct = float(os.getenv("WATCH_MAX_SPREAD_PCT", "0.35"))
@@ -881,12 +882,17 @@ def build_watchlist() -> List[str]:
             volume_score = math.log1p(max(vol, 0.0))
             volume_accel = min(max(volume_acceleration(it), 0.0), 3.0)
 
+            heat_penalty = 0.0
+            if chg > soft_heat:
+                heat_penalty = min(4.5, (chg - soft_heat) * 0.9)
+
             score = (
                 (momentum_score * 2.0)
                 + (liquidity_score * 0.7)
                 + (volume_score * 0.3)
                 + (volume_accel * 1.8)
                 - (spread_pct * 2.5)
+                - heat_penalty
             )
             if not math.isfinite(score):
                 dropped["score"] += 1
@@ -906,7 +912,7 @@ def build_watchlist() -> List[str]:
             f"radar_combo markets={radar_markets} pool={len(raw_by_sym)} selected={len(out)} "
             f"volume_rank={src_counts['volume_rank']} strength={src_counts['strength']} condition={src_counts['condition']} "
             f"drop_price={dropped['price']} drop_chg={dropped['chg']} drop_heat={dropped['heat']} "
-            f"drop_tv={dropped['tv']} drop_vol={dropped['vol']} drop_spread={dropped['spread']} drop_score={dropped['score']}"
+            f"drop_tv={dropped['tv']} drop_vol={dropped['vol']} drop_spread={dropped['spread']} drop_score={dropped['score']} soft_heat={soft_heat:.1f}"
         )
         _LAST_SOURCE_MAP = {sym: src_map.get(sym, "volume_rank") for sym in out}
         _emit_watch_status(len(raw_by_sym), len(out), want_n, dropped, scored, len(raw_by_sym))
@@ -992,12 +998,17 @@ def build_watchlist() -> List[str]:
         volume_score = math.log1p(max(vol, 0.0))
         volume_accel = min(max(volume_acceleration(it), 0.0), 3.0)
 
+        heat_penalty = 0.0
+        if chg > soft_heat:
+            heat_penalty = min(4.5, (chg - soft_heat) * 0.9)
+
         score = (
             (momentum_score * 2.0)
             + (liquidity_score * 0.7)
             + (volume_score * 0.3)
             + (volume_accel * 1.8)
             - (spread_pct * 2.5)
+            - heat_penalty
         )
         if not math.isfinite(score):
             dropped["score"] += 1
@@ -1023,7 +1034,7 @@ def build_watchlist() -> List[str]:
     _LAST_BUILD_META = (
         f"simple_rest pool={len(raw_by_sym)} quote={len(by_sym_q)} selected={len(out)} "
         f"drop_price={dropped['price']} drop_chg={dropped['chg']} drop_heat={dropped['heat']} "
-        f"drop_tv={dropped['tv']} drop_vol={dropped['vol']} drop_spread={dropped['spread']} drop_score={dropped['score']}"
+        f"drop_tv={dropped['tv']} drop_vol={dropped['vol']} drop_spread={dropped['spread']} drop_score={dropped['score']} soft_heat={soft_heat:.1f}"
     )
     _LAST_SOURCE_MAP = {sym: src_map.get(sym, "rest") for sym in out}
     _emit_watch_status(len(raw_by_sym), len(out), want_n, dropped, scored, len(by_sym_q))

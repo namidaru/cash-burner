@@ -68,6 +68,7 @@ class EngineSimple:
         self.buy_trv10_min = float(os.getenv("BUY_TRV10_MIN", "30000000"))
         self.buy_ofi_min = float(os.getenv("BUY_OFI_MIN", "1.4"))
         self.buy_imb_min = float(os.getenv("BUY_IMB_MIN", "0.60"))
+        self.buy_spread_max_bps = float(os.getenv("BUY_SPREAD_MAX_BPS", "35"))
         self.pullback_pct = float(os.getenv("PULLBACK_PCT", "0.65"))
         self.pullback_rebound_pct = float(os.getenv("PULLBACK_REBOUND_PCT", "0.18"))
         self.vi_guard_pct = float(os.getenv("VI_GUARD_PCT", "0.25"))
@@ -79,7 +80,15 @@ class EngineSimple:
         self.trail_drop_pct = float(os.getenv("TRAIL_DROP_PCT", "2.2"))
         self.max_hold_sec = float(os.getenv("MAX_HOLD_SEC", "240"))
         self.exit_grace_sec = float(os.getenv("EXIT_GRACE_SEC", "3.0"))
+        self.take_profit_grace_sec = float(os.getenv("TAKE_PROFIT_GRACE_SEC", "1.5"))
+        self.stop_loss_early_grace_sec = float(os.getenv("STOP_LOSS_EARLY_GRACE_SEC", "3.0"))
+        self.stop_loss_early_relax_mult = float(os.getenv("STOP_LOSS_EARLY_RELAX_MULT", "1.6"))
+        self.stop_loss_emergency_pct = float(os.getenv("STOP_LOSS_EMERGENCY_PCT", "4.5"))
         self.cooldown_sec = float(os.getenv("COOLDOWN_SEC", "90"))
+
+        self.entry_chase_dayrise_pct = float(os.getenv("ENTRY_CHASE_DAYRISE_PCT", "15.0"))
+        self.entry_chase_high_near_pct = float(os.getenv("ENTRY_CHASE_HIGH_NEAR_PCT", "0.10"))
+        self.entry_chase_penalty_dayrise_pct = float(os.getenv("ENTRY_CHASE_PENALTY_DAYRISE_PCT", "12.0"))
 
         self.health_check_sec = float(os.getenv("HEALTH_CHECK_SEC", "1800"))
         self.health_cash_symbol = os.getenv("HEALTH_CASH_SYMBOL", "005930").strip() or "005930"
@@ -259,6 +268,17 @@ class EngineSimple:
             return 1.0
         return bid / ask
 
+    def _spread_bps(self, sym: str, price: float) -> float:
+        ob = self.book.get(sym) or {}
+        ask1 = _f(ob.get("ASKP1")) + _f(ob.get("askp1"))
+        bid1 = _f(ob.get("BIDP1")) + _f(ob.get("bidp1"))
+        if ask1 <= 0 or bid1 <= 0:
+            return 0.0
+        mid = (ask1 + bid1) / 2.0
+        if mid <= 0:
+            return 0.0
+        return (ask1 - bid1) / mid * 10000.0
+
     def _pullback_rebound(self, dq: Deque[Tuple[float, float, float]], now: float, price: float) -> float:
         high30 = max((px for t, px, _ in dq if (now - t) <= 30.0), default=price)
         low10 = min((px for t, px, _ in dq if (now - t) <= 10.0), default=price)
@@ -332,6 +352,7 @@ class EngineSimple:
         ofi = self._compute_ofi_window(dq, ts_epoch, 10.0)
         imb = self._imbalance(sym)
         depth = self._depth_ratio(sym)
+        spread_bps = self._spread_bps(sym, price)
         dayrise = self._day_rise_pct(sym, price)
         accel = trv10 / max(1.0, trv30 / 3.0)
         pull_rebound = self._pullback_rebound(dq, ts_epoch, price)
@@ -355,7 +376,7 @@ class EngineSimple:
         penalty_dayrise = 0.0
         if dayrise > self.entry_block_dayrise_pct:
             # soft penalty: 과열 구간 진입을 억제하되 완전 무력화는 방지
-            penalty_dayrise = min(22.0, (dayrise - self.entry_block_dayrise_pct) * 3.0)
+            penalty_dayrise = min(34.0, (dayrise - self.entry_block_dayrise_pct) * 4.2)
 
         penalty_vi = 0.0
         if vi_gap <= self.vi_guard_pct:
@@ -363,8 +384,13 @@ class EngineSimple:
 
         high20 = max((px for t, px, _ in dq if (ts_epoch - t) <= 20.0), default=price)
         penalty_chase = 0.0
-        if high20 > 0 and price >= high20 * 0.999 and pull_rebound <= 0.0:
-            penalty_chase = 6.0
+        near_high = (high20 > 0 and price >= high20 * 0.999)
+        if near_high and pull_rebound <= 0.0:
+            penalty_chase = 5.0 + (7.0 if dayrise >= self.entry_chase_penalty_dayrise_pct else 0.0)
+            if ret5 < self.buy_ret5_min:
+                penalty_chase += 4.0
+            if spread_bps > (self.buy_spread_max_bps * 0.8):
+                penalty_chase += min(5.0, (spread_bps - self.buy_spread_max_bps * 0.8) * 0.25)
 
         penalty_score = penalty_dayrise + penalty_vi + penalty_chase
         score = score_pos - penalty_score
@@ -397,9 +423,13 @@ class EngineSimple:
             "ofi": ofi,
             "imb": imb,
             "depth_ratio": depth,
+            "spread_bps": spread_bps,
             "dayrise": dayrise,
             "pull_rebound": pull_rebound,
             "vi_gap": vi_gap,
+            "recent_high": high20,
+            "recent_high_gap_pct": ((high20 - price) / high20 * 100.0) if high20 > 0 else 0.0,
+            "near_recent_high": 1.0 if near_high else 0.0,
             "score_pos": score_pos,
             "score_pen": penalty_score,
             "contrib_pos": contrib_pos,
@@ -418,11 +448,21 @@ class EngineSimple:
         if ts_epoch < self.cooldown_until.get(sym, 0.0):
             return False, f"cooldown<{self.cooldown_until[sym]-ts_epoch:.0f}s"
         if metrics.get("dayrise", 0.0) >= self.entry_hard_dayrise_block_pct:
-            return False, f"dayrise_hard>{self.entry_hard_dayrise_block_pct:.1f}"
-        if metrics.get("trv10", 0.0) < max(1.0, self.buy_trv10_min * 0.5):
-            return False, "trv10_too_low"
+            return False, "gate_dayrise_hard"
+        if metrics.get("trv10", 0.0) < max(1.0, self.buy_trv10_min):
+            return False, "gate_trv10"
+        if metrics.get("ret10", 0.0) < self.buy_ret10_min:
+            return False, "gate_ret10"
+        if metrics.get("spread_bps", 0.0) > self.buy_spread_max_bps:
+            return False, "gate_spread"
+        ofi_ok = metrics.get("ofi", 0.0) >= self.buy_ofi_min
+        imb_ok = metrics.get("imb", 0.0) >= self.buy_imb_min
+        if not (ofi_ok or imb_ok):
+            return False, "gate_ofi_imb"
         if score < self.entry_score_threshold:
-            return False, f"score<{self.entry_score_threshold:.1f}"
+            if abs(metrics.get("contrib_neg", {}).get("chase", 0.0)) >= 10.0:
+                return False, "chase_penalty_dominated"
+            return False, "score_too_low"
         self._score_pass_total += 1
         return True, "pass"
 
@@ -443,12 +483,28 @@ class EngineSimple:
         return min(self.position_pct, 0.12)
 
     def enter_position(self, sym: str, price: float, score: float, reasons: list[str], metrics: Dict[str, float], ts_epoch: float):
-        cash = self._effective_buying_power()
+        display_cash = self._refresh_orderable_cash(ts_epoch, use_fallback=False)
+        orderable_cash = self._refresh_orderable_cash(ts_epoch, use_fallback=True)
+        live_cash = self._effective_buying_power()
+        available_cash_source = "live"
+        if live_cash <= 0:
+            available_cash_source = "snapshot" if (orderable_cash or 0.0) > 0 else "fallback"
+        cash = live_cash if live_cash > 0 else float(orderable_cash or display_cash or 0.0)
         pct = self._position_pct_by_score(score)
-        qty = int((cash * pct) // max(1.0, price))
+        target_budget = cash * pct
+        qty = int(target_budget // max(1.0, price))
+        capped_qty_reason = ""
+        if qty <= 0 and target_budget > 0:
+            capped_qty_reason = "budget_below_lot"
+        self._log_diag(
+            ts_epoch,
+            sym,
+            "BUY_CASH",
+            f"display_cash={display_cash if display_cash is not None else -1:.0f} orderable_cash={orderable_cash if orderable_cash is not None else -1:.0f} live_cash={live_cash:.0f} effective_cash={cash:.0f} source={available_cash_source} target_budget={target_budget:.0f} qty={qty} cap={capped_qty_reason or '-'} cash_gap={(cash - float(orderable_cash or 0.0)):.0f}",
+        )
         if qty <= 0:
             self._skip_reason_counts["cash_short"] += 1
-            self._log_diag(ts_epoch, sym, "SKIP", f"cash_short cash={cash:.0f} price={price:.0f}")
+            self._log_diag(ts_epoch, sym, "SKIP", f"cash_short cash={cash:.0f} price={price:.0f} budget={target_budget:.0f} source={available_cash_source}")
             return
 
         reason = f"score={score:.1f} pct={pct:.2f} reasons={'|'.join(reasons[:5])}"
@@ -466,7 +522,7 @@ class EngineSimple:
             ts_epoch,
             sym,
             "BUY",
-            f"score={score:.1f} pos={self._top_factor_strings(metrics)[0]} neg={self._top_factor_strings(metrics)[1]} price={price:.0f} qty={qty} metrics=ret10={metrics.get('ret10',0.0):.2f},ret5={metrics.get('ret5',0.0):.2f},trv10={metrics.get('trv10',0.0):.0f},ofi={metrics.get('ofi',0.0):.2f},imb={metrics.get('imb',0.0):.2f},depth={metrics.get('depth_ratio',0.0):.2f},dayrise={metrics.get('dayrise',0.0):.2f}",
+            f"score={score:.1f} pos={self._top_factor_strings(metrics)[0]} neg={self._top_factor_strings(metrics)[1]} gate=trv10={metrics.get('trv10',0.0):.0f}/{self.buy_trv10_min:.0f},ret10={metrics.get('ret10',0.0):.2f}/{self.buy_ret10_min:.2f},ofi={metrics.get('ofi',0.0):.2f}/{self.buy_ofi_min:.2f},imb={metrics.get('imb',0.0):.2f}/{self.buy_imb_min:.2f},spread={metrics.get('spread_bps',0.0):.2f}/{self.buy_spread_max_bps:.2f},pass=1 price={price:.0f} qty={qty} est_notional={price*qty:.0f} cash={cash:.0f} metrics=ret5={metrics.get('ret5',0.0):.2f},spread={metrics.get('spread_bps',0.0):.2f},dayrise={metrics.get('dayrise',0.0):.2f},recent_high={metrics.get('recent_high',0.0):.0f},near_high={metrics.get('near_recent_high',0.0):.0f},pull_rebound={metrics.get('pull_rebound',0.0):.0f}",
         )
         self.notifier.send(
             title=f"✅ 단순모멘텀 매수 {sym}",
@@ -492,18 +548,24 @@ class EngineSimple:
         hold_sec = max(0.0, ts_epoch - p.entry_ts)
         reason = ""
 
-        # stop / take always active
-        if pnl_pct <= -abs(self.stop_loss_pct):
-            reason = "STOP_LOSS"
-        elif pnl_pct >= abs(self.take_profit_pct):
-            reason = "TAKE_PROFIT"
+        early_stop_pct = abs(self.stop_loss_pct) * max(1.0, self.stop_loss_early_relax_mult)
+        if hold_sec < self.stop_loss_early_grace_sec:
+            if pnl_pct <= -abs(self.stop_loss_emergency_pct):
+                reason = "stop_loss_panic"
+            elif pnl_pct <= -early_stop_pct:
+                reason = "stop_loss_early"
+        elif pnl_pct <= -abs(self.stop_loss_pct):
+            reason = "stop_loss_after_grace"
+
+        if not reason and hold_sec >= self.take_profit_grace_sec and pnl_pct >= abs(self.take_profit_pct):
+            reason = "take_profit_after_grace"
         elif hold_sec >= self.exit_grace_sec:
             # trailing / max_hold after grace
             trail_stop = p.max_price * (1.0 - abs(self.trail_drop_pct) / 100.0)
             if p.max_pnl_pct >= abs(self.trail_arm_pct) and price <= trail_stop:
-                reason = "TRAILING"
+                reason = "trail_stop"
             elif hold_sec >= self.max_hold_sec:
-                reason = "MAX_HOLD"
+                reason = "max_hold"
 
         if not reason:
             self._save_state()
@@ -534,7 +596,7 @@ class EngineSimple:
             ts_epoch,
             sym,
             "SELL",
-            f"reason={reason} pnl={pnl_pct:.2f}% hold={hold_sec:.1f}s max={p.max_pnl_pct:.2f}% min={p.min_pnl_pct:.2f}%",
+            f"reason={reason} hold={hold_sec:.1f}s pnl={pnl_pct:.2f}% peak={p.max_pnl_pct:.2f}% min={p.min_pnl_pct:.2f}% grace_stop={1 if hold_sec < self.stop_loss_early_grace_sec else 0} grace_take={1 if hold_sec < self.take_profit_grace_sec else 0}",
         )
         self.notifier.send(
             title=f"📉 단순모멘텀 매도 {sym}",
@@ -584,7 +646,7 @@ class EngineSimple:
                 ts_epoch,
                 sym,
                 "CAND",
-                f"score={score:.1f} pass={1 if ok else 0} why={why} pos={pos_s} neg={neg_s} metrics=ret10={metrics.get('ret10',0.0):.2f},ret5={metrics.get('ret5',0.0):.2f},trv10={metrics.get('trv10',0.0):.0f},ofi={metrics.get('ofi',0.0):.2f},imb={metrics.get('imb',0.0):.2f},depth={metrics.get('depth_ratio',0.0):.2f},dayrise={metrics.get('dayrise',0.0):.2f}",
+                f"score={score:.1f} pass={1 if ok else 0} why={why} gate=trv10={metrics.get('trv10',0.0):.0f}/{self.buy_trv10_min:.0f},ret10={metrics.get('ret10',0.0):.2f}/{self.buy_ret10_min:.2f},ofi={metrics.get('ofi',0.0):.2f}/{self.buy_ofi_min:.2f},imb={metrics.get('imb',0.0):.2f}/{self.buy_imb_min:.2f},spread={metrics.get('spread_bps',0.0):.2f}/{self.buy_spread_max_bps:.2f} pos={pos_s} neg={neg_s} metrics=ret5={metrics.get('ret5',0.0):.2f},depth={metrics.get('depth_ratio',0.0):.2f},spread={metrics.get('spread_bps',0.0):.2f},dayrise={metrics.get('dayrise',0.0):.2f},recent_high={metrics.get('recent_high',0.0):.0f},pull_rebound={metrics.get('pull_rebound',0.0):.0f}",
             )
 
         if not ok:
@@ -604,7 +666,7 @@ class EngineSimple:
         })
 
     def _operator_summary_runtime(self, watch_n: int, score_pass_rate: float) -> str:
-        hard_block = sum(v for k, v in self._gate_block_counts.items() if (not k.startswith("watch")) and (not k.startswith("score<")) and k != "pass")
+        hard_block = sum(v for k, v in self._gate_block_counts.items() if (not k.startswith("watch")) and k not in {"pass", "score_too_low", "chase_penalty_dominated"})
         watch_ok = watch_n >= max(3, self.max_positions * 2)
         if watch_n < max(3, self.max_positions):
             return "watch_small and scanner_overfiltered"
