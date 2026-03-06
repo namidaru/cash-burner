@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os, time
 from parser import extract_raw, parse_ws_raw_multi
-from engine_real import EngineReal
+from engine_simple import EngineSimple
 
 def parse_prefix_ts(line: str) -> float:
     if "\t" not in line:
@@ -16,7 +16,7 @@ def parse_prefix_ts(line: str) -> float:
         return time.time()
 
 def run_live(in_file: str, poll: float = 0.2):
-    eng = EngineReal()
+    eng = EngineSimple()
     while True:
         try:
             with open(in_file, "r", encoding="utf-8") as f:

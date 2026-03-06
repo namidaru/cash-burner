@@ -6,19 +6,14 @@ import time
 import threading
 from typing import List
 
-PAPER_TRADE_MODE = os.getenv("PAPER_TRADE_MODE", "1") == "1"
-
-def _set_mode_default_env(key: str, real_path: str, paper_path: str):
-    os.environ.setdefault(key, paper_path if PAPER_TRADE_MODE else real_path)
-
-_set_mode_default_env("OUT_FILE", os.path.join("data", "ws_dump.log"), os.path.join("data", "ws_dump_paper.log"))
-_set_mode_default_env("CONTROL_FILE", os.path.join("data", "ws_control.log"), os.path.join("data", "ws_control_paper.log"))
-_set_mode_default_env("LEDGER_FILE", os.path.join("data", "ledger_real.csv"), os.path.join("data", "ledger_paper.csv"))
-_set_mode_default_env("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"), os.path.join("data", "watchlist_paper.txt"))
-_set_mode_default_env("POSITION_STATE_FILE", os.path.join("data", "positions_real.json"), os.path.join("data", "positions_paper.json"))
-_set_mode_default_env("AUTO_POSITION_LOG_FILE", os.path.join("data", "auto_positions_real.csv"), os.path.join("data", "auto_positions_paper.csv"))
-_set_mode_default_env("SIGNAL_DIAG_FILE", os.path.join("data", "signal_diag.log"), os.path.join("data", "signal_diag_paper.log"))
-_set_mode_default_env("WATCHLIST_DEBUG", os.path.join("data", "watchlist_debug.log"), os.path.join("data", "watchlist_debug_paper.log"))
+os.environ.setdefault("OUT_FILE", os.path.join("data", "ws_dump.log"))
+os.environ.setdefault("CONTROL_FILE", os.path.join("data", "ws_control.log"))
+os.environ.setdefault("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
+os.environ.setdefault("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
+os.environ.setdefault("POSITION_STATE_FILE", os.path.join("data", "positions_real.json"))
+os.environ.setdefault("AUTO_POSITION_LOG_FILE", os.path.join("data", "auto_positions_real.csv"))
+os.environ.setdefault("SIGNAL_DIAG_FILE", os.path.join("data", "signal_diag.log"))
+os.environ.setdefault("WATCHLIST_DEBUG", os.path.join("data", "watchlist_debug.log"))
 
 from scanner_company_rank import build_watchlist, get_last_build_meta, check_watchlist_integrity, get_last_source_map
 from quote_basic import ensure_prev_close
@@ -40,9 +35,9 @@ def _resolve_in_file() -> str:
 
 IN_FILE = _resolve_in_file()
 LIVE_POLL_SEC = float(os.getenv("LIVE_POLL_SEC", "0.2"))
-SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "10"))
+SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "2"))
 WATCHLIST_DEBUG = os.getenv("WATCHLIST_DEBUG", os.path.join("data", "watchlist_debug.log"))
-PREVCLOSE_WARMUP = os.getenv("PREVCLOSE_WARMUP", "0") == "1"
+PREVCLOSE_WARMUP = os.getenv("PREVCLOSE_WARMUP", "1") == "1"
 
 def _log(msg: str):
     try:
@@ -65,44 +60,6 @@ def _load_watchlist_file() -> List[str]:
 
 
 
-def _stabilize_watchlist(prev: List[str], new: List[str]) -> List[str]:
-    """전체 갈아끼움 대신 하위 일부만 교체해 신호 흔들림 완화."""
-    if not prev:
-        return new
-    if not new:
-        return prev
-
-    keep_n = int(os.getenv("WATCH_KEEP_TOP_N", "20"))
-    max_replace = int(os.getenv("WATCH_MAX_REPLACE", "10"))
-    want_n = int(os.getenv("WATCH_TOP_N", str(len(new))))
-
-    prev_cut = [s for s in prev[:want_n]]
-    new_cut = [s for s in new[:want_n]]
-
-    fixed = [s for s in prev_cut[:keep_n] if s in new_cut]
-    result = list(fixed)
-
-    for s in prev_cut[keep_n:]:
-        if s in result:
-            continue
-        result.append(s)
-
-    add_pool = [s for s in new_cut if s not in result]
-    replace_n = min(max_replace, len(add_pool))
-
-    if replace_n > 0:
-        removable_idx = [i for i in range(len(result) - 1, keep_n - 1, -1)]
-        for i in removable_idx[:replace_n]:
-            result[i] = add_pool.pop(0)
-
-    for s in new_cut:
-        if len(result) >= want_n:
-            break
-        if s not in result:
-            result.append(s)
-
-    return result[:want_n]
-
 def scanner_loop():
     _log("START scanner_company_rank mode")
 
@@ -112,10 +69,8 @@ def scanner_loop():
 
     while True:
         try:
-            raw_watch = build_watchlist()
-            watch = _stabilize_watchlist(last_watch, raw_watch)
-            _log(f"rank raw_watch n={len(raw_watch)} head={raw_watch[:10]}")
-            _log(f"rank stable_watch n={len(watch)} head={watch[:10]}")
+            watch = build_watchlist()
+            _log(f"rank watch n={len(watch)} head={watch[:10]}")
             integ = check_watchlist_integrity(watch)
             _log(
                 "rank integrity "
@@ -149,7 +104,16 @@ def scanner_loop():
                 if watch != last_watch:
                     write_watchlist(watch)
                     last_watch = watch
-                    _log("watchlist updated")
+                    _log(f"watch_update n={len(watch)}")
+                    _log(
+                        "watch_update_source "
+                        f"volume_rank={c_volume_rank if src_map else 0} "
+                        f"strength={c_strength if src_map else 0} "
+                        f"condition={c_condition if src_map else 0} "
+                        f"fallback={c_fallback if src_map else 0}"
+                    )
+                    if detail:
+                        _log(f"watch_update_meta {detail}")
                 else:
                     _log("watchlist unchanged")
             else:

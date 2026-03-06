@@ -10,13 +10,8 @@ APP_SECRET = os.getenv("KOREA_INVEST_APP_SECRET","")
 WS_URL = os.getenv("KIS_WS_URL", "ws://ops.koreainvestment.com:21000")
 BASE_URL = os.getenv("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443")
 
-PAPER_TRADE_MODE = os.getenv("PAPER_TRADE_MODE", "1") == "1"
-
-def _mode_default(real_path: str, paper_path: str) -> str:
-    return paper_path if PAPER_TRADE_MODE else real_path
-
 def _dated_out_file() -> str:
-    raw = os.getenv("OUT_FILE", _mode_default(os.path.join("data", "ws_dump.log"), os.path.join("data", "ws_dump_paper.log")))
+    raw = os.getenv("OUT_FILE", os.path.join("data", "ws_dump.log"))
     ymd = time.strftime("%Y%m%d")
     if "{date}" in raw:
         return raw.replace("{date}", ymd)
@@ -27,11 +22,9 @@ def _dated_out_file() -> str:
 
 
 OUT_FILE = _dated_out_file()
-CONTROL_FILE = os.getenv("CONTROL_FILE", _mode_default(os.path.join("data", "ws_control.log"), os.path.join("data", "ws_control_paper.log")))
-WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", _mode_default(os.path.join("data", "watchlist.txt"), os.path.join("data", "watchlist_paper.txt")))
-LEDGER_FILE = os.getenv("LEDGER_FILE", _mode_default(os.path.join("data", "ledger_real.csv"), os.path.join("data", "ledger_paper.csv")))
-PREOPEN_TRACK_MIN = int(os.getenv("PREOPEN_TRACK_MIN", "15"))
-PREOPEN_START_HHMM = int(os.getenv("PREOPEN_START_HHMM", "900"))
+CONTROL_FILE = os.getenv("CONTROL_FILE", os.path.join("data", "ws_control.log"))
+WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
+LEDGER_FILE = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
 
 RAW_TR_IDS = [t.strip() for t in os.getenv("TR_IDS", "H0STCNT0,H0STASP0").split(",") if t.strip()]
 ALLOWED_TR_IDS = {"H0STCNT0", "H0STASP0", "H0NXCNT0"}
@@ -41,6 +34,7 @@ POLL_WATCH_SEC = float(os.getenv("WATCH_POLL_SEC", "2.0"))
 MAX_SUB_BACKOFF_SEC = float(os.getenv("WS_SUB_BACKOFF_MAX_SEC", "60"))
 BASE_SUB_BACKOFF_SEC = float(os.getenv("WS_SUB_BACKOFF_BASE_SEC", "2"))
 MAX_ACTIVE_SUB_KEYS = int(os.getenv("WS_MAX_ACTIVE_SUB_KEYS", "50"))
+WATCH_REMOVE_DELAY_SEC = float(os.getenv("WATCH_REMOVE_DELAY_SEC", "0"))
 
 
 def _normalized_tr_ids(raw_ids: list[str]) -> tuple[list[str], list[str]]:
@@ -106,12 +100,6 @@ def read_watchlist() -> set[str]:
         return set()
 
 
-def _hhmm_now(ts_epoch: float | None = None) -> int:
-    if ts_epoch is None:
-        ts_epoch = time.time()
-    return int(time.strftime("%H%M", time.localtime(ts_epoch)))
-
-
 def _held_symbols_from_ledger() -> set[str]:
     qty_by_symbol: dict[str, int] = {}
     try:
@@ -166,41 +154,36 @@ class WSCapture:
         self.pending_subscribe: dict[tuple[str, str], float] = {}
         self.sub_blocked_until: dict[tuple[str, str], float] = {}
         self.sub_blocked_retry_exp: dict[tuple[str, str], int] = {}
-        self.last_sync_desired: set[str] = set()
+        self.last_sync_desired_symbols: set[str] = set()
+        self.last_sync_desired_keys: set[tuple[str, str]] = set()
         self.lock = threading.Lock()
-        self.preopen_day = ""
-        self.preopen_snapshot: set[str] = set()
         self.last_held_symbols: set[str] = set()
-
-    def _in_preopen_window(self, ts_epoch: float | None = None) -> bool:
-        hhmm = _hhmm_now(ts_epoch)
-        start_h = PREOPEN_START_HHMM // 100
-        start_m = PREOPEN_START_HHMM % 100
-        start_min = start_h * 60 + start_m
-        now_min = (hhmm // 100) * 60 + (hhmm % 100)
-        return start_min <= now_min < (start_min + PREOPEN_TRACK_MIN)
+        self.watch_remove_after: dict[str, float] = {}
 
     def _desired_symbols(self) -> set[str]:
-        today = time.strftime("%Y%m%d")
-        current_watchlist = read_watchlist()
+        now = time.time()
+        watch_now = read_watchlist()
 
-        if self.preopen_day != today:
-            self.preopen_day = today
-            self.preopen_snapshot = set()
-
-        if self._in_preopen_window():
-            if not self.preopen_snapshot and current_watchlist:
-                self.preopen_snapshot = set(current_watchlist)
-                _append(CONTROL_FILE, f"{_ts()}\tPREOPEN snapshot n={len(self.preopen_snapshot)}")
-            base = self.preopen_snapshot or current_watchlist
+        kept_watch: set[str] = set(watch_now)
+        if WATCH_REMOVE_DELAY_SEC > 0:
+            removed = self.last_sync_desired_symbols - watch_now
+            for sym in removed:
+                self.watch_remove_after.setdefault(sym, now + WATCH_REMOVE_DELAY_SEC)
+            for sym in watch_now:
+                self.watch_remove_after.pop(sym, None)
+            expired = [sym for sym, deadline in self.watch_remove_after.items() if deadline <= now]
+            for sym in expired:
+                self.watch_remove_after.pop(sym, None)
+            kept_watch |= set(self.watch_remove_after.keys())
         else:
-            base = current_watchlist
+            self.watch_remove_after.clear()
 
         held = _held_symbols_from_ledger()
         if held != self.last_held_symbols:
-            _append(CONTROL_FILE, f"{_ts()}\tHELD merge n={len(held)}")
+            _append(CONTROL_FILE, f"{_ts()}	HELD merge n={len(held)}")
             self.last_held_symbols = set(held)
-        return set(base) | held
+
+        return kept_watch | held
 
     def start(self):
         _ensure_dir(OUT_FILE)
@@ -295,7 +278,8 @@ class WSCapture:
                 self.pending_subscribe.clear()
                 self.sub_blocked_until.clear()
                 self.sub_blocked_retry_exp.clear()
-                self.last_sync_desired = set()
+                self.last_sync_desired_symbols = set()
+                self.last_sync_desired_keys = set()
                 _append(CONTROL_FILE, f"{_ts()}\tRECONNECT start")
                 try:
                     self.approval_key = get_approval_key()
@@ -472,10 +456,11 @@ class WSCapture:
 
             add_keys_ordered = [k for k in desired_key_seq if k not in self.subscribed_keys]
             sent_req = 0
-            if force or desired_keys != self.last_sync_desired or add_keys_ordered:
+            if force or desired_keys != self.last_sync_desired_keys or add_keys_ordered:
                 for sym, tr in add_keys_ordered:
                     sent_req += self._try_subscribe_key(sym, tr)
-                self.last_sync_desired = set(desired_keys)
+                self.last_sync_desired_keys = set(desired_keys)
+                self.last_sync_desired_symbols = set(desired_symbols)
 
             self._refresh_subscribed_symbols()
 
