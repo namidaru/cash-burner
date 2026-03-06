@@ -1,6 +1,10 @@
 # src/engine_real.py
 from __future__ import annotations
 
+# NOTE(deprecated): EngineReal is kept as a legacy reference engine only.
+# Production runtime is pinned to EngineSimple via runner_live.py.
+# Do not add new runtime entry paths here without an explicit migration plan.
+
 import os, time, math, sys, json
 from dataclasses import dataclass
 from collections import defaultdict, deque

@@ -16,7 +16,10 @@ DEFAULT_MRKT = os.getenv("FID_COND_MRKT_DIV_CODE_1", "J")
 ENTRY_BLOCK_DAYRISE_PCT = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "5.0"))
 
 # 거래대금(원) 너무 작은 종목은 제외(유동성 쓰레기 필터)
-MIN_TRADE_VALUE = float(os.getenv("WATCH_MIN_TR_VALUE", "1200000000"))  # 3억 기본(원하는대로 조절)
+MIN_TRADE_VALUE = float(os.getenv("WATCH_MIN_TR_VALUE", "600000000"))
+MIN_VOLUME = float(os.getenv("WATCH_MIN_VOLUME", "30000"))
+WATCH_SOFT_HEAT_PCT = float(os.getenv("WATCH_SOFT_HEAT_PCT", "2.5"))
+WATCH_HARD_HEAT_PCT = float(os.getenv("WATCH_HARD_HEAT_PCT", "9.5"))
 
 def chunk(lst: List[str], n: int):
     for i in range(0, len(lst), n):
@@ -60,7 +63,7 @@ def volume_acceleration(it: Dict[str, Any]) -> float:
 def score_item(it: Dict[str, Any]) -> float:
     """
     실전 수익형 워치리스트 점수:
-    - 과열(+3.5% 이상) 및 저유동 체결량은 제외 (score = -inf)
+    - 급등 초입은 감점 위주, 끝물 과열만 하드 제외
     - 거래대금(유동성) + 등락률(모멘텀) + 거래량을 섞어서 점수화
     - 거래대금이 너무 작으면 제외
 
@@ -73,9 +76,14 @@ def score_item(it: Dict[str, Any]) -> float:
         "stck_prdy_ctrt", "STCK_PRDY_CTRT"
     ], 0.0)
 
-    # 과열 차단(+3.5% 이상 즉시 제외, +5% 차단과 별도로 더 보수적으로 운용)
-    if r > 2.5 or r >= ENTRY_BLOCK_DAYRISE_PCT:
+    # 워치리스트는 초반 급등 포착이 목적이므로 soft/hard 이원화
+    # - hard: 정말 과열 구간은 제외
+    # - soft: 초반 급등은 감점만 적용
+    if r >= max(ENTRY_BLOCK_DAYRISE_PCT + 3.0, WATCH_HARD_HEAT_PCT):
         return float("-inf")
+    heat_penalty = 0.0
+    if r > WATCH_SOFT_HEAT_PCT:
+        heat_penalty = min(4.0, (r - WATCH_SOFT_HEAT_PCT) * 0.9)
 
     # 2) 거래대금/거래량 (유동성)
     tr_value = _get_first(it, [
@@ -89,7 +97,7 @@ def score_item(it: Dict[str, Any]) -> float:
     ], 0.0)
 
     # 체결량 하한 필터(너무 얇은 종목 제거)
-    if vol > 0 and vol < 50000:
+    if vol > 0 and vol < MIN_VOLUME:
         return float("-inf")
 
     # 유동성 하한 필터(거래대금 너무 적은 후보는 워치리스트에서 제외)
@@ -122,10 +130,12 @@ def score_item(it: Dict[str, Any]) -> float:
     liquidity_score = math.log1p(max(tr_value, 0.0))
 
     score = (
-        (accel * 3.0)
+        (max(0.0, r) * 0.8)
+        + (accel * 3.0)
         + (strength_score * 1.8)
         + (liquidity_score * 1.0)
         - spread_penalty
+        - heat_penalty
     )
 
     return score

@@ -388,8 +388,8 @@ def _passes_quality(item: Dict[str, Any], min_price: float, max_price: float, mi
     if st > 0 and (st < min_strength or st > max_strength):
         return False
 
-    min_accel = float(os.getenv("WATCH_MIN_VOLUME_ACCEL", "1.4"))
-    if volume_acceleration(item) <= min_accel:
+    min_accel = float(os.getenv("WATCH_MIN_VOLUME_ACCEL", "0.8"))
+    if volume_acceleration(item) < min_accel:
         return False
 
     return True
@@ -716,8 +716,10 @@ def build_watchlist() -> List[str]:
     min_price = float(os.getenv("WATCH_MIN_PRICE", "1000"))
     max_price = float(os.getenv("WATCH_MAX_PRICE", "200000"))
     min_chg = float(os.getenv("WATCH_MIN_CHANGE_PCT", "1.0"))
-    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "6.0"))
-    min_tv = float(os.getenv("WATCH_MIN_TR_VALUE", "1200000000"))
+    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "8.0"))
+    hard_heat = float(os.getenv("WATCH_HARD_HEAT_PCT", "9.5"))
+    min_tv = float(os.getenv("WATCH_MIN_TR_VALUE", "600000000"))
+    min_vol = float(os.getenv("WATCH_MIN_VOLUME", "30000"))
     max_spread_pct = float(os.getenv("WATCH_MAX_SPREAD_PCT", "0.35"))
 
     markets = [m.strip() for m in os.getenv("RANK_MARKETS", "J,NX").split(",") if m.strip()]
@@ -800,7 +802,7 @@ def build_watchlist() -> List[str]:
                 continue
 
             chg = _parse_float(it, "prdy_ctrt", 0.0)
-            if chg > 7.0:
+            if chg > hard_heat:
                 dropped["heat"] += 1
                 continue
             if chg < min_chg or chg > max_chg:
@@ -813,7 +815,7 @@ def build_watchlist() -> List[str]:
                 continue
 
             vol = _parse_float(it, "acml_vol", 0.0)
-            if vol > 0 and vol < 50000:
+            if vol > 0 and vol < min_vol:
                 dropped["vol"] += 1
                 continue
 
@@ -908,7 +910,7 @@ def build_watchlist() -> List[str]:
             continue
 
         chg = _parse_float(it, "prdy_ctrt", 0.0)
-        if chg > 7.0:
+        if chg > hard_heat:
             dropped["heat"] += 1
             continue
         if chg < min_chg or chg > max_chg:
@@ -921,7 +923,7 @@ def build_watchlist() -> List[str]:
             continue
 
         vol = _parse_float(it, "acml_vol", 0.0)
-        if vol > 0 and vol < 50000:
+        if vol > 0 and vol < min_vol:
             dropped["vol"] += 1
             continue
 
