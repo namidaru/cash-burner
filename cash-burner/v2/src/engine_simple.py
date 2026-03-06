@@ -60,6 +60,7 @@ class EngineSimple:
         self.entry_score_threshold = float(os.getenv("ENTRY_SCORE_THRESHOLD", "85"))
         self.entry_score_strong = float(os.getenv("ENTRY_SCORE_STRONG", "120"))
         self.entry_block_dayrise_pct = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "7.0"))
+        self.entry_hard_dayrise_block_pct = float(os.getenv("ENTRY_HARD_DAYRISE_BLOCK_PCT", "18.0"))
 
         self.buy_ret10_min = float(os.getenv("BUY_RET10_MIN", "0.30"))
         self.buy_ret5_min = float(os.getenv("BUY_RET5_MIN", "0.15"))
@@ -283,27 +284,54 @@ class EngineSimple:
         vi_std = _f((self.book.get(sym) or {}).get("VI_STND_PRC"))
         vi_gap = abs(price - vi_std) / vi_std * 100.0 if vi_std > 0 else 999.0
 
-        score = 0.0
-        score += ret10 * 60.0
-        score += math.log1p(max(0.0, trv10)) * 5.0
-        score += (imb - 0.5) * 120.0
-        score += (depth - 1.0) * 20.0
-        score += max(0.0, accel - 1.0) * 15.0
-        score += pull_rebound * 12.0
+        # ---- positive groups ----
+        momentum_score = (ret10 * 45.0) + (ret5 * 25.0)
+        liquidity_score = (math.log1p(max(0.0, trv10)) * 4.0) + (max(0.0, accel - 1.0) * 12.0)
+        ofi_boost = min(35.0, max(0.0, ofi - 1.0) * 18.0)
+        imbalance_boost = max(-22.0, min(22.0, (imb - 0.5) * 90.0))
+        depth_boost = max(-16.0, min(16.0, (depth - 1.0) * 16.0))
+        orderflow_score = ofi_boost + imbalance_boost + depth_boost
+        structure_score = pull_rebound * 10.0
 
+        positive_total = momentum_score + liquidity_score + orderflow_score + structure_score
+        score_pos = positive_total * self._session_weight(ts_epoch)
+
+        # ---- penalties ----
+        penalty_dayrise = 0.0
         if dayrise > self.entry_block_dayrise_pct:
-            score -= (dayrise - self.entry_block_dayrise_pct) * 12.0
-        if vi_gap <= self.vi_guard_pct:
-            score -= 20.0
+            # soft penalty: 과열 구간 진입을 억제하되 완전 무력화는 방지
+            penalty_dayrise = min(22.0, (dayrise - self.entry_block_dayrise_pct) * 3.0)
 
-        score *= self._session_weight(ts_epoch)
+        penalty_vi = 0.0
+        if vi_gap <= self.vi_guard_pct:
+            penalty_vi = min(12.0, (self.vi_guard_pct - vi_gap + 0.02) * 90.0)
+
+        high20 = max((px for t, px, _ in dq if (ts_epoch - t) <= 20.0), default=price)
+        penalty_chase = 0.0
+        if high20 > 0 and price >= high20 * 0.999 and pull_rebound <= 0.0:
+            penalty_chase = 6.0
+
+        penalty_score = penalty_dayrise + penalty_vi + penalty_chase
+        score = score_pos - penalty_score
+
+        contrib_pos = {
+            "momentum": momentum_score,
+            "liquidity": liquidity_score,
+            "orderflow": orderflow_score,
+            "rebound": structure_score,
+        }
+        contrib_neg = {
+            "dayrise": -penalty_dayrise,
+            "vi": -penalty_vi,
+            "chase": -penalty_chase,
+        }
 
         reasons = [
-            f"ret10={ret10:.2f}",
-            f"ret5={ret5:.2f}",
-            f"trv10={trv10:.0f}",
-            f"ofi={ofi:.2f}",
-            f"imb={imb:.2f}",
+            f"mom={momentum_score:.1f}",
+            f"liq={liquidity_score:.1f}",
+            f"flow={orderflow_score:.1f}",
+            f"reb={structure_score:.1f}",
+            f"pen={penalty_score:.1f}",
         ]
         metrics = {
             "ret10": ret10,
@@ -317,6 +345,10 @@ class EngineSimple:
             "dayrise": dayrise,
             "pull_rebound": pull_rebound,
             "vi_gap": vi_gap,
+            "score_pos": score_pos,
+            "score_pen": penalty_score,
+            "contrib_pos": contrib_pos,
+            "contrib_neg": contrib_neg,
         }
         return score, reasons, metrics
 
@@ -329,21 +361,22 @@ class EngineSimple:
             return False, f"max_positions={len(self.pos)}"
         if ts_epoch < self.cooldown_until.get(sym, 0.0):
             return False, f"cooldown<{self.cooldown_until[sym]-ts_epoch:.0f}s"
+        if metrics.get("dayrise", 0.0) >= self.entry_hard_dayrise_block_pct:
+            return False, f"dayrise_hard>{self.entry_hard_dayrise_block_pct:.1f}"
+        if metrics.get("trv10", 0.0) < max(1.0, self.buy_trv10_min * 0.5):
+            return False, "trv10_too_low"
         if score < self.entry_score_threshold:
             return False, f"score<{self.entry_score_threshold:.1f}"
-        if metrics.get("dayrise", 0.0) > self.entry_block_dayrise_pct:
-            return False, f"overheat dayrise={metrics.get('dayrise',0.0):.2f}"
-        if metrics.get("ret10", 0.0) < self.buy_ret10_min:
-            return False, "ret10_low"
-        if metrics.get("ret5", 0.0) < self.buy_ret5_min:
-            return False, "ret5_low"
-        if metrics.get("trv10", 0.0) < self.buy_trv10_min:
-            return False, "trv10_low"
-        if metrics.get("ofi", 0.0) < self.buy_ofi_min:
-            return False, "ofi_low"
-        if metrics.get("imb", 0.0) < self.buy_imb_min:
-            return False, "imb_low"
         return True, "pass"
+
+    def _top_factor_strings(self, metrics: Dict[str, float]) -> tuple[str, str]:
+        pos = metrics.get("contrib_pos", {}) or {}
+        neg = metrics.get("contrib_neg", {}) or {}
+        top_pos = sorted(((k, float(v)) for k, v in pos.items()), key=lambda kv: kv[1], reverse=True)[:3]
+        top_neg = sorted(((k, abs(float(v))) for k, v in neg.items() if float(v) < 0), key=lambda kv: kv[1], reverse=True)[:2]
+        pos_s = "[" + ",".join(f"{k}+{v:.1f}" for k, v in top_pos) + "]"
+        neg_s = "[" + ",".join(f"{k}-{v:.1f}" for k, v in top_neg) + "]"
+        return pos_s, neg_s
 
     def _position_pct_by_score(self, score: float) -> float:
         if score >= self.entry_score_strong:
@@ -373,7 +406,7 @@ class EngineSimple:
             ts_epoch,
             sym,
             "BUY",
-            f"price={price:.0f} qty={qty} score={score:.1f} dayrise={metrics.get('dayrise',0.0):.2f} accel={metrics.get('trv_accel',0.0):.2f} ofi={metrics.get('ofi',0.0):.2f} imb={metrics.get('imb',0.0):.2f} reasons={'|'.join(reasons[:5])}",
+            f"score={score:.1f} pos={self._top_factor_strings(metrics)[0]} neg={self._top_factor_strings(metrics)[1]} price={price:.0f} qty={qty} metrics=ret10={metrics.get('ret10',0.0):.2f},ret5={metrics.get('ret5',0.0):.2f},trv10={metrics.get('trv10',0.0):.0f},ofi={metrics.get('ofi',0.0):.2f},imb={metrics.get('imb',0.0):.2f},depth={metrics.get('depth_ratio',0.0):.2f},dayrise={metrics.get('dayrise',0.0):.2f}",
         )
         self.notifier.send(
             title=f"✅ 단순모멘텀 매수 {sym}",
@@ -483,7 +516,13 @@ class EngineSimple:
         if (ts_epoch - last) >= 1.0:
             self._last_candidate_log_ts[sym] = ts_epoch
             status = "PASS" if ok else "DROP"
-            self._log_diag(ts_epoch, sym, "CAND", f"{status} score={score:.1f} why={why} reasons={'|'.join(reasons[:5])}")
+            pos_s, neg_s = self._top_factor_strings(metrics)
+            self._log_diag(
+                ts_epoch,
+                sym,
+                "CAND",
+                f"score={score:.1f} pass={1 if ok else 0} why={why} pos={pos_s} neg={neg_s} metrics=ret10={metrics.get('ret10',0.0):.2f},ret5={metrics.get('ret5',0.0):.2f},trv10={metrics.get('trv10',0.0):.0f},ofi={metrics.get('ofi',0.0):.2f},imb={metrics.get('imb',0.0):.2f},depth={metrics.get('depth_ratio',0.0):.2f},dayrise={metrics.get('dayrise',0.0):.2f}",
+            )
 
         if not ok:
             self._skip_reason_counts[why] += 1
