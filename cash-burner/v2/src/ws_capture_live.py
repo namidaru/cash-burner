@@ -3,6 +3,7 @@ from __future__ import annotations
 import os, json, time, threading, csv, queue, re
 from dataclasses import dataclass
 import requests, websocket
+from kis_http import request
 
 APP_KEY = os.getenv("KOREA_INVEST_APP_KEY","")
 APP_SECRET = os.getenv("KOREA_INVEST_APP_SECRET","")
@@ -10,13 +11,8 @@ APP_SECRET = os.getenv("KOREA_INVEST_APP_SECRET","")
 WS_URL = os.getenv("KIS_WS_URL", "ws://ops.koreainvestment.com:21000")
 BASE_URL = os.getenv("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443")
 
-PAPER_TRADE_MODE = os.getenv("PAPER_TRADE_MODE", "1") == "1"
-
-def _mode_default(real_path: str, paper_path: str) -> str:
-    return paper_path if PAPER_TRADE_MODE else real_path
-
 def _dated_out_file() -> str:
-    raw = os.getenv("OUT_FILE", _mode_default(os.path.join("data", "ws_dump.log"), os.path.join("data", "ws_dump_paper.log")))
+    raw = os.getenv("OUT_FILE", os.path.join("data", "ws_dump.log"))
     ymd = time.strftime("%Y%m%d")
     if "{date}" in raw:
         return raw.replace("{date}", ymd)
@@ -27,9 +23,9 @@ def _dated_out_file() -> str:
 
 
 OUT_FILE = _dated_out_file()
-CONTROL_FILE = os.getenv("CONTROL_FILE", _mode_default(os.path.join("data", "ws_control.log"), os.path.join("data", "ws_control_paper.log")))
-WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", _mode_default(os.path.join("data", "watchlist.txt"), os.path.join("data", "watchlist_paper.txt")))
-LEDGER_FILE = os.getenv("LEDGER_FILE", _mode_default(os.path.join("data", "ledger_real.csv"), os.path.join("data", "ledger_paper.csv")))
+CONTROL_FILE = os.getenv("CONTROL_FILE", os.path.join("data", "ws_control.log"))
+WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
+LEDGER_FILE = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
 PREOPEN_TRACK_MIN = int(os.getenv("PREOPEN_TRACK_MIN", "15"))
 PREOPEN_START_HHMM = int(os.getenv("PREOPEN_START_HHMM", "900"))
 
@@ -41,6 +37,16 @@ POLL_WATCH_SEC = float(os.getenv("WATCH_POLL_SEC", "2.0"))
 MAX_SUB_BACKOFF_SEC = float(os.getenv("WS_SUB_BACKOFF_MAX_SEC", "60"))
 BASE_SUB_BACKOFF_SEC = float(os.getenv("WS_SUB_BACKOFF_BASE_SEC", "2"))
 MAX_ACTIVE_SUB_KEYS = int(os.getenv("WS_MAX_ACTIVE_SUB_KEYS", "50"))
+WATCH_REMOVE_DELAY_SEC = float(os.getenv("WATCH_REMOVE_DELAY_SEC", "0"))
+LEADER_RADAR_ENABLE = os.getenv("LEADER_RADAR_ENABLE", "0") == "1"
+LEADER_RADAR_RET3S_PCT = float(os.getenv("LEADER_RADAR_RET3S_PCT", "1.0"))
+LEADER_RADAR_MAX_SUBS = max(0, int(os.getenv("LEADER_RADAR_MAX_SUBS", "5")))
+LEADER_RADAR_HOLD_SEC = float(os.getenv("LEADER_RADAR_HOLD_SEC", "120"))
+LEADER_RADAR_POLL_SEC = float(os.getenv("LEADER_RADAR_POLL_SEC", "1.0"))
+LEADER_RADAR_POOL_TOPK = max(10, int(os.getenv("LEADER_RADAR_POOL_TOPK", "120")))
+LEADER_RADAR_MARKETS = [m.strip() for m in os.getenv("LEADER_RADAR_MARKETS", os.getenv("VOLUME_RANK_MARKETS", "J,NX")).split(",") if m.strip()]
+VOLUME_RANK_PATH = "/uapi/domestic-stock/v1/quotations/volume-rank"
+VOLUME_RANK_TR_ID = os.getenv("LEADER_RADAR_TR_ID", "FHPST01710000")
 
 
 def _normalized_tr_ids(raw_ids: list[str]) -> tuple[list[str], list[str]]:
@@ -166,11 +172,16 @@ class WSCapture:
         self.pending_subscribe: dict[tuple[str, str], float] = {}
         self.sub_blocked_until: dict[tuple[str, str], float] = {}
         self.sub_blocked_retry_exp: dict[tuple[str, str], int] = {}
-        self.last_sync_desired: set[str] = set()
+        self.last_sync_desired_symbols: set[str] = set()
+        self.last_sync_desired_keys: set[tuple[str, str]] = set()
         self.lock = threading.Lock()
         self.preopen_day = ""
         self.preopen_snapshot: set[str] = set()
         self.last_held_symbols: set[str] = set()
+        self.watch_remove_after: dict[str, float] = {}
+        self.leader_radar_active_until: dict[str, float] = {}
+        self.leader_radar_price_hist: dict[str, list[tuple[float, float]]] = {}
+        self._leader_radar_last_poll_ts = 0.0
 
     def _in_preopen_window(self, ts_epoch: float | None = None) -> bool:
         hhmm = _hhmm_now(ts_epoch)
@@ -181,6 +192,7 @@ class WSCapture:
         return start_min <= now_min < (start_min + PREOPEN_TRACK_MIN)
 
     def _desired_symbols(self) -> set[str]:
+        now = time.time()
         today = time.strftime("%Y%m%d")
         current_watchlist = read_watchlist()
 
@@ -191,16 +203,112 @@ class WSCapture:
         if self._in_preopen_window():
             if not self.preopen_snapshot and current_watchlist:
                 self.preopen_snapshot = set(current_watchlist)
-                _append(CONTROL_FILE, f"{_ts()}\tPREOPEN snapshot n={len(self.preopen_snapshot)}")
+                _append(CONTROL_FILE, f"{_ts()}	PREOPEN snapshot n={len(self.preopen_snapshot)}")
             base = self.preopen_snapshot or current_watchlist
         else:
             base = current_watchlist
 
+        watch_now = set(base)
+        kept_watch: set[str] = set(watch_now)
+        if WATCH_REMOVE_DELAY_SEC > 0:
+            removed = self.last_sync_desired_symbols - watch_now
+            for sym in removed:
+                self.watch_remove_after.setdefault(sym, now + WATCH_REMOVE_DELAY_SEC)
+            for sym in watch_now:
+                self.watch_remove_after.pop(sym, None)
+            expired = [sym for sym, deadline in self.watch_remove_after.items() if deadline <= now]
+            for sym in expired:
+                self.watch_remove_after.pop(sym, None)
+            kept_watch |= set(self.watch_remove_after.keys())
+        else:
+            self.watch_remove_after.clear()
+
         held = _held_symbols_from_ledger()
         if held != self.last_held_symbols:
-            _append(CONTROL_FILE, f"{_ts()}\tHELD merge n={len(held)}")
+            _append(CONTROL_FILE, f"{_ts()}	HELD merge n={len(held)}")
             self.last_held_symbols = set(held)
-        return set(base) | held
+
+        base_desired = kept_watch | held
+        radar_syms = self._leader_radar_symbols(now, excluded=base_desired)
+        if radar_syms:
+            _append(CONTROL_FILE, f"{_ts()}	LEADER_RADAR add={len(radar_syms)} thr={LEADER_RADAR_RET3S_PCT:.2f}%")
+        return base_desired | radar_syms
+
+    def _fetch_volume_rank_rows(self, market: str) -> list[dict]:
+        params = {
+            "FID_COND_MRKT_DIV_CODE": market,
+            "FID_COND_SCR_DIV_CODE": os.getenv("LEADER_RADAR_SCR", "20171"),
+            "FID_INPUT_ISCD": os.getenv("LEADER_RADAR_INPUT_ISCD", "0000"),
+            "FID_DIV_CLS_CODE": "0",
+            "FID_BLNG_CLS_CODE": "0",
+            "FID_TRGT_CLS_CODE": "111111111",
+            "FID_TRGT_EXLS_CLS_CODE": "000000",
+            "FID_INPUT_PRICE_1": "",
+            "FID_INPUT_PRICE_2": "",
+            "FID_VOL_CNT": "",
+            "FID_INPUT_DATE_1": "",
+        }
+        try:
+            j = request("GET", VOLUME_RANK_PATH, VOLUME_RANK_TR_ID, params=params)
+            for k in ("output", "output1", "output2"):
+                rows = j.get(k)
+                if isinstance(rows, list):
+                    return rows[:LEADER_RADAR_POOL_TOPK]
+        except Exception:
+            return []
+        return []
+
+    def _parse_row_symbol_price(self, row: dict) -> tuple[str, float]:
+        sym = str(row.get("mksc_shrn_iscd") or row.get("stck_shrn_iscd") or row.get("hts_kor_isnm") or "").strip()
+        if sym and not sym.isdigit():
+            sym = str(row.get("stck_shrn_iscd") or row.get("mksc_shrn_iscd") or "").strip()
+        px = 0.0
+        for k in ("stck_prpr", "stck_clpr", "prpr", "price", "cur_prc"):
+            try:
+                px = float(row.get(k, 0) or 0)
+                if px > 0:
+                    break
+            except Exception:
+                pass
+        return sym, px
+
+    def _leader_radar_symbols(self, now: float, excluded: set[str]) -> set[str]:
+        if (not LEADER_RADAR_ENABLE) or LEADER_RADAR_MAX_SUBS <= 0:
+            self.leader_radar_active_until.clear()
+            return set()
+
+        if (now - self._leader_radar_last_poll_ts) >= max(0.2, LEADER_RADAR_POLL_SEC):
+            self._leader_radar_last_poll_ts = now
+            for m in LEADER_RADAR_MARKETS:
+                rows = self._fetch_volume_rank_rows(m)
+                for row in rows:
+                    sym, px = self._parse_row_symbol_price(row)
+                    if (not sym) or (px <= 0):
+                        continue
+                    h = self.leader_radar_price_hist.setdefault(sym, [])
+                    h.append((now, px))
+                    cutoff = now - 4.0
+                    while h and h[0][0] < cutoff:
+                        h.pop(0)
+                    base = next((p for t, p in h if (now - t) >= 3.0), h[0][1] if h else px)
+                    if base > 0:
+                        ret3 = (px / base - 1.0) * 100.0
+                        if ret3 >= LEADER_RADAR_RET3S_PCT and sym not in excluded:
+                            self.leader_radar_active_until[sym] = now + LEADER_RADAR_HOLD_SEC
+
+        # expire
+        expired = [sym for sym, until in self.leader_radar_active_until.items() if until <= now]
+        for sym in expired:
+            self.leader_radar_active_until.pop(sym, None)
+
+        # enforce max slots by remaining ttl
+        ranked = sorted(self.leader_radar_active_until.items(), key=lambda kv: kv[1], reverse=True)
+        keep_syms = {sym for sym, _ in ranked[:LEADER_RADAR_MAX_SUBS]}
+        for sym in list(self.leader_radar_active_until.keys()):
+            if sym not in keep_syms:
+                self.leader_radar_active_until.pop(sym, None)
+
+        return keep_syms
 
     def start(self):
         _ensure_dir(OUT_FILE)
@@ -295,7 +403,8 @@ class WSCapture:
                 self.pending_subscribe.clear()
                 self.sub_blocked_until.clear()
                 self.sub_blocked_retry_exp.clear()
-                self.last_sync_desired = set()
+                self.last_sync_desired_symbols = set()
+                self.last_sync_desired_keys = set()
                 _append(CONTROL_FILE, f"{_ts()}\tRECONNECT start")
                 try:
                     self.approval_key = get_approval_key()
@@ -472,10 +581,11 @@ class WSCapture:
 
             add_keys_ordered = [k for k in desired_key_seq if k not in self.subscribed_keys]
             sent_req = 0
-            if force or desired_keys != self.last_sync_desired or add_keys_ordered:
+            if force or desired_keys != self.last_sync_desired_keys or add_keys_ordered:
                 for sym, tr in add_keys_ordered:
                     sent_req += self._try_subscribe_key(sym, tr)
-                self.last_sync_desired = set(desired_keys)
+                self.last_sync_desired_keys = set(desired_keys)
+                self.last_sync_desired_symbols = set(desired_symbols)
 
             self._refresh_subscribed_symbols()
 
