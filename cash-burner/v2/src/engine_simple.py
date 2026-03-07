@@ -611,7 +611,6 @@ class EngineSimple:
                 reason = "max_hold"
 
         if not reason:
-            self._save_state()
             return
 
         qty_sell = max(0, int(sellable_qty(sym)))
