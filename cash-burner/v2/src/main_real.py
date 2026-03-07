@@ -97,7 +97,12 @@ def _stabilize_watchlist(prev: List[str], new: List[str]) -> List[str]:
             result[i] = add_pool.pop(0)
     # deduplicate while preserving order
     seen = set()
-    result = [s for s in result if not (s in seen or seen.add(s))]
+    deduped = []
+    for s in result:
+        if s not in seen:
+            seen.add(s)
+            deduped.append(s)
+    result = deduped
 
     for s in new_cut:
         if len(result) >= want_n:
