@@ -8,7 +8,7 @@ from kis_http import request
 TRID = "CTPF1002R"
 PATH = "/uapi/domestic-stock/v1/quotations/search-stock-info"
 
-CACHE_PATH = os.getenv("PREVCLOSE_CACHE", r"data\prev_close.json")
+CACHE_PATH = os.getenv("PREVCLOSE_CACHE", os.path.join("data", "prev_close.json"))
 
 def _ensure_dir(path: str):
     d = os.path.dirname(path)
@@ -21,7 +21,7 @@ def get_basic(symbol: str) -> Dict[str, Any]:
 
 def extract_prev_close(j: Dict[str,Any]) -> float:
     out = j.get("output", {}) or j.get("output1", {}) or {}
-    for k in ("prdy_clpr","stck_prdy_clpr","PRDY_CLPR","stck_prdy_clpr"):
+    for k in ("prdy_clpr","stck_prdy_clpr","PRDY_CLPR"):
         if k in out and out[k]:
             try: return float(out[k])
             except: pass
