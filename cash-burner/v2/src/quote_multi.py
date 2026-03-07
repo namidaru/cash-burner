@@ -21,6 +21,31 @@ MIN_VOLUME = float(os.getenv("WATCH_MIN_VOLUME", "30000"))
 WATCH_SOFT_HEAT_PCT = float(os.getenv("WATCH_SOFT_HEAT_PCT", "2.5"))
 WATCH_HARD_HEAT_PCT = float(os.getenv("WATCH_HARD_HEAT_PCT", "14.0"))
 
+MARKET_CANDIDATES = [m.strip() for m in os.getenv("FID_COND_MRKT_DIV_CODE_MULTI", f"{DEFAULT_MRKT},NX").split(",") if m.strip()]
+_SYMBOL_MARKET: Dict[str, str] = {}
+
+def _item_symbol(it: Dict[str, Any]) -> str:
+    return str(
+        it.get("mksc_shrn_iscd")
+        or it.get("MKSC_SHRN_ISCD")
+        or it.get("stnd_iscd")
+        or it.get("STND_ISCD")
+        or it.get("pdno")
+        or it.get("PDNO")
+        or ""
+    ).strip()
+
+
+
+def _norm_symbol(sym: str) -> str:
+    s = str(sym or "").strip()
+    if len(s) == 6 and s.isdigit():
+        return s
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if len(digits) >= 6:
+        return digits[-6:]
+    return s
+
 def chunk(lst: List[str], n: int):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
@@ -37,13 +62,59 @@ def _get_first(it: Dict[str, Any], keys: List[str], default: float = 0.0) -> flo
 def multi_quote(symbols: List[str]) -> List[Dict[str, Any]]:
     out = []
     for batch in chunk(symbols, 30):
-        params = {"FID_COND_MRKT_DIV_CODE_1": DEFAULT_MRKT}
-        for i, sym in enumerate(batch, start=1):
-            params[f"FID_INPUT_ISCD_{i}"] = sym
-        j = request("GET", PATH, TRID, params=params)
-        items = j.get("output", []) or j.get("output1", []) or j.get("output2", [])
-        if isinstance(items, list):
-            out.extend(items)
+        merged: Dict[str, Dict[str, Any]] = {}
+        pending = [_norm_symbol(sym) for sym in batch if sym]
+
+        known_by_market: Dict[str, List[str]] = {}
+        for sym in pending:
+            m = _SYMBOL_MARKET.get(sym)
+            if m:
+                known_by_market.setdefault(m, []).append(sym)
+
+        for market, syms in known_by_market.items():
+            params = {"FID_COND_MRKT_DIV_CODE_1": market}
+            for i, sym in enumerate(syms, start=1):
+                params[f"FID_INPUT_ISCD_{i}"] = sym
+            j = request("GET", PATH, TRID, params=params)
+            items = j.get("output", []) or j.get("output1", []) or j.get("output2", [])
+            if not isinstance(items, list):
+                continue
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                sym = _norm_symbol(_item_symbol(it))
+                if not sym or sym in merged:
+                    continue
+                merged[sym] = it
+                _SYMBOL_MARKET[sym] = market
+
+        pending = [sym for sym in pending if sym not in merged]
+        for market in MARKET_CANDIDATES:
+            if not pending:
+                break
+            params = {"FID_COND_MRKT_DIV_CODE_1": market}
+            for i, sym in enumerate(pending, start=1):
+                params[f"FID_INPUT_ISCD_{i}"] = sym
+            j = request("GET", PATH, TRID, params=params)
+            items = j.get("output", []) or j.get("output1", []) or j.get("output2", [])
+            if not isinstance(items, list):
+                continue
+            found = set()
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                sym = _norm_symbol(_item_symbol(it))
+                if not sym or sym in merged:
+                    continue
+                merged[sym] = it
+                _SYMBOL_MARKET[sym] = market
+                found.add(sym)
+            if found:
+                pending = [sym for sym in pending if sym not in found]
+        for sym in batch:
+            ns = _norm_symbol(sym)
+            if ns in merged:
+                out.append(merged[ns])
     return out
 
 

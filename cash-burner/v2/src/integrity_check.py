@@ -9,7 +9,7 @@ from typing import Dict, List
 
 DEFAULT_LEDGER = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
 DEFAULT_EQUITY = os.getenv("EQUITY_FILE", os.path.join("data", "equity.csv"))
-DEFAULT_SIGNAL_DIAG = os.getenv("SIGNAL_DIAG_FILE", os.path.join("data", "signal_diag_simple.log"))
+DEFAULT_SIGNAL_DIAG = os.getenv("SIGNAL_DIAG_FILE", os.path.join("data", "signal_diag.log"))
 
 
 def _to_float(v: str, d: float = 0.0) -> float:
@@ -72,7 +72,12 @@ def check_ledger(path: str) -> Dict[str, object]:
 
     open_symbols = {s: q for s, q in by_symbol.items() if q > 0}
     now = time.time()
-    open_age_sec = {s: max(0.0, now - open_ts.get(s, now)) for s in open_symbols}
+    open_age_sec = {}
+    for s in open_symbols:
+        if s in open_ts:
+            open_age_sec[s] = max(0.0, now - open_ts[s])
+        else:
+            open_age_sec[s] = -1.0  # sentinel: buy timestamp missing
     max_open_age_sec = max(open_age_sec.values(), default=0.0)
     max_expect_open_sec = float(os.getenv("MAX_EXPECT_OPEN_SEC", "1200"))
     if max_open_age_sec > max_expect_open_sec:
