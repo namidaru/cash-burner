@@ -85,6 +85,10 @@ class EngineSimple:
         self.stop_loss_early_relax_mult = float(os.getenv("STOP_LOSS_EARLY_RELAX_MULT", "1.6"))
         self.stop_loss_emergency_pct = float(os.getenv("STOP_LOSS_EMERGENCY_PCT", "4.5"))
         self.cooldown_sec = float(os.getenv("COOLDOWN_SEC", "90"))
+        self.daily_loss_limit_pct = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "3.0"))
+        self._daily_loss_base_cash: float | None = None
+        self._daily_realized_pnl: float = 0.0
+        self._trading_halted: bool = False
 
         self.entry_chase_dayrise_pct = float(os.getenv("ENTRY_CHASE_DAYRISE_PCT", "15.0"))
         self.entry_chase_high_near_pct = float(os.getenv("ENTRY_CHASE_HIGH_NEAR_PCT", "0.10"))
@@ -303,6 +307,12 @@ class EngineSimple:
         now = time.time()
         self._refresh_orderable_cash(now, use_fallback=False)
         self._refresh_orderable_cash(now, use_fallback=True)
+        if self._daily_loss_base_cash is None and self._last_orderable_cash is not None:
+            self._daily_loss_base_cash = self._last_orderable_cash
+            self._log_diag(
+                time.time(), "ENGINE", "DAILY_BASE",
+                f"base_cash={self._daily_loss_base_cash:.0f}"
+            )
 
     def _refresh_orderable_cash(self, ts_epoch: float, use_fallback: bool = True) -> float | None:
         orderable = None
@@ -438,6 +448,8 @@ class EngineSimple:
         return score, reasons, metrics
 
     def should_buy(self, sym: str, score: float, metrics: Dict[str, float], ts_epoch: float) -> tuple[bool, str]:
+        if self._trading_halted:
+            return False, "trading_halted"
         self._score_eval_total += 1
         if sym not in self.watch:
             return False, "watchlist_out"
@@ -585,6 +597,25 @@ class EngineSimple:
             self._log_diag(ts_epoch, sym, "SELL_FAIL", str(j.get("msg1", ""))[:160])
             return
 
+        pnl = (price - p.entry_price) * qty
+        self._daily_realized_pnl += pnl
+        if self._daily_loss_base_cash and self._daily_loss_base_cash > 0:
+            loss_pct = max(0.0, -self._daily_realized_pnl) / self._daily_loss_base_cash * 100.0
+            if not self._trading_halted and loss_pct >= self.daily_loss_limit_pct:
+                self._trading_halted = True
+                self._log_diag(
+                    ts_epoch, "ENGINE", "HALT",
+                    f"daily_loss_pct={loss_pct:.2f} limit={self.daily_loss_limit_pct:.2f} pnl={self._daily_realized_pnl:.0f}"
+                )
+                self.notifier.send(
+                    title="🚨 일일 손실 한도 도달 — 거래 중지",
+                    color=0xE74C3C,
+                    lines=[
+                        f"누적손실={loss_pct:.2f}%  한도={self.daily_loss_limit_pct:.2f}%",
+                        f"실현PnL={self._daily_realized_pnl:,.0f}원",
+                    ],
+                )
+
         self.cooldown_until[sym] = ts_epoch + self.cooldown_sec
         self.pos.pop(sym, None)
         self._last_sell_time = ts_epoch
@@ -695,6 +726,8 @@ class EngineSimple:
             "last_sell_symbol": self._last_sell_symbol,
             "recent_events": list(self._recent_events),
             "operator_summary": self._operator_summary_runtime(len(self.watch), score_pass_rate),
+            "trading_halted": self._trading_halted,
+            "daily_realized_pnl": round(self._daily_realized_pnl, 0),
         }
         try:
             d = os.path.dirname(self.runtime_status_file)
