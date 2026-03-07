@@ -627,17 +627,7 @@ class EngineSimple:
             self._log_diag(ts_epoch, sym, "SELL_FAIL", str(j.get("msg1", ""))[:160])
             return
 
-        filled_qty = self._confirmed_fill_qty(j)
-        if filled_qty <= 0:
-            self._log_diag(ts_epoch, sym, "SELL_ACK", "sell_accepted_unconfirmed")
-            return
-
-        filled_qty = max(0, min(int(filled_qty), int(qty), int(p.qty)))
-        if filled_qty <= 0:
-            self._log_diag(ts_epoch, sym, "SELL_ACK", "sell_accepted_unconfirmed")
-            return
-
-        pnl = (price - p.entry_price) * filled_qty
+        pnl = (price - p.entry_price) * qty
         self._daily_realized_pnl += pnl
         if self._daily_loss_base_cash and self._daily_loss_base_cash > 0:
             loss_pct = max(0.0, -self._daily_realized_pnl) / self._daily_loss_base_cash * 100.0
@@ -656,7 +646,8 @@ class EngineSimple:
                     ],
                 )
 
-        remain_qty = max(0, int(p.qty) - int(filled_qty))
+        self.cooldown_until[sym] = ts_epoch + self.cooldown_sec
+        self.pos.pop(sym, None)
         self._last_sell_time = ts_epoch
         self._last_sell_symbol = sym
         if remain_qty <= 0:

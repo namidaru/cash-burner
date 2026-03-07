@@ -36,6 +36,16 @@ def _item_symbol(it: Dict[str, Any]) -> str:
     ).strip()
 
 
+
+def _norm_symbol(sym: str) -> str:
+    s = str(sym or "").strip()
+    if len(s) == 6 and s.isdigit():
+        return s
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if len(digits) >= 6:
+        return digits[-6:]
+    return s
+
 def chunk(lst: List[str], n: int):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
@@ -53,7 +63,7 @@ def multi_quote(symbols: List[str]) -> List[Dict[str, Any]]:
     out = []
     for batch in chunk(symbols, 30):
         merged: Dict[str, Dict[str, Any]] = {}
-        pending = [sym for sym in batch if sym]
+        pending = [_norm_symbol(sym) for sym in batch if sym]
 
         known_by_market: Dict[str, List[str]] = {}
         for sym in pending:
@@ -72,7 +82,7 @@ def multi_quote(symbols: List[str]) -> List[Dict[str, Any]]:
             for it in items:
                 if not isinstance(it, dict):
                     continue
-                sym = _item_symbol(it)
+                sym = _norm_symbol(_item_symbol(it))
                 if not sym or sym in merged:
                     continue
                 merged[sym] = it
@@ -93,7 +103,7 @@ def multi_quote(symbols: List[str]) -> List[Dict[str, Any]]:
             for it in items:
                 if not isinstance(it, dict):
                     continue
-                sym = _item_symbol(it)
+                sym = _norm_symbol(_item_symbol(it))
                 if not sym or sym in merged:
                     continue
                 merged[sym] = it
@@ -102,8 +112,9 @@ def multi_quote(symbols: List[str]) -> List[Dict[str, Any]]:
             if found:
                 pending = [sym for sym in pending if sym not in found]
         for sym in batch:
-            if sym in merged:
-                out.append(merged[sym])
+            ns = _norm_symbol(sym)
+            if ns in merged:
+                out.append(merged[ns])
     return out
 
 

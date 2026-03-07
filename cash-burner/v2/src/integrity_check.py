@@ -9,7 +9,7 @@ from typing import Dict, List
 
 DEFAULT_LEDGER = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
 DEFAULT_EQUITY = os.getenv("EQUITY_FILE", os.path.join("data", "equity.csv"))
-DEFAULT_SIGNAL_DIAG = os.getenv("SIGNAL_DIAG_FILE", os.path.join("data", "signal_diag_simple.log"))
+DEFAULT_SIGNAL_DIAG = os.getenv("SIGNAL_DIAG_FILE", os.path.join("data", "signal_diag.log"))
 
 
 def _to_float(v: str, d: float = 0.0) -> float:
