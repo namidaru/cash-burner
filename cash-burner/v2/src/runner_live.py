@@ -16,6 +16,7 @@ def parse_prefix_ts(line: str) -> float:
         return time.time()
 
 def run_live(in_file: str, poll: float = 0.2):
+    _last_timer = [0.0]
     eng = EngineSimple()
     while True:
         try:
@@ -40,10 +41,13 @@ def run_live(in_file: str, poll: float = 0.2):
                             except Exception as e:
                                 print(time.strftime("%Y-%m-%d %H:%M:%S"), f"[LIVE][WARN] {tr_id} {type(e).__name__}: {e}")
                     else:
-                        try:
-                            eng.on_timer(time.time())
-                        except Exception as e:
-                            print(time.strftime("%Y-%m-%d %H:%M:%S"), f"[LIVE][WARN] timer {type(e).__name__}: {e}")
+                        now = time.time()
+                        if now - _last_timer[0] >= 1.0:
+                            _last_timer[0] = now
+                            try:
+                                eng.on_timer(now)
+                            except Exception as e:
+                                print(time.strftime("%Y-%m-%d %H:%M:%S"), f"[LIVE][WARN] timer {type(e).__name__}: {e}")
                         time.sleep(poll)
         except FileNotFoundError:
             try:
