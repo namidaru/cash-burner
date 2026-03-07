@@ -89,9 +89,20 @@ def _stabilize_watchlist(prev: List[str], new: List[str]) -> List[str]:
     replace_n = min(max_replace, len(add_pool))
 
     if replace_n > 0:
-        removable_idx = [i for i in range(len(result) - 1, keep_n - 1, -1)]
+        removable_idx = [i for i in range(len(result) - 1, keep_n - 1, -1)
+                         if i < len(result)]
         for i in removable_idx[:replace_n]:
+            if not add_pool:
+                break
             result[i] = add_pool.pop(0)
+    # deduplicate while preserving order
+    seen = set()
+    deduped = []
+    for s in result:
+        if s not in seen:
+            seen.add(s)
+            deduped.append(s)
+    result = deduped
 
     for s in new_cut:
         if len(result) >= want_n:

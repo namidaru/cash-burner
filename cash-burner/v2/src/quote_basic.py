@@ -21,7 +21,7 @@ def get_basic(symbol: str) -> Dict[str, Any]:
 
 def extract_prev_close(j: Dict[str,Any]) -> float:
     out = j.get("output", {}) or j.get("output1", {}) or {}
-    for k in ("prdy_clpr","stck_prdy_clpr","PRDY_CLPR","stck_prdy_clpr"):
+    for k in ("prdy_clpr","stck_prdy_clpr","PRDY_CLPR"):
         if k in out and out[k]:
             try: return float(out[k])
             except: pass

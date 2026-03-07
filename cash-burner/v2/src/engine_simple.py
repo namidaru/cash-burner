@@ -85,6 +85,10 @@ class EngineSimple:
         self.stop_loss_early_relax_mult = float(os.getenv("STOP_LOSS_EARLY_RELAX_MULT", "1.6"))
         self.stop_loss_emergency_pct = float(os.getenv("STOP_LOSS_EMERGENCY_PCT", "4.5"))
         self.cooldown_sec = float(os.getenv("COOLDOWN_SEC", "90"))
+        self.daily_loss_limit_pct = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "3.0"))
+        self._daily_loss_base_cash: float | None = None
+        self._daily_realized_pnl: float = 0.0
+        self._trading_halted: bool = False
 
         self.entry_chase_dayrise_pct = float(os.getenv("ENTRY_CHASE_DAYRISE_PCT", "15.0"))
         self.entry_chase_high_near_pct = float(os.getenv("ENTRY_CHASE_HIGH_NEAR_PCT", "0.10"))
@@ -255,8 +259,8 @@ class EngineSimple:
 
     def _imbalance(self, sym: str) -> float:
         ob = self.book.get(sym) or {}
-        bid = _f(ob.get("TOTAL_BIDP_RSQN")) + _f(ob.get("total_bidp_rsqn"))
-        ask = _f(ob.get("TOTAL_ASKP_RSQN")) + _f(ob.get("total_askp_rsqn"))
+        bid = _f(ob.get("TOTAL_BIDP_RSQN") or ob.get("total_bidp_rsqn"))
+        ask = _f(ob.get("TOTAL_ASKP_RSQN") or ob.get("total_askp_rsqn"))
         den = bid + ask
         return (bid / den) if den > 0 else 0.5
 
@@ -270,8 +274,8 @@ class EngineSimple:
 
     def _spread_bps(self, sym: str, price: float) -> float:
         ob = self.book.get(sym) or {}
-        ask1 = _f(ob.get("ASKP1")) + _f(ob.get("askp1"))
-        bid1 = _f(ob.get("BIDP1")) + _f(ob.get("bidp1"))
+        ask1 = _f(ob.get("ASKP1") or ob.get("askp1"))
+        bid1 = _f(ob.get("BIDP1") or ob.get("bidp1"))
         if ask1 <= 0 or bid1 <= 0:
             return 0.0
         mid = (ask1 + bid1) / 2.0
@@ -303,6 +307,12 @@ class EngineSimple:
         now = time.time()
         self._refresh_orderable_cash(now, use_fallback=False)
         self._refresh_orderable_cash(now, use_fallback=True)
+        if self._daily_loss_base_cash is None and self._last_orderable_cash is not None:
+            self._daily_loss_base_cash = self._last_orderable_cash
+            self._log_diag(
+                time.time(), "ENGINE", "DAILY_BASE",
+                f"base_cash={self._daily_loss_base_cash:.0f}"
+            )
 
     def _refresh_orderable_cash(self, ts_epoch: float, use_fallback: bool = True) -> float | None:
         orderable = None
@@ -438,6 +448,8 @@ class EngineSimple:
         return score, reasons, metrics
 
     def should_buy(self, sym: str, score: float, metrics: Dict[str, float], ts_epoch: float) -> tuple[bool, str]:
+        if self._trading_halted:
+            return False, "trading_halted"
         self._score_eval_total += 1
         if sym not in self.watch:
             return False, "watchlist_out"
@@ -518,11 +530,12 @@ class EngineSimple:
         self._last_buy_symbol = sym
         self._record_event(ts_epoch, "BUY", sym, f"score={score:.1f} qty={qty}")
         self._save_state()
+        pos_s, neg_s = self._top_factor_strings(metrics)
         self._log_diag(
             ts_epoch,
             sym,
             "BUY",
-            f"score={score:.1f} pos={self._top_factor_strings(metrics)[0]} neg={self._top_factor_strings(metrics)[1]} gate=trv10={metrics.get('trv10',0.0):.0f}/{self.buy_trv10_min:.0f},ret10={metrics.get('ret10',0.0):.2f}/{self.buy_ret10_min:.2f},ofi={metrics.get('ofi',0.0):.2f}/{self.buy_ofi_min:.2f},imb={metrics.get('imb',0.0):.2f}/{self.buy_imb_min:.2f},spread={metrics.get('spread_bps',0.0):.2f}/{self.buy_spread_max_bps:.2f},pass=1 price={price:.0f} qty={qty} est_notional={price*qty:.0f} cash={cash:.0f} metrics=ret5={metrics.get('ret5',0.0):.2f},spread={metrics.get('spread_bps',0.0):.2f},dayrise={metrics.get('dayrise',0.0):.2f},recent_high={metrics.get('recent_high',0.0):.0f},near_high={metrics.get('near_recent_high',0.0):.0f},pull_rebound={metrics.get('pull_rebound',0.0):.0f}",
+            f"score={score:.1f} pos={pos_s} neg={neg_s} gate=trv10={metrics.get('trv10',0.0):.0f}/{self.buy_trv10_min:.0f},ret10={metrics.get('ret10',0.0):.2f}/{self.buy_ret10_min:.2f},ofi={metrics.get('ofi',0.0):.2f}/{self.buy_ofi_min:.2f},imb={metrics.get('imb',0.0):.2f}/{self.buy_imb_min:.2f},spread={metrics.get('spread_bps',0.0):.2f}/{self.buy_spread_max_bps:.2f},pass=1 price={price:.0f} qty={qty} est_notional={price*qty:.0f} cash={cash:.0f} metrics=ret5={metrics.get('ret5',0.0):.2f},spread={metrics.get('spread_bps',0.0):.2f},dayrise={metrics.get('dayrise',0.0):.2f},recent_high={metrics.get('recent_high',0.0):.0f},near_high={metrics.get('near_recent_high',0.0):.0f},pull_rebound={metrics.get('pull_rebound',0.0):.0f}",
         )
         self.notifier.send(
             title=f"✅ 단순모멘텀 매수 {sym}",
@@ -568,7 +581,6 @@ class EngineSimple:
                 reason = "max_hold"
 
         if not reason:
-            self._save_state()
             return
 
         qty_sell = max(0, int(sellable_qty(sym)))
@@ -584,6 +596,25 @@ class EngineSimple:
         if j.get("rt_cd") != "0":
             self._log_diag(ts_epoch, sym, "SELL_FAIL", str(j.get("msg1", ""))[:160])
             return
+
+        pnl = (price - p.entry_price) * qty
+        self._daily_realized_pnl += pnl
+        if self._daily_loss_base_cash and self._daily_loss_base_cash > 0:
+            loss_pct = max(0.0, -self._daily_realized_pnl) / self._daily_loss_base_cash * 100.0
+            if not self._trading_halted and loss_pct >= self.daily_loss_limit_pct:
+                self._trading_halted = True
+                self._log_diag(
+                    ts_epoch, "ENGINE", "HALT",
+                    f"daily_loss_pct={loss_pct:.2f} limit={self.daily_loss_limit_pct:.2f} pnl={self._daily_realized_pnl:.0f}"
+                )
+                self.notifier.send(
+                    title="🚨 일일 손실 한도 도달 — 거래 중지",
+                    color=0xE74C3C,
+                    lines=[
+                        f"누적손실={loss_pct:.2f}%  한도={self.daily_loss_limit_pct:.2f}%",
+                        f"실현PnL={self._daily_realized_pnl:,.0f}원",
+                    ],
+                )
 
         self.cooldown_until[sym] = ts_epoch + self.cooldown_sec
         self.pos.pop(sym, None)
@@ -695,6 +726,8 @@ class EngineSimple:
             "last_sell_symbol": self._last_sell_symbol,
             "recent_events": list(self._recent_events),
             "operator_summary": self._operator_summary_runtime(len(self.watch), score_pass_rate),
+            "trading_halted": self._trading_halted,
+            "daily_realized_pnl": round(self._daily_realized_pnl, 0),
         }
         try:
             d = os.path.dirname(self.runtime_status_file)

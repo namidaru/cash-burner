@@ -101,4 +101,3 @@ def request(method: str, path: str, tr_id: str, params: Dict[str, Any] = None, b
                 raise
             time.sleep(HTTP_RETRY_SLEEP * (attempt + 1))
 
-    raise RuntimeError(f"request failed without exception: {last_err}")
