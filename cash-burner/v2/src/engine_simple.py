@@ -255,8 +255,8 @@ class EngineSimple:
 
     def _imbalance(self, sym: str) -> float:
         ob = self.book.get(sym) or {}
-        bid = _f(ob.get("TOTAL_BIDP_RSQN")) + _f(ob.get("total_bidp_rsqn"))
-        ask = _f(ob.get("TOTAL_ASKP_RSQN")) + _f(ob.get("total_askp_rsqn"))
+        bid = _f(ob.get("TOTAL_BIDP_RSQN") or ob.get("total_bidp_rsqn"))
+        ask = _f(ob.get("TOTAL_ASKP_RSQN") or ob.get("total_askp_rsqn"))
         den = bid + ask
         return (bid / den) if den > 0 else 0.5
 
@@ -270,8 +270,8 @@ class EngineSimple:
 
     def _spread_bps(self, sym: str, price: float) -> float:
         ob = self.book.get(sym) or {}
-        ask1 = _f(ob.get("ASKP1")) + _f(ob.get("askp1"))
-        bid1 = _f(ob.get("BIDP1")) + _f(ob.get("bidp1"))
+        ask1 = _f(ob.get("ASKP1") or ob.get("askp1"))
+        bid1 = _f(ob.get("BIDP1") or ob.get("bidp1"))
         if ask1 <= 0 or bid1 <= 0:
             return 0.0
         mid = (ask1 + bid1) / 2.0
@@ -518,11 +518,12 @@ class EngineSimple:
         self._last_buy_symbol = sym
         self._record_event(ts_epoch, "BUY", sym, f"score={score:.1f} qty={qty}")
         self._save_state()
+        pos_s, neg_s = self._top_factor_strings(metrics)
         self._log_diag(
             ts_epoch,
             sym,
             "BUY",
-            f"score={score:.1f} pos={self._top_factor_strings(metrics)[0]} neg={self._top_factor_strings(metrics)[1]} gate=trv10={metrics.get('trv10',0.0):.0f}/{self.buy_trv10_min:.0f},ret10={metrics.get('ret10',0.0):.2f}/{self.buy_ret10_min:.2f},ofi={metrics.get('ofi',0.0):.2f}/{self.buy_ofi_min:.2f},imb={metrics.get('imb',0.0):.2f}/{self.buy_imb_min:.2f},spread={metrics.get('spread_bps',0.0):.2f}/{self.buy_spread_max_bps:.2f},pass=1 price={price:.0f} qty={qty} est_notional={price*qty:.0f} cash={cash:.0f} metrics=ret5={metrics.get('ret5',0.0):.2f},spread={metrics.get('spread_bps',0.0):.2f},dayrise={metrics.get('dayrise',0.0):.2f},recent_high={metrics.get('recent_high',0.0):.0f},near_high={metrics.get('near_recent_high',0.0):.0f},pull_rebound={metrics.get('pull_rebound',0.0):.0f}",
+            f"score={score:.1f} pos={pos_s} neg={neg_s} gate=trv10={metrics.get('trv10',0.0):.0f}/{self.buy_trv10_min:.0f},ret10={metrics.get('ret10',0.0):.2f}/{self.buy_ret10_min:.2f},ofi={metrics.get('ofi',0.0):.2f}/{self.buy_ofi_min:.2f},imb={metrics.get('imb',0.0):.2f}/{self.buy_imb_min:.2f},spread={metrics.get('spread_bps',0.0):.2f}/{self.buy_spread_max_bps:.2f},pass=1 price={price:.0f} qty={qty} est_notional={price*qty:.0f} cash={cash:.0f} metrics=ret5={metrics.get('ret5',0.0):.2f},spread={metrics.get('spread_bps',0.0):.2f},dayrise={metrics.get('dayrise',0.0):.2f},recent_high={metrics.get('recent_high',0.0):.0f},near_high={metrics.get('near_recent_high',0.0):.0f},pull_rebound={metrics.get('pull_rebound',0.0):.0f}",
         )
         self.notifier.send(
             title=f"✅ 단순모멘텀 매수 {sym}",
@@ -568,7 +569,6 @@ class EngineSimple:
                 reason = "max_hold"
 
         if not reason:
-            self._save_state()
             return
 
         qty_sell = max(0, int(sellable_qty(sym)))
