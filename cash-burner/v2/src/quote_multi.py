@@ -22,6 +22,7 @@ WATCH_SOFT_HEAT_PCT = float(os.getenv("WATCH_SOFT_HEAT_PCT", "2.5"))
 WATCH_HARD_HEAT_PCT = float(os.getenv("WATCH_HARD_HEAT_PCT", "14.0"))
 
 MARKET_CANDIDATES = [m.strip() for m in os.getenv("FID_COND_MRKT_DIV_CODE_MULTI", f"{DEFAULT_MRKT},NX").split(",") if m.strip()]
+_SYMBOL_MARKET: Dict[str, str] = {}
 
 def _item_symbol(it: Dict[str, Any]) -> str:
     return str(
@@ -53,6 +54,31 @@ def multi_quote(symbols: List[str]) -> List[Dict[str, Any]]:
     for batch in chunk(symbols, 30):
         merged: Dict[str, Dict[str, Any]] = {}
         pending = [sym for sym in batch if sym]
+
+        known_by_market: Dict[str, List[str]] = {}
+        for sym in pending:
+            m = _SYMBOL_MARKET.get(sym)
+            if m:
+                known_by_market.setdefault(m, []).append(sym)
+
+        for market, syms in known_by_market.items():
+            params = {"FID_COND_MRKT_DIV_CODE_1": market}
+            for i, sym in enumerate(syms, start=1):
+                params[f"FID_INPUT_ISCD_{i}"] = sym
+            j = request("GET", PATH, TRID, params=params)
+            items = j.get("output", []) or j.get("output1", []) or j.get("output2", [])
+            if not isinstance(items, list):
+                continue
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                sym = _item_symbol(it)
+                if not sym or sym in merged:
+                    continue
+                merged[sym] = it
+                _SYMBOL_MARKET[sym] = market
+
+        pending = [sym for sym in pending if sym not in merged]
         for market in MARKET_CANDIDATES:
             if not pending:
                 break
@@ -71,6 +97,7 @@ def multi_quote(symbols: List[str]) -> List[Dict[str, Any]]:
                 if not sym or sym in merged:
                     continue
                 merged[sym] = it
+                _SYMBOL_MARKET[sym] = market
                 found.add(sym)
             if found:
                 pending = [sym for sym in pending if sym not in found]

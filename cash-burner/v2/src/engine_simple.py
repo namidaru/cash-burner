@@ -628,11 +628,16 @@ class EngineSimple:
             return
 
         filled_qty = self._confirmed_fill_qty(j)
-        if filled_qty < p.qty:
-            self._log_diag(ts_epoch, sym, "SELL_ACK", f"sell_accepted_unconfirmed filled={filled_qty} req={qty}")
+        if filled_qty <= 0:
+            self._log_diag(ts_epoch, sym, "SELL_ACK", "sell_accepted_unconfirmed")
             return
 
-        pnl = (price - p.entry_price) * p.qty
+        filled_qty = max(0, min(int(filled_qty), int(qty), int(p.qty)))
+        if filled_qty <= 0:
+            self._log_diag(ts_epoch, sym, "SELL_ACK", "sell_accepted_unconfirmed")
+            return
+
+        pnl = (price - p.entry_price) * filled_qty
         self._daily_realized_pnl += pnl
         if self._daily_loss_base_cash and self._daily_loss_base_cash > 0:
             loss_pct = max(0.0, -self._daily_realized_pnl) / self._daily_loss_base_cash * 100.0
@@ -651,11 +656,16 @@ class EngineSimple:
                     ],
                 )
 
-        self.cooldown_until[sym] = ts_epoch + self.cooldown_sec
-        self.pos.pop(sym, None)
+        remain_qty = max(0, int(p.qty) - int(filled_qty))
         self._last_sell_time = ts_epoch
         self._last_sell_symbol = sym
-        self._record_event(ts_epoch, "SELL", sym, reason)
+        if remain_qty <= 0:
+            self.cooldown_until[sym] = ts_epoch + self.cooldown_sec
+            self.pos.pop(sym, None)
+            self._record_event(ts_epoch, "SELL", sym, reason)
+        else:
+            p.qty = remain_qty
+            self._record_event(ts_epoch, "SELL", sym, f"{reason}|partial={filled_qty}")
         self._save_state()
 
         self._log_diag(
@@ -810,6 +820,12 @@ class EngineSimple:
         self._reset_daily_state(ts_epoch)
         self._reload_watchlist(ts_epoch)
         self._refresh_orderable_cash(ts_epoch, use_fallback=True)
+        if self._daily_loss_base_cash is None and self._last_orderable_cash is not None:
+            self._daily_loss_base_cash = self._last_orderable_cash
+            self._log_diag(
+                ts_epoch, "ENGINE", "DAILY_BASE",
+                f"base_cash={self._daily_loss_base_cash:.0f}"
+            )
         self._send_health(ts_epoch)
         if (ts_epoch - self._last_runtime_snapshot_ts) >= 1.0:
             self._last_runtime_snapshot_ts = ts_epoch
