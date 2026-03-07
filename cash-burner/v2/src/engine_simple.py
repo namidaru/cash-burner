@@ -549,10 +549,16 @@ class EngineSimple:
             self._log_diag(ts_epoch, sym, "BUY_FAIL", str(j.get("msg1", ""))[:160])
             return
 
-        self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, score=score, reasons=reasons[:5])
+        filled_qty = self._confirmed_fill_qty(j)
+        if filled_qty <= 0:
+            self._log_diag(ts_epoch, sym, "BUY_ACK", "accepted_unconfirmed")
+            return
+
+        filled_qty = min(qty, filled_qty)
+        self.pos[sym] = Position(qty=filled_qty, entry_price=price, entry_ts=ts_epoch, max_price=price, score=score, reasons=reasons[:5])
         self._last_buy_time = ts_epoch
         self._last_buy_symbol = sym
-        self._record_event(ts_epoch, "BUY", sym, f"score={score:.1f} qty={qty}")
+        self._record_event(ts_epoch, "BUY", sym, f"score={score:.1f} qty={filled_qty}")
         self._save_state()
         pos_s, neg_s = self._top_factor_strings(metrics)
         self._log_diag(
@@ -565,7 +571,7 @@ class EngineSimple:
             title=f"✅ 단순모멘텀 매수 {sym}",
             color=0x2ECC71,
             lines=[
-                f"price={price:,.0f} qty={qty} score={score:.1f}",
+                f"price={price:,.0f} qty={filled_qty} score={score:.1f}",
                 f"dayrise={metrics.get('dayrise',0.0):.2f}% accel={metrics.get('trv_accel',0.0):.2f}",
                 f"ofi={metrics.get('ofi',0.0):.2f} imb={metrics.get('imb',0.0):.2f}",
                 f"reason: {', '.join(reasons[:5])}",
@@ -605,7 +611,6 @@ class EngineSimple:
                 reason = "max_hold"
 
         if not reason:
-            self._save_state()
             return
 
         qty_sell = max(0, int(sellable_qty(sym)))
@@ -645,7 +650,13 @@ class EngineSimple:
         self.pos.pop(sym, None)
         self._last_sell_time = ts_epoch
         self._last_sell_symbol = sym
-        self._record_event(ts_epoch, "SELL", sym, reason)
+        if remain_qty <= 0:
+            self.cooldown_until[sym] = ts_epoch + self.cooldown_sec
+            self.pos.pop(sym, None)
+            self._record_event(ts_epoch, "SELL", sym, reason)
+        else:
+            p.qty = remain_qty
+            self._record_event(ts_epoch, "SELL", sym, f"{reason}|partial={filled_qty}")
         self._save_state()
 
         self._log_diag(
