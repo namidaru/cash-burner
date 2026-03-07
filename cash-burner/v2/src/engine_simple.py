@@ -52,7 +52,7 @@ class EngineSimple:
         self.ledger_file = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
         self.state_file = os.getenv("POSITION_STATE_FILE", os.path.join("data", "positions_simple.json"))
         self.watchlist_file = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
-        self.signal_diag_file = os.getenv("SIGNAL_DIAG_FILE", os.path.join("data", "signal_diag_simple.log"))
+        self.signal_diag_file = os.getenv("SIGNAL_DIAG_FILE", os.path.join("data", "signal_diag.log"))
         self.runtime_status_file = os.getenv("RUNTIME_STATUS_FILE", os.path.join("data", "runtime_status.json"))
 
         # buy / score
@@ -79,8 +79,8 @@ class EngineSimple:
         self.trail_arm_pct = float(os.getenv("TRAIL_ARM_PCT", "3.0"))
         self.trail_drop_pct = float(os.getenv("TRAIL_DROP_PCT", "2.2"))
         self.max_hold_sec = float(os.getenv("MAX_HOLD_SEC", "240"))
-        self.exit_grace_sec = float(os.getenv("EXIT_GRACE_SEC", "3.0"))
-        self.take_profit_grace_sec = float(os.getenv("TAKE_PROFIT_GRACE_SEC", "1.5"))
+        self.exit_grace_sec = max(5.0, float(os.getenv("EXIT_GRACE_SEC", "3.0")))
+        self.take_profit_grace_sec = max(5.0, float(os.getenv("TAKE_PROFIT_GRACE_SEC", "1.5")))
         self.stop_loss_early_grace_sec = float(os.getenv("STOP_LOSS_EARLY_GRACE_SEC", "3.0"))
         self.stop_loss_early_relax_mult = float(os.getenv("STOP_LOSS_EARLY_RELAX_MULT", "1.6"))
         self.stop_loss_emergency_pct = float(os.getenv("STOP_LOSS_EMERGENCY_PCT", "4.5"))
@@ -89,6 +89,7 @@ class EngineSimple:
         self._daily_loss_base_cash: float | None = None
         self._daily_realized_pnl: float = 0.0
         self._trading_halted: bool = False
+        self._last_trading_day: str = ""
 
         self.entry_chase_dayrise_pct = float(os.getenv("ENTRY_CHASE_DAYRISE_PCT", "15.0"))
         self.entry_chase_high_near_pct = float(os.getenv("ENTRY_CHASE_HIGH_NEAR_PCT", "0.10"))
@@ -107,7 +108,6 @@ class EngineSimple:
         self._last_watch_reload_ts = 0.0
         self._last_candidate_log_ts: Dict[str, float] = {}
         self._last_health_ts = 0.0
-        self._skip_reason_counts: Dict[str, int] = defaultdict(int)
         self._score_eval_total = 0
         self._score_pass_total = 0
         self._gate_block_counts: Dict[str, int] = defaultdict(int)
@@ -272,15 +272,15 @@ class EngineSimple:
             return 1.0
         return bid / ask
 
-    def _spread_bps(self, sym: str, price: float) -> float:
+    def _spread_bps(self, sym: str, price: float) -> float | None:
         ob = self.book.get(sym) or {}
         ask1 = _f(ob.get("ASKP1") or ob.get("askp1"))
         bid1 = _f(ob.get("BIDP1") or ob.get("bidp1"))
         if ask1 <= 0 or bid1 <= 0:
-            return 0.0
+            return None
         mid = (ask1 + bid1) / 2.0
         if mid <= 0:
-            return 0.0
+            return None
         return (ask1 - bid1) / mid * 10000.0
 
     def _pullback_rebound(self, dq: Deque[Tuple[float, float, float]], now: float, price: float) -> float:
@@ -302,6 +302,30 @@ class EngineSimple:
     def _is_afterhours_window(self, ts_epoch: float) -> bool:
         hhmm = int(time.strftime("%H%M", time.localtime(ts_epoch)))
         return not (900 <= hhmm < 1530)
+
+    def _is_regular_entry_session(self, ts_epoch: float) -> bool:
+        lt = time.localtime(ts_epoch)
+        if lt.tm_wday >= 5:
+            return False
+        hhmmss = lt.tm_hour * 10000 + lt.tm_min * 100 + lt.tm_sec
+        return 90000 <= hhmmss <= 152000
+
+    def _confirmed_fill_qty(self, j: Dict[str, Any]) -> int:
+        cands = []
+        if isinstance(j, dict):
+            cands.append(j)
+            for rk in ("output", "output1", "output2"):
+                out = j.get(rk)
+                if isinstance(out, dict):
+                    cands.append(out)
+                elif isinstance(out, list):
+                    cands.extend([it for it in out if isinstance(it, dict)])
+        for k in ("tot_ccld_qty", "TOT_CCLD_QTY", "ccld_qty", "CCLD_QTY", "exec_qty", "EXEC_QTY", "filled_qty", "FILLED_QTY"):
+            for d in cands:
+                v = _f(d.get(k), -1.0)
+                if v > 0:
+                    return int(v)
+        return 0
 
     def _prime_cash_status(self):
         now = time.time()
@@ -362,7 +386,8 @@ class EngineSimple:
         ofi = self._compute_ofi_window(dq, ts_epoch, 10.0)
         imb = self._imbalance(sym)
         depth = self._depth_ratio(sym)
-        spread_bps = self._spread_bps(sym, price)
+        spread_bps_raw = self._spread_bps(sym, price)
+        spread_bps = -1.0 if spread_bps_raw is None else spread_bps_raw
         dayrise = self._day_rise_pct(sym, price)
         accel = trv10 / max(1.0, trv30 / 3.0)
         pull_rebound = self._pullback_rebound(dq, ts_epoch, price)
@@ -399,8 +424,8 @@ class EngineSimple:
             penalty_chase = 5.0 + (7.0 if dayrise >= self.entry_chase_penalty_dayrise_pct else 0.0)
             if ret5 < self.buy_ret5_min:
                 penalty_chase += 4.0
-            if spread_bps > (self.buy_spread_max_bps * 0.8):
-                penalty_chase += min(5.0, (spread_bps - self.buy_spread_max_bps * 0.8) * 0.25)
+            if spread_bps_raw is not None and spread_bps_raw > (self.buy_spread_max_bps * 0.8):
+                penalty_chase += min(5.0, (spread_bps_raw - self.buy_spread_max_bps * 0.8) * 0.25)
 
         penalty_score = penalty_dayrise + penalty_vi + penalty_chase
         score = score_pos - penalty_score
@@ -465,7 +490,10 @@ class EngineSimple:
             return False, "gate_trv10"
         if metrics.get("ret10", 0.0) < self.buy_ret10_min:
             return False, "gate_ret10"
-        if metrics.get("spread_bps", 0.0) > self.buy_spread_max_bps:
+        spread_bps = metrics.get("spread_bps", -1.0)
+        if spread_bps is None or spread_bps < 0:
+            return False, "spread_missing"
+        if spread_bps > self.buy_spread_max_bps:
             return False, "gate_spread"
         ofi_ok = metrics.get("ofi", 0.0) >= self.buy_ofi_min
         imb_ok = metrics.get("imb", 0.0) >= self.buy_imb_min
@@ -495,13 +523,10 @@ class EngineSimple:
         return min(self.position_pct, 0.12)
 
     def enter_position(self, sym: str, price: float, score: float, reasons: list[str], metrics: Dict[str, float], ts_epoch: float):
-        display_cash = self._refresh_orderable_cash(ts_epoch, use_fallback=False)
         orderable_cash = self._refresh_orderable_cash(ts_epoch, use_fallback=True)
-        live_cash = self._effective_buying_power()
-        available_cash_source = "live"
-        if live_cash <= 0:
-            available_cash_source = "snapshot" if (orderable_cash or 0.0) > 0 else "fallback"
-        cash = live_cash if live_cash > 0 else float(orderable_cash or display_cash or 0.0)
+        display_cash = orderable_cash
+        cash = float(orderable_cash or 0.0)
+        available_cash_source = "snapshot" if cash > 0 else "none"
         pct = self._position_pct_by_score(score)
         target_budget = cash * pct
         qty = int(target_budget // max(1.0, price))
@@ -512,10 +537,9 @@ class EngineSimple:
             ts_epoch,
             sym,
             "BUY_CASH",
-            f"display_cash={display_cash if display_cash is not None else -1:.0f} orderable_cash={orderable_cash if orderable_cash is not None else -1:.0f} live_cash={live_cash:.0f} effective_cash={cash:.0f} source={available_cash_source} target_budget={target_budget:.0f} qty={qty} cap={capped_qty_reason or '-'} cash_gap={(cash - float(orderable_cash or 0.0)):.0f}",
+            f"orderable_cash={orderable_cash if orderable_cash is not None else -1:.0f} effective_cash={cash:.0f} source={available_cash_source} target_budget={target_budget:.0f} qty={qty} cap={capped_qty_reason or '-'}",
         )
         if qty <= 0:
-            self._skip_reason_counts["cash_short"] += 1
             self._log_diag(ts_epoch, sym, "SKIP", f"cash_short cash={cash:.0f} price={price:.0f} budget={target_budget:.0f} source={available_cash_source}")
             return
 
@@ -525,10 +549,16 @@ class EngineSimple:
             self._log_diag(ts_epoch, sym, "BUY_FAIL", str(j.get("msg1", ""))[:160])
             return
 
-        self.pos[sym] = Position(qty=qty, entry_price=price, entry_ts=ts_epoch, max_price=price, score=score, reasons=reasons[:5])
+        filled_qty = self._confirmed_fill_qty(j)
+        if filled_qty <= 0:
+            self._log_diag(ts_epoch, sym, "BUY_ACK", "accepted_unconfirmed")
+            return
+
+        filled_qty = min(qty, filled_qty)
+        self.pos[sym] = Position(qty=filled_qty, entry_price=price, entry_ts=ts_epoch, max_price=price, score=score, reasons=reasons[:5])
         self._last_buy_time = ts_epoch
         self._last_buy_symbol = sym
-        self._record_event(ts_epoch, "BUY", sym, f"score={score:.1f} qty={qty}")
+        self._record_event(ts_epoch, "BUY", sym, f"score={score:.1f} qty={filled_qty}")
         self._save_state()
         pos_s, neg_s = self._top_factor_strings(metrics)
         self._log_diag(
@@ -541,7 +571,7 @@ class EngineSimple:
             title=f"✅ 단순모멘텀 매수 {sym}",
             color=0x2ECC71,
             lines=[
-                f"price={price:,.0f} qty={qty} score={score:.1f}",
+                f"price={price:,.0f} qty={filled_qty} score={score:.1f}",
                 f"dayrise={metrics.get('dayrise',0.0):.2f}% accel={metrics.get('trv_accel',0.0):.2f}",
                 f"ofi={metrics.get('ofi',0.0):.2f} imb={metrics.get('imb',0.0):.2f}",
                 f"reason: {', '.join(reasons[:5])}",
@@ -597,7 +627,12 @@ class EngineSimple:
             self._log_diag(ts_epoch, sym, "SELL_FAIL", str(j.get("msg1", ""))[:160])
             return
 
-        pnl = (price - p.entry_price) * qty
+        filled_qty = self._confirmed_fill_qty(j)
+        if filled_qty < p.qty:
+            self._log_diag(ts_epoch, sym, "SELL_ACK", f"sell_accepted_unconfirmed filled={filled_qty} req={qty}")
+            return
+
+        pnl = (price - p.entry_price) * p.qty
         self._daily_realized_pnl += pnl
         if self._daily_loss_base_cash and self._daily_loss_base_cash > 0:
             loss_pct = max(0.0, -self._daily_realized_pnl) / self._daily_loss_base_cash * 100.0
@@ -681,7 +716,6 @@ class EngineSimple:
             )
 
         if not ok:
-            self._skip_reason_counts[why] += 1
             self._gate_block_counts[why] += 1
             self._record_event(ts_epoch, "DROP", sym, why)
             return
@@ -757,7 +791,23 @@ class EngineSimple:
         ]
         self.notifier.send(title="🩺 Simple Engine Health", color=0x5865F2, lines=lines)
 
+    def _reset_daily_state(self, ts_epoch: float):
+        today = time.strftime("%Y%m%d", time.localtime(ts_epoch))
+        last = self._last_trading_day
+        if last == today:
+            return
+        self._last_trading_day = today
+        if self._trading_halted or self._daily_realized_pnl != 0.0:
+            self._log_diag(
+                ts_epoch, "ENGINE", "DAILY_RESET",
+                f"prev_day={last} pnl={self._daily_realized_pnl:.0f} halted={self._trading_halted}"
+            )
+        self._trading_halted = False
+        self._daily_realized_pnl = 0.0
+        self._daily_loss_base_cash = None
+
     def on_timer(self, ts_epoch: float):
+        self._reset_daily_state(ts_epoch)
         self._reload_watchlist(ts_epoch)
         self._refresh_orderable_cash(ts_epoch, use_fallback=True)
         self._send_health(ts_epoch)

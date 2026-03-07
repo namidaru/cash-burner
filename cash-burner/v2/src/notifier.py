@@ -55,7 +55,13 @@ class DiscordNotifier:
                 }
             ],
         }
-        try:
-            requests.post(self.webhook_url, json=payload, timeout=self.timeout)
-        except Exception:
-            return
+        for attempt in range(3):
+            try:
+                r = requests.post(self.webhook_url, json=payload, timeout=self.timeout)
+                if r.status_code == 429:
+                    retry_after = float((r.json() or {}).get("retry_after", 1.0))
+                    time.sleep(min(retry_after, 5.0))
+                    continue
+                return
+            except Exception:
+                return

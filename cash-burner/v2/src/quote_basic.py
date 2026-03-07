@@ -8,7 +8,7 @@ from kis_http import request
 TRID = "CTPF1002R"
 PATH = "/uapi/domestic-stock/v1/quotations/search-stock-info"
 
-CACHE_PATH = os.getenv("PREVCLOSE_CACHE", r"data\prev_close.json")
+CACHE_PATH = os.getenv("PREVCLOSE_CACHE", os.path.join("data", "prev_close.json"))
 
 def _ensure_dir(path: str):
     d = os.path.dirname(path)
