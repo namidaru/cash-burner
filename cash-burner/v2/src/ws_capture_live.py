@@ -16,10 +16,7 @@ def _dated_out_file() -> str:
     ymd = time.strftime("%Y%m%d")
     if "{date}" in raw:
         return raw.replace("{date}", ymd)
-    base, ext = os.path.splitext(raw)
-    if not ext:
-        ext = ".log"
-    return f"{base}_{ymd}{ext}"
+    return raw
 
 
 OUT_FILE = _dated_out_file()

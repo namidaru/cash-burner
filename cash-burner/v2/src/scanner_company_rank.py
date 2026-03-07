@@ -1039,11 +1039,3 @@ def build_watchlist() -> List[str]:
     _LAST_SOURCE_MAP = {sym: src_map.get(sym, "rest") for sym in out}
     _emit_watch_status(len(raw_by_sym), len(out), want_n, dropped, scored, len(by_sym_q))
     return out
-
-
-def get_last_build_meta() -> str:
-    return _LAST_BUILD_META
-
-
-def get_last_source_map() -> Dict[str, str]:
-    return dict(_LAST_SOURCE_MAP)

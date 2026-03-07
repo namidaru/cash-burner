@@ -15,13 +15,20 @@ def parse_prefix_ts(line: str) -> float:
     except Exception:
         return time.time()
 
+def _resolve_in_file(path: str) -> str:
+    if "{date}" in path:
+        return path.replace("{date}", time.strftime("%Y%m%d"))
+    return path
+
 def run_live(in_file: str, poll: float = 0.2):
+    _last_timer = [0.0]
     eng = EngineSimple()
     while True:
         try:
-            with open(in_file, "r", encoding="utf-8") as f:
+            live_path = _resolve_in_file(in_file)
+            with open(live_path, "r", encoding="utf-8") as f:
                 f.seek(0,2)
-                print(time.strftime("%Y-%m-%d %H:%M:%S"), f"[LIVE] {in_file}")
+                print(time.strftime("%Y-%m-%d %H:%M:%S"), f"[LIVE] {live_path}")
                 while True:
                     line = f.readline()
                     if line:
@@ -40,16 +47,22 @@ def run_live(in_file: str, poll: float = 0.2):
                             except Exception as e:
                                 print(time.strftime("%Y-%m-%d %H:%M:%S"), f"[LIVE][WARN] {tr_id} {type(e).__name__}: {e}")
                     else:
-                        try:
-                            eng.on_timer(time.time())
-                        except Exception as e:
-                            print(time.strftime("%Y-%m-%d %H:%M:%S"), f"[LIVE][WARN] timer {type(e).__name__}: {e}")
+                        now = time.time()
+                        if now - _last_timer[0] >= 1.0:
+                            _last_timer[0] = now
+                            try:
+                                eng.on_timer(now)
+                            except Exception as e:
+                                print(time.strftime("%Y-%m-%d %H:%M:%S"), f"[LIVE][WARN] timer {type(e).__name__}: {e}")
                         time.sleep(poll)
         except FileNotFoundError:
-            try:
-                eng.on_timer(time.time())
-            except Exception as e:
-                print(time.strftime("%Y-%m-%d %H:%M:%S"), f"[LIVE][WARN] timer(no-file) {type(e).__name__}: {e}")
+            now = time.time()
+            if now - _last_timer[0] >= 1.0:
+                _last_timer[0] = now
+                try:
+                    eng.on_timer(now)
+                except Exception as e:
+                    print(time.strftime("%Y-%m-%d %H:%M:%S"), f"[LIVE][WARN] timer(no-file) {type(e).__name__}: {e}")
             time.sleep(max(1.0, poll))
         except Exception as e:
             print(time.strftime("%Y-%m-%d %H:%M:%S"), f"[LIVE][ERR] {type(e).__name__}: {e}")
