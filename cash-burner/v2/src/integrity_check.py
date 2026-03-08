@@ -103,7 +103,7 @@ def check_ledger(path: str) -> Dict[str, object]:
         hints.append(f"stop_loss 비율 {stop_loss_sells/full_sells*100:.0f}% (≥60%): STOP_LOSS_PCT 완화 또는 진입 조건 재검토")
     if hold_secs:
         avg_hold = sum(hold_secs) / len(hold_secs)
-        max_hold_sec = float(os.getenv("MAX_HOLD_SEC", "240"))
+        max_hold_sec = float(os.getenv("MAX_HOLD_SEC", "600"))  # 240→600: engine과 동기화
         if avg_hold >= max_hold_sec * 0.70:
             hints.append(f"평균 보유시간 {avg_hold:.0f}s (MAX_HOLD_SEC {max_hold_sec:.0f}s의 70%↑): MAX_HOLD_SEC 연장 또는 청산 조건 조정 검토")
 

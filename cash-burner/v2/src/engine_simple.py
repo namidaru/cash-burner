@@ -623,7 +623,9 @@ class EngineSimple:
         ofi_ok = metrics.get("ofi", 0.0) >= self.buy_ofi_min
         imb_ok = metrics.get("imb", 0.0) >= self.buy_imb_min
         if not (ofi_ok or imb_ok):
-            return False, "gate_ofi_imb"
+            # 장 초반 9:00~9:10 호가/ofi 미도착 시 면제
+            if not (900 <= hhmm < 910):
+                return False, "gate_ofi_imb"
         # PROMPT 7: 시장 하락추세 시 진입 기준 +15점 강화
         effective_threshold = self.entry_score_threshold + (15.0 if self._market_declining else 0.0)
         if score < effective_threshold:
@@ -665,6 +667,8 @@ class EngineSimple:
         return final_pct, quality_mult
 
     def enter_position(self, sym: str, price: float, score: float, reasons: list[str], metrics: Dict[str, float], ts_epoch: float):
+        if sym in self.pos:  # 중복 진입 방지
+            return
         self._last_orderable_cash_ts = 0.0
         orderable_cash = self._refresh_orderable_cash(ts_epoch, use_fallback=True)
         cash = float(orderable_cash or 0.0)
