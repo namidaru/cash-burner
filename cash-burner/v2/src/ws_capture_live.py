@@ -277,8 +277,9 @@ class WSCapture:
         return keep_syms - excluded
 
     def start(self):
-        _ensure_dir(_dated_out_file())
-        _append(_dated_out_file(), f"# ---- session start {_ts()} mode=real tr_ids={TR_IDS} ----")
+        out_file = _dated_out_file()
+        _ensure_dir(out_file)
+        _append(out_file, f"# ---- session start {_ts()} mode=real tr_ids={TR_IDS} ----")
         _append(CONTROL_FILE, f"{_ts()}\tBOOT watchlist_file={WATCHLIST_FILE}")
         if DROPPED_TR_IDS:
             _append(CONTROL_FILE, f"{_ts()}\tTR_ID_DROP unsupported={','.join(DROPPED_TR_IDS)}")
@@ -333,7 +334,7 @@ class WSCapture:
                 _append(CONTROL_FILE, f"{_ts()}\t{s[:2000]}")
                 return
             if s.startswith("0|") or s.startswith("1|"):
-                _append(_dated_out_file(), f"{_ts()}\t{s}")
+                _append(out_file, f"{_ts()}\t{s}")
 
         def on_error(ws, err):
             _append(CONTROL_FILE, f"{_ts()}\tERR {err}")
