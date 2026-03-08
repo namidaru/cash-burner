@@ -34,9 +34,8 @@ def load_cache() -> Dict[str,float]:
         today = time.strftime("%Y%m%d")
         out: Dict[str, float] = {}
         for sym, v in raw.items():
-            if isinstance(v, dict):
-                if v.get("date") == today:
-                    out[sym] = float(v.get("price", 0))
+            if isinstance(v, dict) and v.get("date") == today:
+                out[sym] = float(v.get("price", 0))
         return out
     except Exception:
         return {}

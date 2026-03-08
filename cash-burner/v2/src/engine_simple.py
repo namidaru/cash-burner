@@ -803,7 +803,11 @@ class EngineSimple:
                     else:
                         self._loss_streak[sym] = 0
                 self.pos.pop(sym, None)
-                self.cooldown_until[sym] = ts_epoch + self.cooldown_sec
+                if self.loss_streak_block_enabled and self._loss_streak.get(sym, 0) >= 2:
+                    self._loss_streak_blocked.add(sym)
+                    self.cooldown_until[sym] = self._eod_ts(ts_epoch)
+                else:
+                    self.cooldown_until[sym] = ts_epoch + self._exit_cooldown(reason)
                 self._last_sell_time = ts_epoch
                 self._last_sell_symbol = sym
                 self._record_event(ts_epoch, "SELL", sym, f"EVICT_{reason}")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os, json, time, threading, csv, queue, re
+from collections import deque
 from dataclasses import dataclass
 import requests, websocket
 from kis_http import request
@@ -19,7 +20,6 @@ def _dated_out_file() -> str:
     return raw
 
 
-OUT_FILE = _dated_out_file()
 CONTROL_FILE = os.getenv("CONTROL_FILE", os.path.join("data", "ws_control.log"))
 WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
 LEDGER_FILE = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
@@ -172,7 +172,7 @@ class WSCapture:
         self.last_held_symbols: set[str] = set()
         self.watch_remove_after: dict[str, float] = {}
         self.leader_radar_active_until: dict[str, float] = {}
-        self.leader_radar_price_hist: dict[str, list[tuple[float, float]]] = {}
+        self.leader_radar_price_hist: dict[str, deque] = {}
 
     def _in_preopen_window(self, ts_epoch: float | None = None) -> bool:
         hhmm = _hhmm_now(ts_epoch)
@@ -246,11 +246,11 @@ class WSCapture:
         """WS 체결 틱에서 직접 호출. REST 폴링 불필요."""
         if not LEADER_RADAR_ENABLE:
             return
-        h = self.leader_radar_price_hist.setdefault(sym, [])
+        h = self.leader_radar_price_hist.setdefault(sym, deque())
         h.append((ts, price))
         cutoff = ts - 4.0
         while h and h[0][0] < cutoff:
-            h.pop(0)
+            h.popleft()
         if not h:
             self.leader_radar_price_hist.pop(sym, None)
             return
