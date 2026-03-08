@@ -78,7 +78,9 @@ def parse_ledger(path: str) -> Tuple[List[dict], List[dict]]:
             if action == "BUY":
                 ledger_buys.append(row)
             elif action == "SELL":
-                ledger_sells.append(row)
+                reason = (row.get("reason") or "").lower()
+                if "partial_take" not in reason:
+                    ledger_sells.append(row)
     return ledger_buys, ledger_sells
 
 
@@ -135,7 +137,7 @@ def match_trades(diag_buys: List[dict], diag_sells: List[dict],
             else:
                 ls = {}
 
-            buy_price = _f(lb.get("price")) or _f(b.get("price"))
+            buy_price = _f(lb.get("price")) or _f(str(b.get("price", "")).replace(",", ""))
             sell_price = _f(ls.get("price")) or _f(s.get("price"))
             qty = _f(lb.get("qty")) or 1.0
 
@@ -199,7 +201,7 @@ def analyze(trades: List[dict]) -> None:
 
     # 시간대별 승률
     print(f"\n=== 시간대별 승률 ===")
-    hour_buckets = {9: [], 10: [], 11: [], 13: [], 14: []}
+    hour_buckets = {9: [], 10: [], 11: [], 12: [], 13: [], 14: []}
     for t in trades:
         h = t["buy_hhmm"] // 100
         if h in hour_buckets and t["pnl_pct_ledger"] is not None:

@@ -68,11 +68,14 @@ def check_ledger(path: str) -> Dict[str, object]:
                     open_ts[sym] = ts
                 buy_ts[sym] = ts
             else:
-                sells += 1
                 reason = row.get("reason", "")
-                if "stop_loss" in reason:
-                    stop_loss_sells += 1
-                if sym in buy_ts and ts > buy_ts[sym]:
+                if "partial_take" in reason:
+                    pass
+                else:
+                    sells += 1
+                    if "stop_loss" in reason:
+                        stop_loss_sells += 1
+                if sym in buy_ts and ts > buy_ts[sym] and "partial_take" not in reason:
                     hold_secs.append(ts - buy_ts[sym])
                 by_symbol[sym] -= qty
                 if by_symbol[sym] <= 0:
