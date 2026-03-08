@@ -21,19 +21,15 @@ from ws_sub_manager import write_watchlist
 from ws_capture_live import WSCapture
 from runner_live import run_live
 
-def _resolve_in_file() -> str:
+def _raw_in_file() -> str:
+    """{date} 미치환 원본 그대로 반환. runner_live가 매 루프마다 그 시점 날짜로 치환."""
     explicit = (os.getenv("IN_FILE", "") or "").strip()
     if explicit:
         return explicit
-
-    raw = os.getenv("OUT_FILE", os.path.join("data", "ws_dump.log"))
-    ymd = time.strftime("%Y%m%d")
-    if "{date}" in raw:
-        return raw.replace("{date}", ymd)
-    return raw
+    return os.getenv("OUT_FILE", os.path.join("data", "ws_dump.log"))
 
 
-IN_FILE = _resolve_in_file()
+IN_FILE = _raw_in_file()
 LIVE_POLL_SEC = float(os.getenv("LIVE_POLL_SEC", "0.2"))
 SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "2"))
 RADAR_SCAN_INTERVAL_SEC = float(os.getenv("RADAR_SCAN_INTERVAL_SEC", "1.0"))

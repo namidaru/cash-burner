@@ -441,7 +441,8 @@ def _passes_quality(item: Dict[str, Any], min_price: float, max_price: float, mi
         return False
 
     min_accel = float(os.getenv("WATCH_MIN_VOLUME_ACCEL", "0.8"))
-    if volume_acceleration(item) < min_accel:
+    accel = volume_acceleration(item)
+    if accel > 0 and accel < min_accel:
         return False
 
     return True
@@ -454,11 +455,11 @@ def _supplement_from_volume_rank(
     min_tv: float,
     block_rise: float,
     meta: List[str],
-    max_price: float,
-    min_chg: float,
-    max_chg: float,
-    min_strength: float,
-    max_strength: float,
+    max_price: float = 0.0,
+    min_chg: float = 0.0,
+    max_chg: float = 999.0,
+    min_strength: float = 0.0,
+    max_strength: float = 9999.0,
 ) -> List[str]:
     if need_n <= 0:
         return []
@@ -558,6 +559,9 @@ def _supplement_from_strength(
     min_tv: float,
     block_rise: float,
     meta: List[str],
+    max_price: float = 0.0,
+    min_chg: float = 0.0,
+    max_chg: float = 999.0,
 ) -> List[str]:
     if need_n <= 0:
         return []
@@ -590,6 +594,10 @@ def _supplement_from_strength(
         strength = _parse_strength(it)
 
         if min_price > 0 and px > 0 and px <= min_price:
+            continue
+        if max_price > 0 and px > max_price:
+            continue
+        if r < min_chg or r > max_chg:
             continue
         if r >= block_rise:
             continue
@@ -764,11 +772,11 @@ def build_watchlist() -> List[str]:
     """
     global _LAST_BUILD_META, _LAST_SOURCE_MAP
 
-    want_n = int(os.getenv("WATCH_TOP_N", "12"))
+    want_n = int(os.getenv("WATCH_TOP_N", "15"))  # 12→15: WS 슬롯 여유 있어 감시 종목 확대
     min_price = float(os.getenv("WATCH_MIN_PRICE", "5000"))
     max_price = float(os.getenv("WATCH_MAX_PRICE", "200000"))
-    min_chg = float(os.getenv("WATCH_MIN_CHANGE_PCT", "1.0"))
-    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "12.0"))
+    min_chg = float(os.getenv("WATCH_MIN_CHANGE_PCT", "0.5"))   # 1.0→0.5: 급등 초입 선점
+    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "10.0"))  # 12.0→10.0: ENTRY_HARD_DAYRISE와 선제 정렬
     hard_heat = float(os.getenv("WATCH_HARD_HEAT_PCT", "14.0"))
     soft_heat = float(os.getenv("WATCH_SOFT_HEAT_PCT", "10.5"))
     min_tv = float(os.getenv("WATCH_MIN_TR_VALUE", "600000000"))
@@ -877,23 +885,7 @@ def build_watchlist() -> List[str]:
                 dropped["spread"] += 1
                 continue
 
-            momentum_score = chg
-            liquidity_score = math.log1p(max(tv, 0.0))
-            volume_score = math.log1p(max(vol, 0.0))
-            volume_accel = min(max(volume_acceleration(it), 0.0), 3.0)
-
-            heat_penalty = 0.0
-            if chg > soft_heat:
-                heat_penalty = min(4.5, (chg - soft_heat) * 0.9)
-
-            score = (
-                (momentum_score * 2.0)
-                + (liquidity_score * 0.7)
-                + (volume_score * 0.3)
-                + (volume_accel * 1.8)
-                - (spread_pct * 2.5)
-                - heat_penalty
-            )
+            score = score_item(it)
             if not math.isfinite(score):
                 dropped["score"] += 1
                 continue
@@ -993,23 +985,7 @@ def build_watchlist() -> List[str]:
             dropped["spread"] += 1
             continue
 
-        momentum_score = chg
-        liquidity_score = math.log1p(max(tv, 0.0))
-        volume_score = math.log1p(max(vol, 0.0))
-        volume_accel = min(max(volume_acceleration(it), 0.0), 3.0)
-
-        heat_penalty = 0.0
-        if chg > soft_heat:
-            heat_penalty = min(4.5, (chg - soft_heat) * 0.9)
-
-        score = (
-            (momentum_score * 2.0)
-            + (liquidity_score * 0.7)
-            + (volume_score * 0.3)
-            + (volume_accel * 1.8)
-            - (spread_pct * 2.5)
-            - heat_penalty
-        )
+        score = score_item(it)
         if not math.isfinite(score):
             dropped["score"] += 1
             continue
@@ -1023,6 +999,21 @@ def build_watchlist() -> List[str]:
         out.append(sym)
         if len(out) >= want_n:
             break
+
+    if len(out) < want_n:
+        out += _supplement_from_volume_rank(
+            want_n - len(out), set(out), min_price, min_tv, hard_heat, meta,
+            max_price=max_price, min_chg=min_chg, max_chg=max_chg,
+        )
+    if len(out) < want_n:
+        out += _supplement_from_strength(
+            want_n - len(out), set(out), min_price, min_tv, hard_heat, meta,
+            max_price=max_price, min_chg=min_chg, max_chg=max_chg,
+        )
+    if len(out) < want_n:
+        out += _supplement_from_conditions(
+            want_n - len(out), set(out), min_price, min_tv, hard_heat, meta,
+        )
 
     if not out:
         fb = _fallback_symbols()[:want_n]

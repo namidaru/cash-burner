@@ -52,6 +52,14 @@ def parse_ws_raw_multi(raw: str) -> List[Tuple[str, Dict[str, str]]]:
         return out
 
     # orderbook
+    if len(values) != len(cols):
+        # best-effort: slice to cols length so _values_len == _cols_len downstream
+        block = values[:len(cols)]
+        row = dict(zip(cols, block))
+        row["_values_len"] = str(len(cols))
+        row["_cols_len"] = str(len(cols))
+        out.append((tr_id, row))
+        return out
     row = dict(zip(cols, values))
     row["_values_len"] = str(len(values))
     row["_cols_len"] = str(len(cols))

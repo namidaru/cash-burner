@@ -1,0 +1,53 @@
+아래 버그 2개 수정해줘. 기존 동작 최소 변경.
+
+## Bug 10 — engine_simple.py : EVICT 경로에서 daily_loss_limit 체크 및 이벤트 기록 누락
+sell_fail_count >= 3으로 강제 퇴출 시 정상 SELL 경로의 3가지 처리가 빠져있음.
+```python
+# 변경 전 (EVICT 블록)
+self.pos.pop(sym, None)
+self.cooldown_until[sym] = ts_epoch + self.cooldown_sec
+self._save_state()
+self._log_diag(ts_epoch, sym, "SELL_EVICT", ...)
+
+# 변경 후 — 아래 3가지 추가
+# 1) daily_loss_limit 체크
+if self._daily_loss_base_cash and self._daily_loss_base_cash > 0:
+    loss_pct = max(0.0, -self._daily_realized_pnl) / self._daily_loss_base_cash * 100.0
+    if not self._trading_halted and loss_pct >= self.daily_loss_limit_pct:
+        self._trading_halted = True
+        self._log_diag(ts_epoch, "ENGINE", "HALT",
+            f"daily_loss_pct={loss_pct:.2f} limit={self.daily_loss_limit_pct:.2f} pnl={self._daily_realized_pnl:.0f}")
+
+# 2) loss_streak 업데이트
+if self.loss_streak_block_enabled:
+    if "stop_loss" in reason:
+        self._loss_streak[sym] = self._loss_streak.get(sym, 0) + 1
+    else:
+        self._loss_streak[sym] = 0
+
+# 3) 이벤트 기록
+self._last_sell_time = ts_epoch
+self._last_sell_symbol = sym
+self._record_event(ts_epoch, "SELL", sym, f"EVICT_{reason}")
+```
+
+## Bug 11 — engine_simple.py : _score_eval_total 과다 카운트
+should_buy에서 (ts - last) >= 1.0 이면 카운트하는데,
+_last_candidate_log_ts 업데이트는 should_buy 호출 *이후* on_trade에서 일어남.
+같은 초에 여러 틱이 오면 should_buy를 틱마다 호출하면서 매번 카운트 증가.
+score_pass_rate가 실제보다 낮게 계산돼 운영 판단 지표 오염됨.
+```python
+# 변경 전 (should_buy 내)
+last = self._last_candidate_log_ts.get(sym, 0.0)
+if (ts_epoch - last) >= 1.0:
+    self._score_eval_total += 1
+
+# 변경 후 — 카운트를 on_trade의 _last_candidate_log_ts 업데이트 블록으로 이동
+# should_buy에서 해당 두 줄 제거하고,
+# on_trade의 아래 블록 안으로 이동:
+last = self._last_candidate_log_ts.get(sym, 0.0)
+if (ts_epoch - last) >= 1.0:
+    self._score_eval_total += 1          # ← 여기로 이동
+    self._last_candidate_log_ts[sym] = ts_epoch
+    ...
+```

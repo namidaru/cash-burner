@@ -1,0 +1,40 @@
+아래 버그 4개를 수정해줘. 기존 동작 건드리지 말고 해당 부분만 최소 수정.
+
+## Bug 1 — engine_simple.py
+`__init__`에서 max(5.0, ...) 클램프가 env var을 무시함. 기본값 올리고 클램프 제거.
+```python
+# 변경 전
+self.exit_grace_sec        = max(5.0, float(os.getenv("EXIT_GRACE_SEC", "3.0")))
+self.take_profit_grace_sec = max(5.0, float(os.getenv("TAKE_PROFIT_GRACE_SEC", "1.5")))
+# 변경 후
+self.exit_grace_sec        = float(os.getenv("EXIT_GRACE_SEC", "5.0"))
+self.take_profit_grace_sec = float(os.getenv("TAKE_PROFIT_GRACE_SEC", "5.0"))
+```
+
+## Bug 2 — ws_capture_live.py
+모듈 상단 `OUT_FILE = _dated_out_file()` 가 import 시 1회만 실행돼서 자정 넘으면 전날 파일에 기록됨.
+`_append(OUT_FILE, ...)` 호출부를 전부 `_append(_dated_out_file(), ...)` 로 교체.
+
+## Bug 3 — ws_capture_live.py
+`_leader_radar_symbols` 마지막 return에서 excluded 필터 누락.
+```python
+# 변경 전
+return keep_syms
+# 변경 후
+return keep_syms - excluded
+```
+
+## Bug 4 — engine_simple.py
+`_compute_ofi_window`에서 윈도우 이전 틱을 prev로 누적 안 해서 첫 틱 방향 스킵됨.
+```python
+# 변경 전
+for t, px, vol in dq:
+    if t < st:
+        continue
+# 변경 후
+for t, px, vol in dq:
+    if t < st:
+        if px > 0:
+            prev = px
+        continue
+```

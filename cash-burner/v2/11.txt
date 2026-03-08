@@ -1,0 +1,116 @@
+main_real.py, scanner_company_rank.py, quote_multi.py, quote_basic.py 개선 3개:
+
+===== 개선 A: _stabilize_watchlist keep_n 고정 로직 점수 기반으로 교체 =====
+
+현재: prev_cut[:keep_n] 상위 20개를 무조건 고정.
+점수가 떨어진 종목도 이전 워치리스트 상위에 있으면 계속 살아남음.
+
+수정 — main_real.py _stabilize_watchlist():
+고정 기준을 "이전 순위 상위" 대신 "새 빌드에서도 상위에 있는 종목"으로 변경:
+
+현재:
+    fixed = [s for s in prev_cut[:keep_n] if s in new_cut]
+    result = list(fixed)
+    for s in prev_cut[keep_n:]:
+        if s in result:
+            continue
+        result.append(s)
+
+수정:
+    # 새 빌드 상위 keep_n에 있으면서 이전에도 있던 종목만 고정
+    new_top = set(new_cut[:keep_n])
+    fixed = [s for s in prev_cut if s in new_top]
+    result = list(fixed)
+    # 새 빌드 상위 종목 중 아직 result에 없는 것 추가
+    for s in new_cut:
+        if s not in result:
+            result.append(s)
+        if len(result) >= want_n:
+            break
+
+이유: "이전에 좋았던 종목"이 아니라 "지금도 좋은 종목"을 기준으로 고정.
+흔들림 방지 효과는 유지하면서 stale 종목 고착 방지.
+
+===== 개선 B: score_item strength_score — rank API에 없는 필드 fallback 처리 =====
+
+현재: score_item()의 strength는 volume-rank 응답에 없는 키를 탐색 → 항상 0.
+strength_score가 실제로 기여하지 못함.
+
+수정 — quote_multi.py score_item():
+strength 필드 탐색 실패 시, 체결강도를 cttr(매수체결/매도체결 비율)로 대체 추정:
+
+현재:
+    strength = _get_first(it, [
+        "tday_rltv", "exec_str", "trade_strength", "cntrg", "cttr", "power"
+    ], 0.0)
+
+수정:
+    strength = _get_first(it, [
+        "tday_rltv", "exec_str", "trade_strength", "cntrg", "cttr", "power"
+    ], 0.0)
+
+    # strength 필드가 없으면 매수/매도 체결건수 비율로 추정
+    if strength == 0.0:
+        buy_cnt = _get_first(it, ["shnu_cntg_csnu", "SHNU_CNTG_CSNU"], 0.0)
+        sell_cnt = _get_first(it, ["seln_cntg_csnu", "SELN_CNTG_CSNU"], 0.0)
+        if sell_cnt > 0:
+            strength = (buy_cnt / sell_cnt) * 100.0
+
+    # 또한 score_item이 scanner_company_rank에서 호출될 때는
+    # build_watchlist inline 공식과 중복되지 않도록
+    # strength_score 가중치를 WATCH_STRENGTH_WEIGHT env로 조정 가능하게:
+    strength_weight = float(os.getenv("WATCH_STRENGTH_WEIGHT", "1.2"))
+    strength_score = max(0.0, (strength - 100.0) / 20.0)
+    if r > 2.0:
+        strength_score *= 0.7
+
+    # 기존 코드의 strength_score * 1.2 부분을:
+    + (strength_score * strength_weight)
+    # 으로 교체 (기본값 1.2 유지이므로 동작 변화 없음)
+
+===== 개선 C: prev_close.json 날짜 기반 캐시로 교체 =====
+
+현재: prev_close.json에 {symbol: price} 형태로 저장. 날짜 구분 없음.
+액면분할/재상장 시 오래된 전일종가가 계속 사용되어 day_rise_pct 왜곡.
+
+수정 — quote_basic.py:
+
+1. 캐시 구조 변경:
+현재: {"005930": 78000.0}
+수정: {"005930": {"price": 78000.0, "date": "20250310"}}
+
+2. load_cache() — 구버전 flat dict 자동 변환 지원:
+def load_cache() -> Dict[str, float]:
+    try:
+        with open(CACHE_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        today = time.strftime("%Y%m%d")
+        out = {}
+        for sym, v in raw.items():
+            if isinstance(v, dict):
+                if v.get("date") == today:
+                    out[sym] = float(v.get("price", 0))
+                # 날짜 다르면 stale → 제외 (자동 갱신)
+            elif isinstance(v, (int, float)):
+                # 구버전 flat → 날짜 모르므로 무효 처리
+                pass
+        return out
+    except Exception:
+        return {}
+
+3. save_cache() — 날짜 포함해서 저장:
+def save_cache(cache: Dict[str, float]):
+    _ensure_dir(CACHE_PATH)
+    today = time.strftime("%Y%m%d")
+    payload = {sym: {"price": price, "date": today}
+               for sym, price in cache.items() if price > 0}
+    with open(CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+이유: 매일 자동으로 전날 캐시가 무효화됨.
+재상장/액면분할 종목도 당일 최초 조회 시 새 전일종가 취득.
+
+===== 공통 주의사항 =====
+기존 env var 기본값 변경 금지.
+order_cash() 호출 경로 건드리지 말 것.
+ensure_prev_close() 인터페이스(반환값 Dict[str, float]) 변경 금지.

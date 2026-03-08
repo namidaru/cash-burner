@@ -39,11 +39,6 @@ LEADER_RADAR_ENABLE = os.getenv("LEADER_RADAR_ENABLE", "0") == "1"
 LEADER_RADAR_RET3S_PCT = float(os.getenv("LEADER_RADAR_RET3S_PCT", "1.0"))
 LEADER_RADAR_MAX_SUBS = max(0, int(os.getenv("LEADER_RADAR_MAX_SUBS", "5")))
 LEADER_RADAR_HOLD_SEC = float(os.getenv("LEADER_RADAR_HOLD_SEC", "120"))
-LEADER_RADAR_POLL_SEC = float(os.getenv("LEADER_RADAR_POLL_SEC", "1.0"))
-LEADER_RADAR_POOL_TOPK = max(10, int(os.getenv("LEADER_RADAR_POOL_TOPK", "120")))
-LEADER_RADAR_MARKETS = [m.strip() for m in os.getenv("LEADER_RADAR_MARKETS", os.getenv("VOLUME_RANK_MARKETS", "J,NX")).split(",") if m.strip()]
-VOLUME_RANK_PATH = "/uapi/domestic-stock/v1/quotations/volume-rank"
-VOLUME_RANK_TR_ID = os.getenv("LEADER_RADAR_TR_ID", "FHPST01710000")
 
 
 def _normalized_tr_ids(raw_ids: list[str]) -> tuple[list[str], list[str]]:
@@ -178,7 +173,6 @@ class WSCapture:
         self.watch_remove_after: dict[str, float] = {}
         self.leader_radar_active_until: dict[str, float] = {}
         self.leader_radar_price_hist: dict[str, list[tuple[float, float]]] = {}
-        self._leader_radar_last_poll_ts = 0.0
 
     def _in_preopen_window(self, ts_epoch: float | None = None) -> bool:
         hhmm = _hhmm_now(ts_epoch)
@@ -228,70 +222,48 @@ class WSCapture:
         base_desired = kept_watch | held
         radar_syms = self._leader_radar_symbols(now, excluded=base_desired)
         if radar_syms:
-            _append(CONTROL_FILE, f"{_ts()}	LEADER_RADAR add={len(radar_syms)} thr={LEADER_RADAR_RET3S_PCT:.2f}%")
+            _append(CONTROL_FILE, f"{_ts()}\tLEADER_RADAR add={len(radar_syms)} thr={LEADER_RADAR_RET3S_PCT:.2f}%")
+            # watchlist에도 반영 — 엔진이 score_eval을 실행하려면 watchlist.txt에 있어야 함
+            try:
+                wl_path = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
+                existing: set[str] = set()
+                try:
+                    with open(wl_path, "r", encoding="utf-8") as f:
+                        existing = {ln.strip() for ln in f if ln.strip()}
+                except Exception:
+                    pass
+                new_syms = radar_syms - existing
+                if new_syms:
+                    with open(wl_path, "a", encoding="utf-8") as f:
+                        for s in sorted(new_syms):
+                            f.write(s + "\n")
+                    _append(CONTROL_FILE, f"{_ts()}\tLEADER_RADAR watchlist_inject n={len(new_syms)}")
+            except Exception as e:
+                _append(CONTROL_FILE, f"{_ts()}\tLEADER_RADAR watchlist_inject_err {e}")
         return base_desired | radar_syms
 
-    def _fetch_volume_rank_rows(self, market: str) -> list[dict]:
-        params = {
-            "FID_COND_MRKT_DIV_CODE": market,
-            "FID_COND_SCR_DIV_CODE": os.getenv("LEADER_RADAR_SCR", "20171"),
-            "FID_INPUT_ISCD": os.getenv("LEADER_RADAR_INPUT_ISCD", "0000"),
-            "FID_DIV_CLS_CODE": "0",
-            "FID_BLNG_CLS_CODE": "0",
-            "FID_TRGT_CLS_CODE": "111111111",
-            "FID_TRGT_EXLS_CLS_CODE": "000000",
-            "FID_INPUT_PRICE_1": "",
-            "FID_INPUT_PRICE_2": "",
-            "FID_VOL_CNT": "",
-            "FID_INPUT_DATE_1": "",
-        }
-        try:
-            j = request("GET", VOLUME_RANK_PATH, VOLUME_RANK_TR_ID, params=params)
-            for k in ("output", "output1", "output2"):
-                rows = j.get(k)
-                if isinstance(rows, list):
-                    return rows[:LEADER_RADAR_POOL_TOPK]
-        except Exception:
-            return []
-        return []
-
-    def _parse_row_symbol_price(self, row: dict) -> tuple[str, float]:
-        sym = str(row.get("mksc_shrn_iscd") or row.get("stck_shrn_iscd") or row.get("hts_kor_isnm") or "").strip()
-        if sym and not sym.isdigit():
-            sym = str(row.get("stck_shrn_iscd") or row.get("mksc_shrn_iscd") or "").strip()
-        px = 0.0
-        for k in ("stck_prpr", "stck_clpr", "prpr", "price", "cur_prc"):
-            try:
-                px = float(row.get(k, 0) or 0)
-                if px > 0:
-                    break
-            except Exception:
-                pass
-        return sym, px
+    def feed_leader_price(self, sym: str, price: float, ts: float):
+        """WS 체결 틱에서 직접 호출. REST 폴링 불필요."""
+        if not LEADER_RADAR_ENABLE:
+            return
+        h = self.leader_radar_price_hist.setdefault(sym, [])
+        h.append((ts, price))
+        cutoff = ts - 4.0
+        while h and h[0][0] < cutoff:
+            h.pop(0)
+        if not h:
+            self.leader_radar_price_hist.pop(sym, None)
+            return
+        base = next((p for t, p in h if (ts - t) >= 3.0), None)
+        if base and base > 0:
+            ret3 = (price / base - 1.0) * 100.0
+            if ret3 >= LEADER_RADAR_RET3S_PCT:
+                self.leader_radar_active_until[sym] = ts + LEADER_RADAR_HOLD_SEC
 
     def _leader_radar_symbols(self, now: float, excluded: set[str]) -> set[str]:
         if (not LEADER_RADAR_ENABLE) or LEADER_RADAR_MAX_SUBS <= 0:
             self.leader_radar_active_until.clear()
             return set()
-
-        if (now - self._leader_radar_last_poll_ts) >= max(0.2, LEADER_RADAR_POLL_SEC):
-            self._leader_radar_last_poll_ts = now
-            for m in LEADER_RADAR_MARKETS:
-                rows = self._fetch_volume_rank_rows(m)
-                for row in rows:
-                    sym, px = self._parse_row_symbol_price(row)
-                    if (not sym) or (px <= 0):
-                        continue
-                    h = self.leader_radar_price_hist.setdefault(sym, [])
-                    h.append((now, px))
-                    cutoff = now - 4.0
-                    while h and h[0][0] < cutoff:
-                        h.pop(0)
-                    base = next((p for t, p in h if (now - t) >= 3.0), h[0][1] if h else px)
-                    if base > 0:
-                        ret3 = (px / base - 1.0) * 100.0
-                        if ret3 >= LEADER_RADAR_RET3S_PCT and sym not in excluded:
-                            self.leader_radar_active_until[sym] = now + LEADER_RADAR_HOLD_SEC
 
         # expire
         expired = [sym for sym, until in self.leader_radar_active_until.items() if until <= now]
@@ -545,7 +517,8 @@ class WSCapture:
         sent = 0
         now = time.time()
         key = self._sub_key(sym, tr)
-        if self.pending_subscribe.get(key):
+        pending_ts = self.pending_subscribe.get(key)
+        if pending_ts and (now - pending_ts) < 15.0:
             return 0
         blocked_until = self.sub_blocked_until.get(key, 0.0)
         if blocked_until > now:

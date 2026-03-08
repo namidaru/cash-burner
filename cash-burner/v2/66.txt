@@ -1,0 +1,62 @@
+아래 버그 2개 수정해줘. 기존 동작 최소 변경.
+
+## Bug 12 — main_real.py : run_live에 cap 전달 누락
+LEADER_RADAR_ENABLE=1 이어도 cap이 None으로 전달되어 feed_leader_price가 절대 호출 안됨.
+레이더 기능이 완전히 비활성화된 상태로 돌아감.
+```python
+# 변경 전
+def main():
+    threading.Thread(target=scanner_loop, daemon=True).start()
+    cap = WSCapture()
+    threading.Thread(target=cap.start, daemon=True).start()
+    run_live(IN_FILE, poll=LIVE_POLL_SEC)
+
+# 변경 후
+def main():
+    threading.Thread(target=scanner_loop, daemon=True).start()
+    cap = WSCapture()
+    threading.Thread(target=cap.start, daemon=True).start()
+    run_live(IN_FILE, poll=LIVE_POLL_SEC, cap=cap)
+```
+
+## Bug 13 — engine_simple.py : VI_STND_PRC 빈 문자열 수신 시 VI 해제 오탐
+`_f(row.get("VI_STND_PRC"))` 는 빈 문자열 `""` 을 받으면 0.0을 반환함.
+직전에 vi_std_prev > 0 이었던 종목은 VI가 실제로 해제되지 않았는데
+`_vi_clear_ts` 가 기록되어 score에 +15점 부스트가 잘못 적용됨.
+```python
+# 변경 전
+vi_std_new = _f(row.get("VI_STND_PRC"))
+vi_std_prev = self._vi_prev_std.get(sym, -1.0)
+if vi_std_prev > 0 and vi_std_new == 0.0:
+    self._vi_clear_ts[sym] = ts_epoch
+
+# 변경 후 — 필드 자체가 없거나 빈 문자열이면 prev 유지
+_vi_raw = row.get("VI_STND_PRC", "")
+if _vi_raw == "" or _vi_raw is None:
+    pass  # 필드 없음 → vi_std 판단 스킵
+else:
+    vi_std_new = _f(_vi_raw)
+    vi_std_prev = self._vi_prev_std.get(sym, -1.0)
+    if vi_std_prev > 0 and vi_std_new == 0.0:
+        self._vi_clear_ts[sym] = ts_epoch
+    self._vi_prev_std[sym] = vi_std_new
+아래 버그 수정해줘. 기존 동작 최소 변경.
+
+## Bug 14 — scanner_company_rank.py : min_price 경계값 필터 불일치 (4곳)
+메인 build_watchlist 필터는 `px < min_price` (<)인데,
+_passes_quality / supplement / preopen 함수 4곳은 `px <= min_price` (<=)로 달라서
+정확히 min_price(기본 5000원)인 종목이 메인은 통과, 나머지에서는 탈락함.
+```python
+# 변경 전 (4곳 모두 동일)
+if min_price > 0 and px > 0 and px <= min_price:
+
+# 변경 후 (< 로 통일)
+if min_price > 0 and px > 0 and px < min_price:
+```
+
+수정 위치 4곳:
+- `_passes_quality` 함수 (line ~430)
+- `_supplement_from_strength` 함수 (line ~596)
+- `_supplement_from_conditions` 함수 (line ~669)
+- `_preopen_combo_seed` 함수 (line ~743)
+```

@@ -64,4 +64,7 @@ class DiscordNotifier:
                     continue
                 return
             except Exception:
-                return
+                if attempt >= 2:
+                    return
+                time.sleep(0.5)
+                continue

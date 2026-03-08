@@ -1,0 +1,51 @@
+아래 버그 3개 수정해줘. 기존 동작 최소 변경.
+
+## Bug 5 — quote_multi.py : volume_acceleration 단위 불일치
+acml_tr_pbmn(원) ÷ prdy_vol(주) = 가격 proxy. 가속도가 아니라 단가임.
+비싼 주식일수록 accel_score가 무조건 높아져서 워치리스트가 고가주 편향됨.
+```python
+# 변경 전
+return tr_value / prev_vol
+
+# 변경 후 — 당일 거래대금 / 전일 거래대금 (단위 통일)
+prdy_tr_value = _get_first(it, [
+    "prdy_tr_pbmn", "PRDY_TR_PBMN", "prdy_acml_tr_pbmn", "PRDY_ACML_TR_PBMN"
+], 0.0)
+if prdy_tr_value <= 0:
+    # 전일 거래대금 없으면 거래량 비율로 폴백
+    today_vol = _get_first(it, ["acml_vol", "ACML_VOL", "stck_acml_vol"], 0.0)
+    return today_vol / prev_vol
+return tr_value / prdy_tr_value
+```
+
+## Bug 6 — engine_simple.py : should_buy의 already_held 체크 dead code
+on_trade에서 sym in self.pos이면 이미 return하므로 should_buy까지 도달 불가.
+gate_block_counts["already_held"]가 절대 카운트 안 됨 → 진단 데이터 누락.
+```python
+# should_buy 맨 위에서 제거
+if sym in self.pos:
+    return False, "already_held"
+
+# on_trade 쪽에 대신 명시적으로 카운트 추가
+# (sym in self.pos → manage_position → return 하는 블록 직전에)
+# 아래처럼 변경:
+if sym in self.pos:
+    self.manage_position(sym, price, ts_epoch)
+    return
+# 위 블록 아래에 추가:
+if sym in self.pos:  # should_buy 전 최종 방어
+    self._gate_block_counts["already_held"] += 1
+    return
+```
+
+## Bug 7 — scanner_company_rank.py : _supplement_from_volume_rank에서 tv_pct 이중 반영
+vol_breakout_pct = tv_pct로 두어 tv가 0.30 + 0.15 = 0.45 가중치가 됨.
+spread_score_pct는 0.15밖에 안 됨. 유동성 과중, 스프레드 과소.
+```python
+# 변경 전
+liquidity_spread_score = (0.5 * tv_pct) + (0.5 * spread_score_pct)
+vol_breakout_pct = tv_pct
+score = (0.40 * roc_pct) + (0.30 * liquidity_spread_score) + (0.30 * vol_breakout_pct)
+# 더 명확하게:
+score = (0.55 * roc_pct) + (0.30 * tv_pct) + (0.15 * spread_score_pct)
+```

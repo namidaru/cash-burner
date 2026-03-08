@@ -1,0 +1,55 @@
+아래 버그 2개 수정해줘. 기존 동작 최소 변경.
+
+## Bug 8 — engine_simple.py : _load_state에서 last_price 복원 누락
+재시작 직후 on_timer가 last_price=0.0 → entry_price로 manage_position 호출.
+_update_market_state도 last_price > 0 체크로 건너뛰어 시장 하락추세 감지 불가.
+```python
+# 변경 전 (_load_state의 Position 생성 부분)
+self.pos[sym] = Position(
+    qty=qty_use,
+    entry_price=...,
+    ...
+    partial_taken=bool(item.get("partial_taken", False)),
+)
+
+# 변경 후 — last_price 추가
+self.pos[sym] = Position(
+    qty=qty_use,
+    entry_price=...,
+    ...
+    partial_taken=bool(item.get("partial_taken", False)),
+    last_price=float(item.get("last_price", 0.0)),
+)
+```
+
+## Bug 9 — engine_simple.py : _refresh_orderable_cash에 캐시 TTL 없음
+on_timer가 1초마다 호출 → account_cash_snapshot() REST API도 매초 호출됨.
+KIS API rate limit(초당 수회) 소진 및 불필요한 네트워크 지연 발생.
+```python
+# 변경 전
+def _refresh_orderable_cash(self, ts_epoch: float, use_fallback: bool = True) -> float | None:
+    orderable = None
+    try:
+        snap = account_cash_snapshot()
+    ...
+
+# 변경 후 — TTL(기본 30초) 캐시 추가
+CASH_REFRESH_INTERVAL = float(os.getenv("CASH_REFRESH_INTERVAL_SEC", "30"))
+
+def _refresh_orderable_cash(self, ts_epoch: float, use_fallback: bool = True) -> float | None:
+    if (ts_epoch - self._last_orderable_cash_ts) < CASH_REFRESH_INTERVAL \
+            and self._last_orderable_cash is not None:
+        return self._last_orderable_cash
+    orderable = None
+    try:
+        snap = account_cash_snapshot()
+    ...
+```
+단, enter_position 호출 시에는 캐시를 bypass해야 하므로 해당 호출부만:
+```python
+# enter_position 내
+orderable_cash = self._refresh_orderable_cash(ts_epoch, use_fallback=True)
+# → 아래로 교체 (캐시 무효화 후 호출)
+self._last_orderable_cash_ts = 0.0
+orderable_cash = self._refresh_orderable_cash(ts_epoch, use_fallback=True)
+```

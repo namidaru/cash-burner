@@ -1,0 +1,17 @@
+{
+  "ts": "2026-03-08 01:04:00",
+  "watch_count": 20,
+  "position_count": 0,
+  "orderable_cash": null,
+  "orderable_cash_text": "-",
+  "top_gate_blockers": [],
+  "score_pass_rate": 0.0,
+  "last_buy_time": "",
+  "last_sell_time": "",
+  "last_buy_symbol": "",
+  "last_sell_symbol": "",
+  "recent_events": [],
+  "operator_summary": "watch_ok but score_blocked",
+  "trading_halted": false,
+  "daily_realized_pnl": 0.0
+}

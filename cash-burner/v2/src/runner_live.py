@@ -20,7 +20,21 @@ def _resolve_in_file(path: str) -> str:
         return path.replace("{date}", time.strftime("%Y%m%d"))
     return path
 
-def run_live(in_file: str, poll: float = 0.2):
+def _sym_price_from_trade_row(row: dict) -> tuple[str, float]:
+    sym = str(row.get("MKSC_SHRN_ISCD") or row.get("mksc_shrn_iscd") or "").strip()
+    price = 0.0
+    for k in ("STCK_PRPR", "stck_prpr", "STCK_CLPR", "stck_clpr"):
+        try:
+            v = float(str(row.get(k, 0) or 0).replace(",", ""))
+            if v > 0:
+                price = v
+                break
+        except Exception:
+            pass
+    return sym, price
+
+
+def run_live(in_file: str, poll: float = 0.2, cap=None):
     _last_timer = [0.0]
     eng = EngineSimple()
     while True:
@@ -44,6 +58,10 @@ def run_live(in_file: str, poll: float = 0.2):
                                     eng.on_orderbook(row, ts_epoch)
                                 else:
                                     eng.on_trade(row, ts_epoch)
+                                    if cap is not None:
+                                        sym, px = _sym_price_from_trade_row(row)
+                                        if sym and px > 0:
+                                            cap.feed_leader_price(sym, px, ts_epoch)
                             except Exception as e:
                                 print(time.strftime("%Y-%m-%d %H:%M:%S"), f"[LIVE][WARN] {tr_id} {type(e).__name__}: {e}")
                     else:

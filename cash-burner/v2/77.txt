@@ -1,0 +1,199 @@
+아래 버그 2개 수정해줘. 기존 동작 최소 변경.
+
+## Bug 15 — integrity_check.py : partial_take SELL이 sells 카운트에 포함돼 stop_loss 비율 희석
+partial_take는 포지션 완전 청산이 아닌데 sells에 카운트되어
+stop_loss 비율(stop_loss_sells / sells) 분모가 부풀고 60% 힌트가 억제됨.
+```python
+# 변경 전
+else:
+    sells += 1
+    reason = row.get("reason", "")
+    if "stop_loss" in reason:
+        stop_loss_sells += 1
+
+# 변경 후 — partial_take는 sells 카운트 제외
+else:
+    reason = row.get("reason", "")
+    if "partial_take" in reason:
+        pass  # 부분익실은 완전 청산 아님 → sells 통계 제외
+    else:
+        sells += 1
+        if "stop_loss" in reason:
+            stop_loss_sells += 1
+```
+
+## Bug 16 — scanner_company_rank.py : _parse_price 소문자 키만 탐색
+build_watchlist non-radar 경로에서 multi_quote 실패 시 raw rank API row를 fallback으로 씀.
+rank API 응답이 대문자 키를 쓰면 _parse_price=0.0 → price 필터에서 전부 탈락.
+_parse_sym은 이미 대소문자 대응인데 _parse_price만 누락됨.
+```python
+# 변경 전
+def _parse_price(item: Dict[str, Any]) -> float:
+    for k in ("stck_prpr", "prpr", "stck_clpr", "close", "price", "cur_prc"):
+        v = _parse_float(item, k, -1.0)
+        if v > 0:
+            return v
+    return 0.0
+
+# 변경 후 — 대문자 후보 추가
+def _parse_price(item: Dict[str, Any]) -> float:
+    for k in ("stck_prpr", "STCK_PRPR", "prpr", "PRPR",
+              "stck_clpr", "STCK_CLPR", "close", "price", "cur_prc"):
+        v = _parse_float(item, k, -1.0)
+        if v > 0:
+            return v
+    return 0.0
+```
+아래 버그 2개 수정해줘. 기존 동작 최소 변경.
+
+## Bug 17 — engine_simple.py : score_symbol에서 vi_std를 book(호가)에서 읽어 penalty_vi 항상 0
+VI_STND_PRC는 H0STCNT0(체결) 스키마 필드인데 book은 H0STASP0(호가) row.
+호가 데이터에는 해당 필드가 없으므로 vi_std=0.0 → vi_gap=999.0 → penalty_vi=0.
+VI 근접 종목 진입 차단 기능이 완전히 비활성화된 상태.
+_vi_prev_std에 체결 row 기준 최신 VI_STND_PRC가 이미 저장돼 있으므로 이걸 사용.
+```python
+# 변경 전
+vi_std = _f((self.book.get(sym) or {}).get("VI_STND_PRC"))
+
+# 변경 후
+vi_std = self._vi_prev_std.get(sym, 0.0)
+```
+
+## Bug 18 — integrity_check.py : hold_secs에 partial_take SELL 포함돼 avg_hold 과소평가
+partial_take는 포지션 절반만 청산이므로 실제 보유 종료가 아닌데
+hold_secs에 추가되어 avg_hold가 낮게 계산됨.
+MAX_HOLD_SEC 70% 초과 힌트가 억제될 수 있음.
+```python
+# 변경 전 (SELL action 처리 블록)
+if sym in buy_ts and ts > buy_ts[sym]:
+    hold_secs.append(ts - buy_ts[sym])
+
+# 변경 후 — partial_take는 hold_secs 제외
+reason = row.get("reason", "")
+if sym in buy_ts and ts > buy_ts[sym] and "partial_take" not in reason:
+    hold_secs.append(ts - buy_ts[sym])
+```
+단, reason 변수는 아래 stop_loss_sells 카운트에서도 쓰므로 중복 선언 주의.
+SELL 블록 상단에서 `reason = row.get("reason", "")` 한 번만 선언하고 재사용.
+아래 버그 3개 수정해줘. 기존 동작 최소 변경.
+
+## Bug 19 — engine_simple.py : SELL이 signal_diag에 미기록 → backtest_diag 분석 불능
+signal_diag에 기록되는 status는 BUY/CAND/DROP/PARTIAL_SELL/SELL_FAIL 등이고
+"SELL" status는 어디에도 _log_diag 호출이 없음.
+backtest_diag.py는 signal_diag에서 status=="SELL"을 파싱하므로
+sells 리스트가 항상 비어있어 match_trades 결과가 항상 0.
+```python
+# _do_sell 함수(또는 sell 성공 처리 블록)에 아래 추가
+# qty, price, reason, pnl 계산 직후 (pos.pop 직전)
+pnl_pct = (price / p.entry_price - 1.0) * 100.0 if p.entry_price > 0 else 0.0
+hold_sec = ts_epoch - p.entry_ts
+self._log_diag(
+    ts_epoch, sym, "SELL",
+    f"reason={reason} hold={hold_sec:.1f}s pnl={pnl_pct:.2f}% "
+    f"entry={p.entry_price:.0f} price={price:.0f} qty={qty}"
+)
+```
+
+## Bug 20 — engine_simple.py : _save_state에 _loss_streak/_loss_streak_blocked 미저장
+당일 재시작 시 연속 2회 손절 블락이 해제되어 차단된 종목에 재진입 가능.
+cooldown_until은 저장/복원되지만 loss_streak 상태는 유실됨.
+```python
+# 변경 전 (_save_state)
+rows = {
+    "positions": {sym: asdict(p) for sym, p in self.pos.items()},
+    "cooldown_until": self.cooldown_until,
+}
+
+# 변경 후
+rows = {
+    "positions": {sym: asdict(p) for sym, p in self.pos.items()},
+    "cooldown_until": self.cooldown_until,
+    "loss_streak": dict(self._loss_streak),
+    "loss_streak_blocked": list(self._loss_streak_blocked),
+}
+
+# _load_state에도 추가 (cooldown_until 복원 블록 근처)
+try:
+    self._loss_streak = defaultdict(int, {k: int(v) for k, v in (j.get("loss_streak") or {}).items()})
+except Exception:
+    pass
+try:
+    self._loss_streak_blocked = set(j.get("loss_streak_blocked") or [])
+except Exception:
+    pass
+```
+
+## Bug 21 — scanner_company_rank.py : _add_candidate에서 raw_by_sym과 src_map 불일치
+condition → strength 순으로 들어오면 raw_by_sym은 strength row로 덮어써지지만
+src_map은 condition으로 유지되어 두 값이 불일치.
+(strength → condition 순이면 정상)
+```python
+# 변경 전
+elif source in ("condition", "strength"):
+    raw_by_sym[sym] = it
+
+# 변경 후 — src_map 우선순위와 동일하게: condition > strength > volume_rank
+SOURCE_PRIORITY = {"condition": 2, "strength": 1, "volume_rank": 0}
+
+elif SOURCE_PRIORITY.get(source, 0) > SOURCE_PRIORITY.get(
+        next(iter(sorted(source_seen[sym] - {source}, key=lambda s: SOURCE_PRIORITY.get(s, 0), reverse=True)), ""), 0):
+    raw_by_sym[sym] = it
+```
+위 코드가 복잡하면 아래 단순화 버전:
+```python
+elif source in ("condition", "strength"):
+    # condition은 항상 덮어씀. strength는 condition이 없을 때만.
+    if source == "condition" or "condition" not in source_seen[sym]:
+        raw_by_sym[sym] = it
+```
+아래 버그 3개 수정해줘. 기존 동작 최소 변경.
+
+## Bug 22 — backtest_diag.py : parse_ledger에서 partial_take SELL이 match_trades에 포함돼 pnl 오계산
+partial_take는 포지션 절반 청산이라 최종 청산가가 아님.
+ls_cands에 partial_take row가 포함되면 최종 SELL ts가 비슷할 경우 잘못 매칭되어
+pnl_pct_ledger가 최종 실현 손익 대신 부분익실 가격 기준으로 계산됨.
+```python
+# 변경 전 (parse_ledger)
+elif action == "SELL":
+    ledger_sells.append(row)
+
+# 변경 후 — partial_take는 ledger_sells 제외
+elif action == "SELL":
+    reason = (row.get("reason") or "").lower()
+    if "partial_take" not in reason:
+        ledger_sells.append(row)
+```
+
+## Bug 23 — engine_simple.py : _burst_ratio에서 trv5_prev=0일 때 burst가 거래대금 원금액
+장 시작 첫 5초간 5~10초 구간에 틱이 없으므로 trv5_prev=0 → max(1.0, 0) = 1.0 분모
+→ burst_ratio = trv5 / 1.0 = 수억~수십억 → burst_score 항상 20점 최대
+→ 장 시작 직후 모든 종목이 burst 보너스 최대치로 진입 편향 발생.
+```python
+# 변경 전
+def _burst_ratio(self, dq, now):
+    trv5 = sum(px * vol for t, px, vol in dq if (now - t) <= 5.0)
+    trv5_prev = sum(px * vol for t, px, vol in dq if 5.0 < (now - t) <= 10.0)
+    return trv5 / max(1.0, trv5_prev)
+
+# 변경 후 — trv5_prev=0 이면 비교 불가 → 1.0 반환
+def _burst_ratio(self, dq, now):
+    trv5 = sum(px * vol for t, px, vol in dq if (now - t) <= 5.0)
+    trv5_prev = sum(px * vol for t, px, vol in dq if 5.0 < (now - t) <= 10.0)
+    if trv5_prev <= 0:
+        return 1.0  # 비교 기준 없음 → neutral
+    return trv5 / trv5_prev
+```
+
+## Bug 24 — engine_simple.py : ENTRY_BLOCK_DAYRISE_PCT 기본값 불일치
+`quote_multi.py`는 `ENTRY_BLOCK_DAYRISE_PCT` 기본값을 `5.0`으로 읽고,
+`engine_simple.py`의 `entry_block_dayrise_pct`는 `7.0`이 기본값.
+동일한 환경변수인데 기본값이 달라서 env 미설정 시 워치리스트 선별(5% 기준 score penalty)과
+진입 차단(7% 기준 penalty)이 어긋남.
+`quote_multi.py` 기본값을 `7.0`으로 통일.
+```python
+# 변경 전 (quote_multi.py)
+ENTRY_BLOCK_DAYRISE_PCT = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "5.0"))
+
+# 변경 후
+ENTRY_BLOCK_DAYRISE_PCT = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "7.0"))
+```

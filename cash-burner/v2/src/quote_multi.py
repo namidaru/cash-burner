@@ -18,7 +18,7 @@ ENTRY_BLOCK_DAYRISE_PCT = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "5.0"))
 # 거래대금(원) 너무 작은 종목은 제외(유동성 쓰레기 필터)
 MIN_TRADE_VALUE = float(os.getenv("WATCH_MIN_TR_VALUE", "600000000"))
 MIN_VOLUME = float(os.getenv("WATCH_MIN_VOLUME", "30000"))
-WATCH_SOFT_HEAT_PCT = float(os.getenv("WATCH_SOFT_HEAT_PCT", "2.5"))
+WATCH_SOFT_HEAT_PCT = float(os.getenv("WATCH_SOFT_HEAT_PCT", "10.5"))
 WATCH_HARD_HEAT_PCT = float(os.getenv("WATCH_HARD_HEAT_PCT", "14.0"))
 
 MARKET_CANDIDATES = [m.strip() for m in os.getenv("FID_COND_MRKT_DIV_CODE_MULTI", f"{DEFAULT_MRKT},NX").split(",") if m.strip()]
@@ -126,7 +126,7 @@ def volume_acceleration(it: Dict[str, Any]) -> float:
     ], 0.0)
     prev_vol = _get_first(it, [
         "prdy_vol", "PRDY_VOL", "prev_vol", "PRDY_ACML_VOL"
-    ], 1.0)
+    ], 0.0)
     if prev_vol <= 0:
         return 0.0
     return tr_value / prev_vol
@@ -179,32 +179,36 @@ def score_item(it: Dict[str, Any]) -> float:
         "tday_rltv", "exec_str", "trade_strength", "cntrg", "cttr", "power"
     ], 0.0)
 
-    # 3) 스프레드/호가 품질(있으면 가산/감점)
-    # 멀티시세에 ask/bid가 안 올 수도 있음 → 있으면만 사용
+    # 3) 스프레드/호가 품질(있으면만 사용)
     ask1 = _get_first(it, ["askp1", "ASKP1", "ask1", "ASK1"], 0.0)
     bid1 = _get_first(it, ["bidp1", "BIDP1", "bid1", "BID1"], 0.0)
     spread_penalty = 0.0
     if ask1 > 0 and bid1 > 0 and ask1 >= bid1:
         mid = (ask1 + bid1) / 2.0
         spr_pct = ((ask1 - bid1) / mid) * 100.0 if mid > 0 else 999.0
-        # 스프레드 큰 애는 감점(미끄러짐 방지)
-        # 0.30% 넘으면 꽤 불리하다고 보고 감점
-        if spr_pct > 0.30:
-            spread_penalty = min(2.0, (spr_pct - 0.30) * 2.0)  # 최대 2점 감점
+        # PROMPT 5: 임계치 0.30→0.20%, 감점 강화 최대 4점
+        if spr_pct > 0.20:
+            spread_penalty = min(4.0, (spr_pct - 0.20) * 3.0)
 
-    # 4) 점수 조합 (급등 초입 탐지형)
-    # - volume_accel: 거래대금 가속도 중심
-    # - strength_score: 체결강도 100 기준 정규화
-    # - liquidity_score: 절대 유동성 보정
-    accel = min(volume_acceleration(it), 3.0)
+    # 4) 점수 조합
+    # PROMPT 5-1: 거래량 가속도 log 스케일 (폭발적 가속 포착)
+    accel_raw = volume_acceleration(it)
+    accel_score = math.log1p(max(0.0, accel_raw)) * 6.0
+
+    # PROMPT 5-2: 체결강도 — 등락률 높으면 신뢰도 낮으므로 가중치 축소
     strength_score = max(0.0, (strength - 100.0) / 20.0)
-    liquidity_score = math.log1p(max(tr_value, 0.0))
+    if r > 2.0:
+        strength_score *= 0.7
+
+    # PROMPT 5-3: 유동성 상대화 (MIN_TRADE_VALUE 대비 비율)
+    rel_liquidity = tr_value / max(1.0, MIN_TRADE_VALUE)
+    liquidity_score = math.log1p(rel_liquidity) * 1.5
 
     score = (
-        (max(0.0, r) * 0.8)
-        + (accel * 3.0)
-        + (strength_score * 1.8)
-        + (liquidity_score * 1.0)
+        (max(0.0, r) * 0.7)
+        + accel_score
+        + (strength_score * 1.2)
+        + liquidity_score
         - spread_penalty
         - heat_penalty
     )

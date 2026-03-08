@@ -1,0 +1,43 @@
+{
+  "ts": "2026-03-08 01:03:48",
+  "scanner_pool_summary": {
+    "pool_size": 84,
+    "quote_count": 84,
+    "selected": 20,
+    "want_n": 40
+  },
+  "scanner_drop_summary": {
+    "price": 31,
+    "chg": 14,
+    "heat": 18,
+    "tv": 1,
+    "vol": 0,
+    "spread": 0,
+    "score": 0,
+    "filtered_total": 64,
+    "filter_ratio": 0.7619
+  },
+  "top5_scores": [
+    {
+      "symbol": "034020",
+      "score": 50.025
+    },
+    {
+      "symbol": "222800",
+      "score": 48.526
+    },
+    {
+      "symbol": "233740",
+      "score": 48.192
+    },
+    {
+      "symbol": "272290",
+      "score": 47.775
+    },
+    {
+      "symbol": "107640",
+      "score": 46.563
+    }
+  ],
+  "operator_summary": "scores_ok but hard_gates_blocking"
+}
