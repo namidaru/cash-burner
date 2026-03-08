@@ -546,7 +546,7 @@ def _supplement_from_volume_rank(
             break
     meta.append(
         f"volume_rank fill={len(out)}/{need_n} pool={len(rows)} "
-        f"formula=0.40*roc_pct+0.30*liqspr_pct+0.30*vol_pct vol>={min_vol_pct:.2f} spread<={max_spread_pct:.2f}"
+        f"formula=0.55*roc_pct+0.30*tv_pct+0.15*spread_score_pct vol>={min_vol_pct:.2f} spread<={max_spread_pct:.2f}"
     )
     return out
 

@@ -808,6 +808,13 @@ class EngineSimple:
                 self._last_sell_symbol = sym
                 self._record_event(ts_epoch, "SELL", sym, f"EVICT_{reason}")
                 self._save_state()
+                pnl_pct_evict = (price / p.entry_price - 1.0) * 100.0 if p.entry_price > 0 else 0.0
+                hold_sec_evict = ts_epoch - p.entry_ts
+                self._log_diag(
+                    ts_epoch, sym, "SELL",
+                    f"reason=EVICT_{reason} hold={hold_sec_evict:.1f}s pnl={pnl_pct_evict:.2f}% "
+                    f"entry={p.entry_price:.0f} price={price:.0f} qty={p.qty}"
+                )
                 self._log_diag(ts_epoch, sym, "SELL_EVICT", f"evicted sell_fail_count={p.sell_fail_count}")
             return
 
@@ -855,7 +862,7 @@ class EngineSimple:
             ts_epoch,
             sym,
             "SELL",
-            f"reason={reason} hold={hold_sec:.1f}s pnl={pnl_pct:.2f}% peak={p.max_pnl_pct:.2f}% min={p.min_pnl_pct:.2f}% atr={p.atr_pct:.2f} dyn_sl={dynamic_sl:.2f} dyn_tp={dynamic_tp:.2f} grace_stop={1 if hold_sec < self.stop_loss_early_grace_sec else 0} grace_take={1 if hold_sec < self.take_profit_grace_sec else 0}",
+            f"reason={reason} hold={hold_sec:.1f}s pnl={pnl_pct:.2f}% entry={p.entry_price:.0f} price={price:.0f} qty={qty} peak={p.max_pnl_pct:.2f}% min={p.min_pnl_pct:.2f}% atr={p.atr_pct:.2f} dyn_sl={dynamic_sl:.2f} dyn_tp={dynamic_tp:.2f} grace_stop={1 if hold_sec < self.stop_loss_early_grace_sec else 0} grace_take={1 if hold_sec < self.take_profit_grace_sec else 0}",
         )
         self.notifier.send(
             title=f"📉 단순모멘텀 매도 {sym}",

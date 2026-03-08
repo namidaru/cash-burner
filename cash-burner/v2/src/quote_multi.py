@@ -20,6 +20,7 @@ MIN_TRADE_VALUE = float(os.getenv("WATCH_MIN_TR_VALUE", "600000000"))
 MIN_VOLUME = float(os.getenv("WATCH_MIN_VOLUME", "30000"))
 WATCH_SOFT_HEAT_PCT = float(os.getenv("WATCH_SOFT_HEAT_PCT", "10.5"))
 WATCH_HARD_HEAT_PCT = float(os.getenv("WATCH_HARD_HEAT_PCT", "14.0"))
+WATCH_STRENGTH_WEIGHT = float(os.getenv("WATCH_STRENGTH_WEIGHT", "1.2"))
 
 MARKET_CANDIDATES = [m.strip() for m in os.getenv("FID_COND_MRKT_DIV_CODE_MULTI", f"{DEFAULT_MRKT},NX").split(",") if m.strip()]
 _SYMBOL_MARKET: Dict[str, str] = {}
@@ -184,6 +185,11 @@ def score_item(it: Dict[str, Any]) -> float:
     strength = _get_first(it, [
         "tday_rltv", "exec_str", "trade_strength", "cntrg", "cttr", "power"
     ], 0.0)
+    if strength == 0.0:
+        buy_cnt = _get_first(it, ["shnu_cntg_csnu", "SHNU_CNTG_CSNU"], 0.0)
+        sell_cnt = _get_first(it, ["seln_cntg_csnu", "SELN_CNTG_CSNU"], 0.0)
+        if sell_cnt > 0:
+            strength = (buy_cnt / sell_cnt) * 100.0
 
     # 3) 스프레드/호가 품질(있으면만 사용)
     ask1 = _get_first(it, ["askp1", "ASKP1", "ask1", "ASK1"], 0.0)
@@ -213,7 +219,7 @@ def score_item(it: Dict[str, Any]) -> float:
     score = (
         (max(0.0, r) * 0.7)
         + accel_score
-        + (strength_score * 1.2)
+        + (strength_score * WATCH_STRENGTH_WEIGHT)
         + liquidity_score
         - spread_penalty
         - heat_penalty
