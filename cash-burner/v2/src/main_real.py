@@ -170,7 +170,7 @@ def main():
     threading.Thread(target=scanner_loop, daemon=True).start()
     cap = WSCapture()
     threading.Thread(target=cap.start, daemon=True).start()
-    run_live(IN_FILE, poll=LIVE_POLL_SEC)
+    run_live(IN_FILE, poll=LIVE_POLL_SEC, cap=cap)
 
 if __name__ == "__main__":
     main()

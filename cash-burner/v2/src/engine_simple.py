@@ -48,6 +48,8 @@ class Position:
     last_price: float = 0.0    # PROMPT 7: 시장상태 추적용
 
 
+CASH_REFRESH_INTERVAL = float(os.getenv("CASH_REFRESH_INTERVAL_SEC", "30"))
+
 class EngineSimple:
     """실전용 단순 모멘텀 엔진: 단일 매수 경로 / 단일 청산 경로."""
 
@@ -83,8 +85,8 @@ class EngineSimple:
         self.trail_arm_pct = float(os.getenv("TRAIL_ARM_PCT", "2.5"))  # 3.0→2.5: 이익보호 조기 발동
         self.trail_drop_pct = float(os.getenv("TRAIL_DROP_PCT", "1.8"))  # 2.2→1.8: 이익 반납 축소
         self.max_hold_sec = float(os.getenv("MAX_HOLD_SEC", "240"))
-        self.exit_grace_sec = max(5.0, float(os.getenv("EXIT_GRACE_SEC", "3.0")))
-        self.take_profit_grace_sec = max(5.0, float(os.getenv("TAKE_PROFIT_GRACE_SEC", "1.5")))
+        self.exit_grace_sec = float(os.getenv("EXIT_GRACE_SEC", "5.0"))
+        self.take_profit_grace_sec = float(os.getenv("TAKE_PROFIT_GRACE_SEC", "5.0"))
         self.stop_loss_early_grace_sec = float(os.getenv("STOP_LOSS_EARLY_GRACE_SEC", "3.0"))
         self.stop_loss_early_relax_mult = float(os.getenv("STOP_LOSS_EARLY_RELAX_MULT", "1.6"))
         self.stop_loss_emergency_pct = float(os.getenv("STOP_LOSS_EMERGENCY_PCT", "4.5"))
@@ -171,6 +173,8 @@ class EngineSimple:
         rows = {
             "positions": {sym: asdict(p) for sym, p in self.pos.items()},
             "cooldown_until": self.cooldown_until,
+            "loss_streak": dict(self._loss_streak),
+            "loss_streak_blocked": list(self._loss_streak_blocked),
         }
         with open(self.state_file, "w", encoding="utf-8") as f:
             json.dump(rows, f, ensure_ascii=False)
@@ -185,6 +189,14 @@ class EngineSimple:
             self.cooldown_until = {str(k): float(v) for k, v in (j.get("cooldown_until") or {}).items()}
         except Exception:
             self.cooldown_until = {}
+        try:
+            self._loss_streak = defaultdict(int, {k: int(v) for k, v in (j.get("loss_streak") or {}).items()})
+        except Exception:
+            pass
+        try:
+            self._loss_streak_blocked = set(j.get("loss_streak_blocked") or [])
+        except Exception:
+            pass
         dirty = False
         for sym, item in (j.get("positions") or {}).items():
             try:
@@ -206,6 +218,7 @@ class EngineSimple:
                     reasons=list(item.get("reasons") or []),
                     atr_pct=float(item.get("atr_pct", 0.0)),
                     partial_taken=bool(item.get("partial_taken", False)),
+                    last_price=float(item.get("last_price", 0.0)),
                 )
                 if qty_use != qty_state:
                     dirty = True
@@ -281,6 +294,8 @@ class EngineSimple:
         prev = None
         for t, px, vol in dq:
             if t < st:
+                if px > 0:
+                    prev = px
                 continue
             if px <= 0 or vol <= 0:
                 continue
@@ -332,7 +347,9 @@ class EngineSimple:
         """최근 5초 거래대금 / 직전 5~10초 거래대금 비율."""
         trv5 = sum(px * vol for t, px, vol in dq if (now - t) <= 5.0)
         trv5_prev = sum(px * vol for t, px, vol in dq if 5.0 < (now - t) <= 10.0)
-        return trv5 / max(1.0, trv5_prev)
+        if trv5_prev <= 0:
+            return 1.0
+        return trv5 / trv5_prev
 
     def _safe_order(self, side: str, sym: str, qty: int, ts_epoch: float, price: float, reason: str, ord_dvsn: str = "01", ord_unpr: str = "0") -> Dict[str, Any]:
         try:
@@ -418,6 +435,8 @@ class EngineSimple:
             )
 
     def _refresh_orderable_cash(self, ts_epoch: float, use_fallback: bool = True) -> float | None:
+        if (ts_epoch - self._last_orderable_cash_ts) < CASH_REFRESH_INTERVAL and self._last_orderable_cash is not None:
+            return self._last_orderable_cash
         orderable = None
         try:
             snap = account_cash_snapshot()
@@ -465,7 +484,7 @@ class EngineSimple:
         accel = trv10 / max(1.0, trv30 / 3.0)
         pull_rebound = self._pullback_rebound(dq, ts_epoch, price)
 
-        vi_std = _f((self.book.get(sym) or {}).get("VI_STND_PRC"))
+        vi_std = self._vi_prev_std.get(sym, 0.0)
         vi_gap = abs(price - vi_std) / vi_std * 100.0 if vi_std > 0 else 999.0
 
         # ---- positive groups ----
@@ -563,11 +582,6 @@ class EngineSimple:
             return False, "trading_halted"
         if sym not in self.watch:
             return False, "watchlist_out"
-        last = self._last_candidate_log_ts.get(sym, 0.0)
-        if (ts_epoch - last) >= 1.0:
-            self._score_eval_total += 1
-        if sym in self.pos:
-            return False, "already_held"
         if len(self.pos) >= self.max_positions:
             return False, f"max_positions={len(self.pos)}"
         if ts_epoch < self.cooldown_until.get(sym, 0.0):
@@ -634,6 +648,7 @@ class EngineSimple:
         return final_pct, quality_mult
 
     def enter_position(self, sym: str, price: float, score: float, reasons: list[str], metrics: Dict[str, float], ts_epoch: float):
+        self._last_orderable_cash_ts = 0.0
         orderable_cash = self._refresh_orderable_cash(ts_epoch, use_fallback=True)
         cash = float(orderable_cash or 0.0)
         available_cash_source = "snapshot" if cash > 0 else "none"
@@ -774,8 +789,24 @@ class EngineSimple:
                 self._daily_realized_pnl += pnl
                 self._log_ledger(ts_epoch, "SELL", sym, p.qty, price,
                                  f"EVICT_sell_fail_{p.sell_fail_count}", "EVICT", "force_evicted")
+                if self._daily_loss_base_cash and self._daily_loss_base_cash > 0:
+                    loss_pct = max(0.0, -self._daily_realized_pnl) / self._daily_loss_base_cash * 100.0
+                    if not self._trading_halted and loss_pct >= self.daily_loss_limit_pct:
+                        self._trading_halted = True
+                        self._log_diag(
+                            ts_epoch, "ENGINE", "HALT",
+                            f"daily_loss_pct={loss_pct:.2f} limit={self.daily_loss_limit_pct:.2f} pnl={self._daily_realized_pnl:.0f}"
+                        )
+                if self.loss_streak_block_enabled:
+                    if "stop_loss" in reason:
+                        self._loss_streak[sym] = self._loss_streak.get(sym, 0) + 1
+                    else:
+                        self._loss_streak[sym] = 0
                 self.pos.pop(sym, None)
                 self.cooldown_until[sym] = ts_epoch + self.cooldown_sec
+                self._last_sell_time = ts_epoch
+                self._last_sell_symbol = sym
+                self._record_event(ts_epoch, "SELL", sym, f"EVICT_{reason}")
                 self._save_state()
                 self._log_diag(ts_epoch, sym, "SELL_EVICT", f"evicted sell_fail_count={p.sell_fail_count}")
             return
@@ -852,11 +883,13 @@ class EngineSimple:
             return
 
         # VI 해제 감지 — VI_STND_PRC는 H0STCNT0(체결) 스키마에만 존재
-        vi_std_new = _f(row.get("VI_STND_PRC"))
-        vi_std_prev = self._vi_prev_std.get(sym, -1.0)
-        if vi_std_prev > 0 and vi_std_new == 0.0:
-            self._vi_clear_ts[sym] = ts_epoch
-        self._vi_prev_std[sym] = vi_std_new
+        _vi_raw = row.get("VI_STND_PRC", "")
+        if _vi_raw != "" and _vi_raw is not None:
+            vi_std_new = _f(_vi_raw)
+            vi_std_prev = self._vi_prev_std.get(sym, -1.0)
+            if vi_std_prev > 0 and vi_std_new == 0.0:
+                self._vi_clear_ts[sym] = ts_epoch
+            self._vi_prev_std[sym] = vi_std_new
 
         self._reload_watchlist(ts_epoch)
 
@@ -869,6 +902,7 @@ class EngineSimple:
             dq.popleft()
 
         if sym in self.pos:
+            self._gate_block_counts["already_held"] += 1
             self.manage_position(sym, price, ts_epoch)
             return
 
@@ -877,6 +911,7 @@ class EngineSimple:
 
         last = self._last_candidate_log_ts.get(sym, 0.0)
         if (ts_epoch - last) >= 1.0:
+            self._score_eval_total += 1
             self._last_candidate_log_ts[sym] = ts_epoch
             status = "PASS" if ok else "DROP"
             pos_s, neg_s = self._top_factor_strings(metrics)
