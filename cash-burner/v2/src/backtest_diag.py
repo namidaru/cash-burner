@@ -78,7 +78,9 @@ def parse_ledger(path: str) -> Tuple[List[dict], List[dict]]:
             if action == "BUY":
                 ledger_buys.append(row)
             elif action == "SELL":
-                ledger_sells.append(row)
+                reason = (row.get("reason") or "").lower()
+                if "partial_take" not in reason:
+                    ledger_sells.append(row)
     return ledger_buys, ledger_sells
 
 
@@ -135,7 +137,7 @@ def match_trades(diag_buys: List[dict], diag_sells: List[dict],
             else:
                 ls = {}
 
-            buy_price = _f(lb.get("price")) or _f(b.get("price"))
+            buy_price = _f(lb.get("price")) or _f(str(b.get("price", "")).replace(",", ""))
             sell_price = _f(ls.get("price")) or _f(s.get("price"))
             qty = _f(lb.get("qty")) or 1.0
 

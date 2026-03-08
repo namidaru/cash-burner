@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os, json, time, threading, csv, queue, re
+from collections import deque
 from dataclasses import dataclass
 import requests, websocket
 from kis_http import request
@@ -19,7 +20,6 @@ def _dated_out_file() -> str:
     return raw
 
 
-OUT_FILE = _dated_out_file()
 CONTROL_FILE = os.getenv("CONTROL_FILE", os.path.join("data", "ws_control.log"))
 WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
 LEDGER_FILE = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
@@ -172,7 +172,7 @@ class WSCapture:
         self.last_held_symbols: set[str] = set()
         self.watch_remove_after: dict[str, float] = {}
         self.leader_radar_active_until: dict[str, float] = {}
-        self.leader_radar_price_hist: dict[str, list[tuple[float, float]]] = {}
+        self.leader_radar_price_hist: dict[str, deque] = {}
 
     def _in_preopen_window(self, ts_epoch: float | None = None) -> bool:
         hhmm = _hhmm_now(ts_epoch)
@@ -246,11 +246,11 @@ class WSCapture:
         """WS 체결 틱에서 직접 호출. REST 폴링 불필요."""
         if not LEADER_RADAR_ENABLE:
             return
-        h = self.leader_radar_price_hist.setdefault(sym, [])
+        h = self.leader_radar_price_hist.setdefault(sym, deque())
         h.append((ts, price))
         cutoff = ts - 4.0
         while h and h[0][0] < cutoff:
-            h.pop(0)
+            h.popleft()
         if not h:
             self.leader_radar_price_hist.pop(sym, None)
             return
@@ -277,11 +277,11 @@ class WSCapture:
             if sym not in keep_syms:
                 self.leader_radar_active_until.pop(sym, None)
 
-        return keep_syms
+        return keep_syms - excluded
 
     def start(self):
-        _ensure_dir(OUT_FILE)
-        _append(OUT_FILE, f"# ---- session start {_ts()} mode=real tr_ids={TR_IDS} ----")
+        _ensure_dir(_dated_out_file())
+        _append(_dated_out_file(), f"# ---- session start {_ts()} mode=real tr_ids={TR_IDS} ----")
         _append(CONTROL_FILE, f"{_ts()}\tBOOT watchlist_file={WATCHLIST_FILE}")
         if DROPPED_TR_IDS:
             _append(CONTROL_FILE, f"{_ts()}\tTR_ID_DROP unsupported={','.join(DROPPED_TR_IDS)}")
@@ -336,7 +336,7 @@ class WSCapture:
                 _append(CONTROL_FILE, f"{_ts()}\t{s[:2000]}")
                 return
             if s.startswith("0|") or s.startswith("1|"):
-                _append(OUT_FILE, f"{_ts()}\t{s}")
+                _append(_dated_out_file(), f"{_ts()}\t{s}")
 
         def on_error(ws, err):
             _append(CONTROL_FILE, f"{_ts()}\tERR {err}")
