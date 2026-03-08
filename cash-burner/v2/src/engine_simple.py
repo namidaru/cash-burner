@@ -69,8 +69,8 @@ class EngineSimple:
         self.max_positions = max(1, int(os.getenv("MAX_POSITIONS", "3")))
         self.entry_score_threshold = float(os.getenv("ENTRY_SCORE_THRESHOLD", "80"))  # 85→80: score_pass_rate 개선
         self.entry_score_strong = float(os.getenv("ENTRY_SCORE_STRONG", "120"))
-        self.entry_block_dayrise_pct = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "7.0"))
-        self.entry_hard_dayrise_block_pct = float(os.getenv("ENTRY_HARD_DAYRISE_BLOCK_PCT", "18.0"))
+        self.entry_block_dayrise_pct = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "12.0"))  # 7.0→12.0: 급등주 타겟(+3~15%) 맞게 상향
+        self.entry_hard_dayrise_block_pct = float(os.getenv("ENTRY_HARD_DAYRISE_BLOCK_PCT", "20.0"))  # 18.0→20.0
 
         self.buy_ret10_min = float(os.getenv("BUY_RET10_MIN", "0.20"))  # 0.30→0.20: 저가 종목 gate_ret10 완화
         self.buy_ret5_min = float(os.getenv("BUY_RET5_MIN", "0.15"))
@@ -78,8 +78,8 @@ class EngineSimple:
         self.buy_ofi_min = float(os.getenv("BUY_OFI_MIN", "1.4"))
         self.buy_imb_min = float(os.getenv("BUY_IMB_MIN", "0.60"))
         self.buy_spread_max_bps = float(os.getenv("BUY_SPREAD_MAX_BPS", "35"))
-        self.pullback_pct = float(os.getenv("PULLBACK_PCT", "0.65"))
-        self.pullback_rebound_pct = float(os.getenv("PULLBACK_REBOUND_PCT", "0.18"))
+        self.pullback_pct = float(os.getenv("PULLBACK_PCT", "1.2"))        # 0.65→1.2: 급등주 눌림은 1~2% 현실적
+        self.pullback_rebound_pct = float(os.getenv("PULLBACK_REBOUND_PCT", "0.30"))  # 0.18→0.30: 반등 확인 강화
         self.vi_guard_pct = float(os.getenv("VI_GUARD_PCT", "0.25"))
 
         # sell (4 rules only)
@@ -87,7 +87,7 @@ class EngineSimple:
         self.take_profit_pct = float(os.getenv("TAKE_PROFIT_PCT", "3.5"))
         self.trail_arm_pct = float(os.getenv("TRAIL_ARM_PCT", "2.5"))  # 3.0→2.5: 이익보호 조기 발동
         self.trail_drop_pct = float(os.getenv("TRAIL_DROP_PCT", "1.8"))  # 2.2→1.8: 이익 반납 축소
-        self.max_hold_sec = float(os.getenv("MAX_HOLD_SEC", "240"))
+        self.max_hold_sec = float(os.getenv("MAX_HOLD_SEC", "600"))  # 240→600: 눌림목 반등은 10분 정도 필요
         self.exit_grace_sec = float(os.getenv("EXIT_GRACE_SEC", "5.0"))
         self.take_profit_grace_sec = float(os.getenv("TAKE_PROFIT_GRACE_SEC", "5.0"))
         self.stop_loss_early_grace_sec = float(os.getenv("STOP_LOSS_EARLY_GRACE_SEC", "3.0"))
@@ -111,7 +111,7 @@ class EngineSimple:
         self._trading_halted: bool = False
         self._last_trading_day: str = ""
 
-        self.entry_chase_penalty_dayrise_pct = float(os.getenv("ENTRY_CHASE_PENALTY_DAYRISE_PCT", "12.0"))
+        self.entry_chase_penalty_dayrise_pct = float(os.getenv("ENTRY_CHASE_PENALTY_DAYRISE_PCT", "15.0"))  # entry_block(12%)보다 높아야 함
 
         self.health_check_sec = float(os.getenv("HEALTH_CHECK_SEC", "1800"))
         self.health_cash_symbol = os.getenv("HEALTH_CASH_SYMBOL", "005930").strip() or "005930"
@@ -350,11 +350,12 @@ class EngineSimple:
         return (ask1 - bid1) / mid * 10000.0
 
     def _pullback_rebound(self, dq: Deque[Tuple[float, float, float]], now: float, price: float) -> float:
-        high30 = max((px for t, px, _ in dq if (now - t) <= 30.0), default=price)
+        # 급등주는 고점이 더 오래 전에 형성됨 — 60초 고점 기준으로 확장
+        high60 = max((px for t, px, _ in dq if (now - t) <= 60.0), default=price)
         low10 = min((px for t, px, _ in dq if (now - t) <= 10.0), default=price)
-        pulled = low10 <= high30 * (1.0 - max(0.0, self.pullback_pct) / 100.0)
+        pulled = low10 <= high60 * (1.0 - max(0.0, self.pullback_pct) / 100.0)
         rebound = price >= low10 * (1.0 + max(0.0, self.pullback_rebound_pct) / 100.0)
-        recovery_floor = low10 + (high30 - low10) * 0.5
+        recovery_floor = low10 + (high60 - low10) * 0.5
         return 1.0 if (pulled and rebound and price >= recovery_floor) else 0.0
 
     def _burst_ratio(self, dq: Deque[Tuple[float, float, float]], now: float) -> float:
@@ -498,7 +499,9 @@ class EngineSimple:
         vi_gap = abs(price - vi_std) / vi_std * 100.0 if vi_std > 0 else 999.0
 
         # ---- positive groups ----
-        momentum_score = (ret10 * 45.0) + (ret5 * 25.0)
+        # 눌림목 반등 시 ret10 마이너스로 점수 크게 깎이는 것 방지
+        ret10_for_score = max(ret10, 0.0) if pull_rebound > 0.0 else ret10
+        momentum_score = (ret10_for_score * 45.0) + (ret5 * 25.0)
         liquidity_score = (math.log1p(max(0.0, trv10)) * 4.0) + (max(0.0, accel - 1.0) * 12.0)
         ofi_boost = min(35.0, max(0.0, ofi - 1.0) * 18.0)
         imbalance_boost = max(-22.0, min(22.0, (imb - 0.5) * 90.0))
@@ -606,10 +609,15 @@ class EngineSimple:
         if metrics.get("trv10", 0.0) < max(1.0, effective_trv_min):
             return False, "gate_trv10"
         if metrics.get("ret10", 0.0) < self.buy_ret10_min:
-            return False, "gate_ret10"
+            # 눌림목 반등 감지 시 ret10 게이트 면제 — 눌림목은 정의상 ret10이 마이너스
+            if metrics.get("pull_rebound", 0.0) <= 0.0:
+                return False, "gate_ret10"
         spread_bps = metrics.get("spread_bps", -1.0)
         if spread_bps < 0:
-            return False, "spread_missing"
+            # 장 초반(9:00~9:10) 호가 미도착은 면제 — 급등 포착 골든타임 보호
+            hhmm = int(time.strftime("%H%M", time.localtime(ts_epoch)))
+            if not (900 <= hhmm < 910):
+                return False, "spread_missing"
         if spread_bps > self.buy_spread_max_bps:
             return False, "gate_spread"
         ofi_ok = metrics.get("ofi", 0.0) >= self.buy_ofi_min

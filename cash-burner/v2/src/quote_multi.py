@@ -13,13 +13,13 @@ PATH = "/uapi/domestic-stock/v1/quotations/intstock-multprice"
 DEFAULT_MRKT = os.getenv("FID_COND_MRKT_DIV_CODE_1", "J")
 
 # 실전용 과열 차단(+5% 이상 진입 금지)과도 정합
-ENTRY_BLOCK_DAYRISE_PCT = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "7.0"))
+ENTRY_BLOCK_DAYRISE_PCT = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "12.0"))  # 7.0→12.0: engine과 동기화
 
 # 거래대금(원) 너무 작은 종목은 제외(유동성 쓰레기 필터)
 MIN_TRADE_VALUE = float(os.getenv("WATCH_MIN_TR_VALUE", "600000000"))
 MIN_VOLUME = float(os.getenv("WATCH_MIN_VOLUME", "30000"))
-WATCH_SOFT_HEAT_PCT = float(os.getenv("WATCH_SOFT_HEAT_PCT", "10.5"))
-WATCH_HARD_HEAT_PCT = float(os.getenv("WATCH_HARD_HEAT_PCT", "14.0"))
+WATCH_SOFT_HEAT_PCT = float(os.getenv("WATCH_SOFT_HEAT_PCT", "14.0"))   # 10.5→14.0: 급등주 포착 위해 완화
+WATCH_HARD_HEAT_PCT = float(os.getenv("WATCH_HARD_HEAT_PCT", "20.0"))   # 14.0→20.0: engine hard block과 동기화
 WATCH_STRENGTH_WEIGHT = float(os.getenv("WATCH_STRENGTH_WEIGHT", "1.2"))
 
 MARKET_CANDIDATES = [m.strip() for m in os.getenv("FID_COND_MRKT_DIV_CODE_MULTI", f"{DEFAULT_MRKT},NX").split(",") if m.strip()]
