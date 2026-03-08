@@ -86,7 +86,7 @@ def request(method: str, path: str, tr_id: str, params: Dict[str, Any] = None, b
                 "tr_id": tr_id,
                 "custtype": "P",
             }
-            if body is not None:
+            if method.upper() == "POST" and body is not None:
                 headers["hashkey"] = hashkey(body)
 
             if method.upper() == "GET":

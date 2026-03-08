@@ -119,10 +119,11 @@ def match_trades(diag_buys: List[dict], diag_sells: List[dict],
         used_ls: set[int] = set()
         while bi < len(dbuys) and si < len(dsells):
             b = dbuys[bi]
-            s = dsells[si]
-            if s["ts"] <= b["ts"]:
+            while si < len(dsells) and dsells[si]["ts"] <= b["ts"]:
                 si += 1
-                continue
+            if si >= len(dsells):
+                break
+            s = dsells[si]
             # 미사용 ledger 레코드 중 timestamp 가장 가까운 것 매칭
             lb_cands = [(i, r) for i, r in enumerate(lbuys) if i not in used_lb]
             if lb_cands:

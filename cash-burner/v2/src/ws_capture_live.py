@@ -38,6 +38,7 @@ MAX_ACTIVE_SUB_KEYS = int(os.getenv("WS_MAX_ACTIVE_SUB_KEYS", "50"))
 WATCH_REMOVE_DELAY_SEC = float(os.getenv("WATCH_REMOVE_DELAY_SEC", "0"))
 LEADER_RADAR_ENABLE = os.getenv("LEADER_RADAR_ENABLE", "0") == "1"
 LEADER_RADAR_RET3S_PCT = float(os.getenv("LEADER_RADAR_RET3S_PCT", "1.0"))
+LEADER_RADAR_RET3S_SEC = float(os.getenv("LEADER_RADAR_RET3S_SEC", "3.0"))
 LEADER_RADAR_MAX_SUBS = max(0, int(os.getenv("LEADER_RADAR_MAX_SUBS", "5")))
 LEADER_RADAR_HOLD_SEC = float(os.getenv("LEADER_RADAR_HOLD_SEC", "120"))
 
@@ -226,9 +227,11 @@ class WSCapture:
             _append(CONTROL_FILE, f"{_ts()}	LEADER_RADAR add={len(radar_syms)} thr={LEADER_RADAR_RET3S_PCT:.2f}%")
         try:
             _ensure_dir(RADAR_INJECT_FILE)
-            with open(RADAR_INJECT_FILE, "w", encoding="utf-8") as f:
+            tmp_path = RADAR_INJECT_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 for s in sorted(radar_syms):
                     f.write(s + "\n")
+            os.replace(tmp_path, RADAR_INJECT_FILE)
             if radar_syms:
                 _append(CONTROL_FILE, f"{_ts()}	LEADER_RADAR inject_file n={len(radar_syms)}")
         except Exception as e:
@@ -241,13 +244,14 @@ class WSCapture:
             return
         h = self.leader_radar_price_hist.setdefault(sym, deque())
         h.append((ts, price))
-        cutoff = ts - 4.0
+        keep_sec = max(4.0, LEADER_RADAR_RET3S_SEC + 2.0)
+        cutoff = ts - keep_sec
         while h and h[0][0] < cutoff:
             h.popleft()
         if not h:
             self.leader_radar_price_hist.pop(sym, None)
             return
-        base = next((p for t, p in h if (ts - t) >= 3.0), None)
+        base = next((p for t, p in h if (ts - t) >= LEADER_RADAR_RET3S_SEC), None)
         if base and base > 0:
             ret3 = (price / base - 1.0) * 100.0
             if ret3 >= LEADER_RADAR_RET3S_PCT:
@@ -415,6 +419,9 @@ class WSCapture:
         ok, reason = self._validate_sub_request(tr_id, sym, tr_type)
         if not ok:
             _append(CONTROL_FILE, f"{_ts()}	SUB_DROP {reason}")
+            return False
+        if not self.approval_key:
+            _append(CONTROL_FILE, f"{_ts()}	SUB_DROP approval_key_none")
             return False
         try:
             payload = build_msg(self.approval_key, tr_id, sym, tr_type)

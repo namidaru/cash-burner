@@ -33,6 +33,7 @@ def check_ledger(path: str) -> Dict[str, object]:
     open_ts: Dict[str, float] = {}
     buy_ts: Dict[str, float] = {}
     buys = sells = 0
+    full_sells = 0
     stop_loss_sells = 0
     hold_secs: List[float] = []
 
@@ -73,6 +74,7 @@ def check_ledger(path: str) -> Dict[str, object]:
                     pass
                 else:
                     sells += 1
+                    full_sells += 1
                     if "stop_loss" in reason:
                         stop_loss_sells += 1
                 if sym in buy_ts and ts > buy_ts[sym] and "partial_take" not in reason:
@@ -97,8 +99,8 @@ def check_ledger(path: str) -> Dict[str, object]:
         issues.append(f"open position age exceeds threshold: {max_open_age_sec:.0f}s > {max_expect_open_sec:.0f}s")
 
     # PROMPT 6: ledger 힌트
-    if sells > 0 and stop_loss_sells / sells >= 0.60:
-        hints.append(f"stop_loss 비율 {stop_loss_sells/sells*100:.0f}% (≥60%): STOP_LOSS_PCT 완화 또는 진입 조건 재검토")
+    if full_sells > 0 and stop_loss_sells / full_sells >= 0.60:
+        hints.append(f"stop_loss 비율 {stop_loss_sells/full_sells*100:.0f}% (≥60%): STOP_LOSS_PCT 완화 또는 진입 조건 재검토")
     if hold_secs:
         avg_hold = sum(hold_secs) / len(hold_secs)
         max_hold_sec = float(os.getenv("MAX_HOLD_SEC", "240"))
@@ -110,6 +112,7 @@ def check_ledger(path: str) -> Dict[str, object]:
         "hints": hints,
         "buys": buys,
         "sells": sells,
+        "full_sells": full_sells,
         "open_symbols": open_symbols,
         "open_age_sec": {k: round(v, 1) for k, v in open_age_sec.items()},
         "max_open_age_sec": round(max_open_age_sec, 1),

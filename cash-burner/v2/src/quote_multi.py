@@ -183,7 +183,7 @@ def score_item(it: Dict[str, Any]) -> float:
         return float("-inf")
 
     strength = _get_first(it, [
-        "tday_rltv", "exec_str", "trade_strength", "cntrg", "cttr", "power"
+        "cttr", "cntrg", "tday_rltv", "exec_str", "trade_strength", "power"
     ], 0.0)
     if strength == 0.0:
         buy_cnt = _get_first(it, ["shnu_cntg_csnu", "SHNU_CNTG_CSNU"], 0.0)

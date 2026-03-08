@@ -4,6 +4,7 @@ import json
 import math
 import os
 import time
+import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass, asdict
 from typing import Any, Deque, Dict, Tuple
@@ -46,6 +47,7 @@ class Position:
     atr_pct: float = 0.0       # PROMPT 1: 진입 시 30초 변동성
     partial_taken: bool = False  # PROMPT 1: 부분익실 완료 여부
     last_price: float = 0.0    # PROMPT 7: 시장상태 추적용
+    fill_confirmed: bool = True
 
 
 CASH_REFRESH_INTERVAL = float(os.getenv("CASH_REFRESH_INTERVAL_SEC", "30"))
@@ -133,6 +135,7 @@ class EngineSimple:
         self._last_sell_symbol = ""
         self._recent_events: Deque[Dict[str, Any]] = deque(maxlen=10)
         self._last_runtime_snapshot_ts = 0.0
+        self._state_lock = threading.Lock()
         self._last_orderable_cash: float | None = None
         self._last_orderable_cash_ts = 0.0
         # PROMPT 3: 연속손절 추적
@@ -211,7 +214,7 @@ class EngineSimple:
                 self.pos[sym] = Position(
                     qty=qty_use,
                     entry_price=float(item.get("entry_price", 0.0)),
-                    entry_ts=max(float(item.get("entry_ts", time.time())), time.time() - self.max_hold_sec + 30.0),
+                    entry_ts=max(float(item.get("entry_ts", time.time())), time.time() - self.max_hold_sec),
                     max_price=float(item.get("max_price", item.get("entry_price", 0.0))),
                     max_pnl_pct=float(item.get("max_pnl_pct", 0.0)),
                     min_pnl_pct=float(item.get("min_pnl_pct", 0.0)),
@@ -220,6 +223,7 @@ class EngineSimple:
                     atr_pct=float(item.get("atr_pct", 0.0)),
                     partial_taken=bool(item.get("partial_taken", False)),
                     last_price=float(item.get("last_price", 0.0)),
+                    fill_confirmed=bool(item.get("fill_confirmed", True)),
                 )
                 if qty_use != qty_state:
                     dirty = True
@@ -245,9 +249,10 @@ class EngineSimple:
             except Exception:
                 pass
             if new_watch:
-                if new_watch != self.watch:
-                    self.prev_close_cache = load_cache()
-                self.watch = new_watch
+                with self._state_lock:
+                    if new_watch != self.watch:
+                        self.prev_close_cache = load_cache()
+                    self.watch = new_watch
         except Exception:
             pass
 
@@ -285,7 +290,6 @@ class EngineSimple:
         first_valid = True
         for t, px, vol in dq:
             if t < st:
-                first_valid = True
                 continue
             if first_valid:
                 base = px
@@ -406,12 +410,8 @@ class EngineSimple:
         return self.cooldown_sec
 
     def _eod_ts(self, ts_epoch: float) -> float:
-        """당일 장마감(15:30) KST timestamp."""
-        t = time.localtime(ts_epoch)
-        eod = time.mktime(time.struct_time((t.tm_year, t.tm_mon, t.tm_mday, 15, 30, 0, t.tm_wday, t.tm_yday, t.tm_isdst)))
-        if eod <= ts_epoch:
-            eod += 86400
-        return eod
+        """거래일 캘린더 없이 손절 쿨다운 기준으로 대체."""
+        return ts_epoch + self.cooldown_stop_sec
 
     def _update_market_state(self, ts_epoch: float):
         """보유 포지션 평균 pnl 기반 시장 하락추세 감지 (PROMPT 7)."""
@@ -622,7 +622,6 @@ class EngineSimple:
             if abs(metrics.get("contrib_neg", {}).get("chase", 0.0)) >= 10.0:
                 return False, "chase_penalty_dominated"
             return False, "score_too_low"
-        self._score_pass_total += 1
         return True, "pass"
 
     def _top_factor_strings(self, metrics: Dict[str, float]) -> tuple[str, str]:
@@ -684,7 +683,12 @@ class EngineSimple:
             self._log_diag(ts_epoch, sym, "BUY_FAIL", str(j.get("msg1", ""))[:160])
             return
 
-        filled = self._confirmed_fill_qty(j) or qty
+        filled = self._confirmed_fill_qty(j)
+        fill_confirmed = True
+        if filled <= 0:
+            self._log_diag(ts_epoch, sym, "BUY_FILL_UNKNOWN", f"rt_cd={j.get('rt_cd')} msg={j.get('msg1','')}")
+            filled = qty
+            fill_confirmed = False
         # PROMPT 1: 진입 시 30초 변동성(ATR) 계산
         prices_30s = [px for t, px, _ in self.ticks[sym] if (ts_epoch - t) <= 30.0]
         if len(prices_30s) >= 2:
@@ -692,7 +696,7 @@ class EngineSimple:
             atr_pct = (max(prices_30s) - min(prices_30s)) / max(1.0, mid30) * 100.0
         else:
             atr_pct = 0.0
-        self.pos[sym] = Position(qty=filled, entry_price=price, entry_ts=ts_epoch, max_price=price, score=score, reasons=reasons[:5], atr_pct=atr_pct)
+        self.pos[sym] = Position(qty=filled, entry_price=price, entry_ts=ts_epoch, max_price=price, score=score, reasons=reasons[:5], atr_pct=atr_pct, fill_confirmed=fill_confirmed)
         if self._last_orderable_cash is not None:
             self._last_orderable_cash = max(0.0, self._last_orderable_cash - price * filled)
         self._last_buy_time = ts_epoch
@@ -771,6 +775,8 @@ class EngineSimple:
                         self._daily_realized_pnl += pnl_partial
                         p.qty -= partial_qty
                         p.partial_taken = True
+                        if self._last_orderable_cash is not None:
+                            self._last_orderable_cash += price * partial_qty
                         self._record_event(ts_epoch, "PARTIAL_SELL", sym, f"qty={partial_qty} pnl={pnl_pct:.2f}%")
                         self._save_state()
                         self._log_diag(ts_epoch, sym, "PARTIAL_SELL", f"qty={partial_qty} remain={p.qty} pnl={pnl_pct:.2f}% threshold={partial_tp_threshold:.2f}% atr={p.atr_pct:.2f}")
@@ -809,9 +815,13 @@ class EngineSimple:
                         )
                 if self.loss_streak_block_enabled:
                     if "stop_loss" in reason:
-                        self._loss_streak[sym] = self._loss_streak.get(sym, 0) + 1
+                        self._loss_streak[sym] += 1
                     else:
                         self._loss_streak[sym] = 0
+                evict_entry_price = p.entry_price
+                evict_entry_ts = p.entry_ts
+                evict_qty = p.qty
+                evict_fail_count = p.sell_fail_count
                 self.pos.pop(sym, None)
                 if self.loss_streak_block_enabled and self._loss_streak.get(sym, 0) >= 2:
                     self._loss_streak_blocked.add(sym)
@@ -822,14 +832,14 @@ class EngineSimple:
                 self._last_sell_symbol = sym
                 self._record_event(ts_epoch, "SELL", sym, f"EVICT_{reason}")
                 self._save_state()
-                pnl_pct_evict = (price / p.entry_price - 1.0) * 100.0 if p.entry_price > 0 else 0.0
-                hold_sec_evict = ts_epoch - p.entry_ts
+                pnl_pct_evict = (price / evict_entry_price - 1.0) * 100.0 if evict_entry_price > 0 else 0.0
+                hold_sec_evict = ts_epoch - evict_entry_ts
                 self._log_diag(
                     ts_epoch, sym, "SELL",
                     f"reason=EVICT_{reason} hold={hold_sec_evict:.1f}s pnl={pnl_pct_evict:.2f}% "
-                    f"entry={p.entry_price:.0f} price={price:.0f} qty={p.qty}"
+                    f"entry={evict_entry_price:.0f} price={price:.0f} qty={evict_qty}"
                 )
-                self._log_diag(ts_epoch, sym, "SELL_EVICT", f"evicted sell_fail_count={p.sell_fail_count}")
+                self._log_diag(ts_epoch, sym, "SELL_EVICT", f"evicted sell_fail_count={evict_fail_count}")
             return
 
         pnl = (price - p.entry_price) * qty
@@ -854,7 +864,7 @@ class EngineSimple:
         # PROMPT 3: 연속손절 추적
         if self.loss_streak_block_enabled:
             if "stop_loss" in reason:
-                self._loss_streak[sym] = self._loss_streak.get(sym, 0) + 1
+                self._loss_streak[sym] += 1
             else:
                 self._loss_streak[sym] = 0
 
@@ -914,7 +924,10 @@ class EngineSimple:
 
         self._reload_watchlist(ts_epoch)
 
-        if sym not in self.watch and sym not in self.pos:
+        with self._state_lock:
+            in_watch = sym in self.watch
+            in_pos = sym in self.pos
+        if not in_watch and not in_pos:
             return
 
         dq = self.ticks[sym]
@@ -922,8 +935,7 @@ class EngineSimple:
         while dq and (ts_epoch - dq[0][0]) > 360.0:
             dq.popleft()
 
-        if sym in self.pos:
-            self._gate_block_counts["already_held"] += 1
+        if in_pos:
             self.manage_position(sym, price, ts_epoch)
             return
 
@@ -933,6 +945,8 @@ class EngineSimple:
         last = self._last_candidate_log_ts.get(sym, 0.0)
         if (ts_epoch - last) >= 1.0:
             self._score_eval_total += 1
+            if ok:
+                self._score_pass_total += 1
             self._last_candidate_log_ts[sym] = ts_epoch
             status = "PASS" if ok else "DROP"
             pos_s, neg_s = self._top_factor_strings(metrics)
@@ -1047,7 +1061,9 @@ class EngineSimple:
                 f"base_cash={self._daily_loss_base_cash:.0f}"
             )
         self._update_market_state(ts_epoch)
-        for sym, p in list(self.pos.items()):
+        with self._state_lock:
+            pos_items = list(self.pos.items())
+        for sym, p in pos_items:
             last_px = p.last_price if p.last_price > 0 else p.entry_price
             if last_px > 0:
                 self.manage_position(sym, last_px, ts_epoch)

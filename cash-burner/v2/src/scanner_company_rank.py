@@ -727,6 +727,7 @@ def build_watchlist() -> List[str]:
             if chg < min_chg or chg > max_chg:
                 dropped["chg"] += 1
                 continue
+            # max_chg 완화 시를 대비한 추가 과열 차단
             if chg > hard_heat:
                 dropped["heat"] += 1
                 continue
@@ -827,6 +828,7 @@ def build_watchlist() -> List[str]:
         if chg < min_chg or chg > max_chg:
             dropped["chg"] += 1
             continue
+        # max_chg 완화 시를 대비한 추가 과열 차단
         if chg > hard_heat:
             dropped["heat"] += 1
             continue
@@ -862,23 +864,32 @@ def build_watchlist() -> List[str]:
             break
 
     if len(out) < want_n:
+        prev_n = len(out)
         out += _supplement_from_volume_rank(
             want_n - len(out), set(out), min_price, min_tv, hard_heat, meta,
             max_price=max_price, min_chg=min_chg, max_chg=max_chg,
             min_vol=min_vol,
         )
+        for sym in out[prev_n:]:
+            src_map[sym] = "volume_rank"
     if len(out) < want_n:
+        prev_n = len(out)
         out += _supplement_from_strength(
             want_n - len(out), set(out), min_price, min_tv, hard_heat, meta,
             max_price=max_price, min_chg=min_chg, max_chg=max_chg,
             min_vol=min_vol, max_spread_pct=max_spread_pct,
         )
+        for sym in out[prev_n:]:
+            src_map[sym] = "strength"
     if len(out) < want_n:
+        prev_n = len(out)
         out += _supplement_from_conditions(
             want_n - len(out), set(out), min_price, min_tv, hard_heat, meta,
             max_price=max_price, min_chg=min_chg, max_chg=max_chg,
             min_vol=min_vol, max_spread_pct=max_spread_pct,
         )
+        for sym in out[prev_n:]:
+            src_map[sym] = "condition"
 
     if not out:
         fb = _fallback_symbols()[:want_n]
