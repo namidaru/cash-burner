@@ -636,9 +636,9 @@ def build_watchlist() -> List[str]:
     min_price = float(os.getenv("WATCH_MIN_PRICE", "5000"))
     max_price = float(os.getenv("WATCH_MAX_PRICE", "200000"))
     min_chg = float(os.getenv("WATCH_MIN_CHANGE_PCT", "0.5"))   # 1.0→0.5: 급등 초입 선점
-    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "10.0"))  # 12.0→10.0: ENTRY_HARD_DAYRISE와 선제 정렬
-    hard_heat = float(os.getenv("WATCH_HARD_HEAT_PCT", "14.0"))
-    soft_heat = float(os.getenv("WATCH_SOFT_HEAT_PCT", "10.5"))
+    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "20.0"))  # 10.0→20.0: engine hard block(20%)과 동기화
+    hard_heat = float(os.getenv("WATCH_HARD_HEAT_PCT", "20.0"))  # 14.0→20.0: quote_multi/engine과 동기화
+    soft_heat = float(os.getenv("WATCH_SOFT_HEAT_PCT", "14.0"))  # 10.5→14.0: quote_multi와 동기화
     min_tv = float(os.getenv("WATCH_MIN_TR_VALUE", "600000000"))
     min_vol = float(os.getenv("WATCH_MIN_VOLUME", "30000"))
     max_spread_pct = float(os.getenv("WATCH_MAX_SPREAD_PCT", "0.35"))
