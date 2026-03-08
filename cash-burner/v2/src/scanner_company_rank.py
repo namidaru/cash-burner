@@ -97,6 +97,102 @@ def _in_preopen_window() -> bool:
     return start_min <= now_min < (start_min + track_min)
 
 
+def _normalize_rank_rows(j: Dict[str, Any]) -> List[Dict[str, Any]]:
+    for k in ("output", "output1", "output2"):
+        v = j.get(k)
+        if isinstance(v, list) and v:
+            return v
+    for k in ("output", "output1", "output2"):
+        v = j.get(k)
+        if isinstance(v, dict):
+            for _, iv in v.items():
+                if isinstance(iv, list) and iv:
+                    return iv
+    for _, v in j.items():
+        if isinstance(v, list) and v and isinstance(v[0], dict):
+            return v
+    return []
+
+
+def fetch_strength_rank(market: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    path = os.getenv("STRENGTH_PATH", STRENGTH_PATH).strip() or STRENGTH_PATH
+    tr_ids = [x.strip() for x in os.getenv("STRENGTH_TR_IDS", DEFAULT_STRENGTH_TR_IDS).split(",") if x.strip()]
+    scr_codes = [x.strip() for x in os.getenv("STRENGTH_SCR_CODES", os.getenv("RANK_SCR_CODES", "20170")).split(",") if x.strip()]
+    limit_n = int(os.getenv("STRENGTH_TOPK", "120"))
+    all_rows: List[Dict[str, Any]] = []
+    debug_meta: List[str] = []
+
+    for tr_id in tr_ids:
+        for scr in scr_codes:
+            params = {
+                "fid_cond_mrkt_div_code": market,
+                "fid_cond_scr_div_code": scr,
+                "fid_input_iscd": os.getenv("STRENGTH_INPUT_ISCD", os.getenv("FID_INPUT_ISCD", "0000")),
+                "fid_trgt_cls_code": os.getenv("STRENGTH_TRGT_CLS_CODE", os.getenv("FID_TRGT_CLS_CODE", "0")),
+                "fid_trgt_exls_cls_code": os.getenv("STRENGTH_TRGT_EXLS_CLS_CODE", os.getenv("FID_TRGT_EXLS_CLS_CODE", "0")),
+            }
+            try:
+                j = request("GET", path, tr_id, params=params)
+                rows = _normalize_rank_rows(j)
+                if rows:
+                    all_rows.extend(rows)
+                    debug_meta.append(f"s-ok m={market} tr={tr_id} scr={scr} rows={len(rows)}")
+                else:
+                    debug_meta.append(f"s-empty m={market} tr={tr_id} scr={scr} rt_cd={j.get('rt_cd','?')} msg1={j.get('msg1','')[:40]}")
+            except Exception as e:
+                debug_meta.append(f"s-err m={market} tr={tr_id} scr={scr} ex={type(e).__name__}")
+            if len(all_rows) >= limit_n:
+                return all_rows[:limit_n], debug_meta
+    return all_rows[:limit_n], debug_meta
+
+
+def fetch_volume_rank(market: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    tr_ids = [x.strip() for x in os.getenv("VOLUME_RANK_TR_IDS", DEFAULT_VOLUME_TR_IDS).split(",") if x.strip()]
+    limit_n = int(os.getenv("VOLUME_RANK_TOPK", "120"))
+    all_rows: List[Dict[str, Any]] = []
+    debug_meta: List[str] = []
+
+    for tr_id in tr_ids:
+        params = {
+            "fid_cond_mrkt_div_code": market,
+            "fid_cond_scr_div_code": os.getenv("VOLUME_RANK_SCR", "20171"),
+            "fid_input_iscd": os.getenv("VOLUME_RANK_INPUT_ISCD", "0000"),
+            "fid_div_cls_code": os.getenv("VOLUME_RANK_DIV", "0"),
+            "fid_blng_cls_code": os.getenv("VOLUME_RANK_BLNG", "0"),
+            "fid_trgt_cls_code": os.getenv("VOLUME_RANK_TRGT", "111111111"),
+            "fid_trgt_exls_cls_code": os.getenv("VOLUME_RANK_EXLS", "000000"),
+            "fid_input_price_1": os.getenv("VOLUME_RANK_P1", ""),
+            "fid_input_price_2": os.getenv("VOLUME_RANK_P2", ""),
+            "fid_vol_cnt": os.getenv("VOLUME_RANK_VOL_CNT", ""),
+            "fid_input_date_1": os.getenv("VOLUME_RANK_DATE1", ""),
+        }
+        try:
+            j = request("GET", VOLUME_RANK_PATH, tr_id, params=params)
+            rows = _normalize_rank_rows(j)
+            if rows:
+                all_rows.extend(rows)
+                debug_meta.append(f"v-ok m={market} tr={tr_id} rows={len(rows)}")
+            else:
+                debug_meta.append(f"v-empty m={market} tr={tr_id} rt_cd={j.get('rt_cd','?')} msg1={j.get('msg1','')[:40]}")
+        except Exception as e:
+            debug_meta.append(f"v-err m={market} tr={tr_id} ex={type(e).__name__}")
+        if len(all_rows) >= limit_n:
+            return all_rows[:limit_n], debug_meta
+    return all_rows[:limit_n], debug_meta
+
+
+def _fallback_symbols() -> List[str]:
+    raw = os.getenv("WATCH_FALLBACK_SYMBOLS", os.getenv("FALLBACK_SYMBOLS", ""))
+    if not raw:
+        return []
+    out: List[str] = []
+    for tok in raw.split(","):
+        sym = tok.strip()
+        if sym:
+            out.append(sym.zfill(6))
+    return out
+
+
 def _parse_sym(item: Dict[str, Any]) -> str:
     raw = (
         item.get("mksc_shrn_iscd")
@@ -195,6 +291,7 @@ def _supplement_from_volume_rank(
     max_chg: float = 999.0,
     min_strength: float = 0.0,
     max_strength: float = 9999.0,
+    min_vol: float = 0.0,
 ) -> List[str]:
     if need_n <= 0:
         return []
@@ -227,6 +324,9 @@ def _supplement_from_volume_rank(
         if r >= block_rise:
             continue
         if tv > 0 and tv < min_tv:
+            continue
+        vol = _parse_float(it, "acml_vol", 0.0)
+        if min_vol > 0 and vol > 0 and vol < min_vol:
             continue
 
         candidates.append((sym, it, r, tv, spread_pct))
@@ -624,11 +724,11 @@ def build_watchlist() -> List[str]:
                 continue
 
             chg = _parse_float(it, "prdy_ctrt", 0.0)
-            if chg > hard_heat:
-                dropped["heat"] += 1
-                continue
             if chg < min_chg or chg > max_chg:
                 dropped["chg"] += 1
+                continue
+            if chg > hard_heat:
+                dropped["heat"] += 1
                 continue
 
             tv = _parse_float(it, "acml_tr_pbmn", 0.0)
@@ -724,11 +824,11 @@ def build_watchlist() -> List[str]:
             continue
 
         chg = _parse_float(it, "prdy_ctrt", 0.0)
-        if chg > hard_heat:
-            dropped["heat"] += 1
-            continue
         if chg < min_chg or chg > max_chg:
             dropped["chg"] += 1
+            continue
+        if chg > hard_heat:
+            dropped["heat"] += 1
             continue
 
         tv = _parse_float(it, "acml_tr_pbmn", 0.0)
@@ -765,6 +865,7 @@ def build_watchlist() -> List[str]:
         out += _supplement_from_volume_rank(
             want_n - len(out), set(out), min_price, min_tv, hard_heat, meta,
             max_price=max_price, min_chg=min_chg, max_chg=max_chg,
+            min_vol=min_vol,
         )
     if len(out) < want_n:
         out += _supplement_from_strength(

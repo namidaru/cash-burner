@@ -201,7 +201,7 @@ def analyze(trades: List[dict]) -> None:
 
     # 시간대별 승률
     print(f"\n=== 시간대별 승률 ===")
-    hour_buckets = {9: [], 10: [], 11: [], 13: [], 14: []}
+    hour_buckets = {9: [], 10: [], 11: [], 12: [], 13: [], 14: []}
     for t in trades:
         h = t["buy_hhmm"] // 100
         if h in hour_buckets and t["pnl_pct_ledger"] is not None:

@@ -58,6 +58,7 @@ class EngineSimple:
         self.ledger_file = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
         self.state_file = os.getenv("POSITION_STATE_FILE", os.path.join("data", "positions_simple.json"))
         self.watchlist_file = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
+        self.radar_inject_file = os.getenv("WATCH_RADAR_INJECT_FILE", os.path.join("data", "radar_inject.txt"))
         self.signal_diag_file = os.getenv("SIGNAL_DIAG_FILE", os.path.join("data", "signal_diag.log"))
         self.runtime_status_file = os.getenv("RUNTIME_STATUS_FILE", os.path.join("data", "runtime_status.json"))
 
@@ -232,8 +233,17 @@ class EngineSimple:
             return
         self._last_watch_reload_ts = ts_epoch
         try:
-            with open(self.watchlist_file, "r", encoding="utf-8") as f:
-                new_watch = {ln.strip() for ln in f if ln.strip()}
+            new_watch: set[str] = set()
+            try:
+                with open(self.watchlist_file, "r", encoding="utf-8") as f:
+                    new_watch = {ln.strip() for ln in f if ln.strip()}
+            except Exception:
+                pass
+            try:
+                with open(self.radar_inject_file, "r", encoding="utf-8") as f:
+                    new_watch |= {ln.strip() for ln in f if ln.strip()}
+            except Exception:
+                pass
             if new_watch:
                 if new_watch != self.watch:
                     self.prev_close_cache = load_cache()
@@ -598,7 +608,7 @@ class EngineSimple:
         if metrics.get("ret10", 0.0) < self.buy_ret10_min:
             return False, "gate_ret10"
         spread_bps = metrics.get("spread_bps", -1.0)
-        if spread_bps is None or spread_bps < 0:
+        if spread_bps < 0:
             return False, "spread_missing"
         if spread_bps > self.buy_spread_max_bps:
             return False, "gate_spread"

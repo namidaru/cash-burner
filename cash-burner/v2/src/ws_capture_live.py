@@ -23,6 +23,7 @@ def _dated_out_file() -> str:
 CONTROL_FILE = os.getenv("CONTROL_FILE", os.path.join("data", "ws_control.log"))
 WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
 LEDGER_FILE = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
+RADAR_INJECT_FILE = os.getenv("WATCH_RADAR_INJECT_FILE", os.path.join("data", "radar_inject.txt"))
 PREOPEN_TRACK_MIN = int(os.getenv("PREOPEN_TRACK_MIN", "15"))
 PREOPEN_START_HHMM = int(os.getenv("PREOPEN_START_HHMM", "900"))
 
@@ -222,24 +223,16 @@ class WSCapture:
         base_desired = kept_watch | held
         radar_syms = self._leader_radar_symbols(now, excluded=base_desired)
         if radar_syms:
-            _append(CONTROL_FILE, f"{_ts()}\tLEADER_RADAR add={len(radar_syms)} thr={LEADER_RADAR_RET3S_PCT:.2f}%")
-            # watchlist에도 반영 — 엔진이 score_eval을 실행하려면 watchlist.txt에 있어야 함
-            try:
-                wl_path = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
-                existing: set[str] = set()
-                try:
-                    with open(wl_path, "r", encoding="utf-8") as f:
-                        existing = {ln.strip() for ln in f if ln.strip()}
-                except Exception:
-                    pass
-                new_syms = radar_syms - existing
-                if new_syms:
-                    with open(wl_path, "a", encoding="utf-8") as f:
-                        for s in sorted(new_syms):
-                            f.write(s + "\n")
-                    _append(CONTROL_FILE, f"{_ts()}\tLEADER_RADAR watchlist_inject n={len(new_syms)}")
-            except Exception as e:
-                _append(CONTROL_FILE, f"{_ts()}\tLEADER_RADAR watchlist_inject_err {e}")
+            _append(CONTROL_FILE, f"{_ts()}	LEADER_RADAR add={len(radar_syms)} thr={LEADER_RADAR_RET3S_PCT:.2f}%")
+        try:
+            _ensure_dir(RADAR_INJECT_FILE)
+            with open(RADAR_INJECT_FILE, "w", encoding="utf-8") as f:
+                for s in sorted(radar_syms):
+                    f.write(s + "\n")
+            if radar_syms:
+                _append(CONTROL_FILE, f"{_ts()}	LEADER_RADAR inject_file n={len(radar_syms)}")
+        except Exception as e:
+            _append(CONTROL_FILE, f"{_ts()}	LEADER_RADAR inject_file_err {e}")
         return base_desired | radar_syms
 
     def feed_leader_price(self, sym: str, price: float, ts: float):
