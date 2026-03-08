@@ -13,13 +13,14 @@ PATH = "/uapi/domestic-stock/v1/quotations/intstock-multprice"
 DEFAULT_MRKT = os.getenv("FID_COND_MRKT_DIV_CODE_1", "J")
 
 # 실전용 과열 차단(+5% 이상 진입 금지)과도 정합
-ENTRY_BLOCK_DAYRISE_PCT = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "5.0"))
+ENTRY_BLOCK_DAYRISE_PCT = float(os.getenv("ENTRY_BLOCK_DAYRISE_PCT", "7.0"))
 
 # 거래대금(원) 너무 작은 종목은 제외(유동성 쓰레기 필터)
 MIN_TRADE_VALUE = float(os.getenv("WATCH_MIN_TR_VALUE", "600000000"))
 MIN_VOLUME = float(os.getenv("WATCH_MIN_VOLUME", "30000"))
 WATCH_SOFT_HEAT_PCT = float(os.getenv("WATCH_SOFT_HEAT_PCT", "10.5"))
 WATCH_HARD_HEAT_PCT = float(os.getenv("WATCH_HARD_HEAT_PCT", "14.0"))
+WATCH_STRENGTH_WEIGHT = float(os.getenv("WATCH_STRENGTH_WEIGHT", "1.2"))
 
 MARKET_CANDIDATES = [m.strip() for m in os.getenv("FID_COND_MRKT_DIV_CODE_MULTI", f"{DEFAULT_MRKT},NX").split(",") if m.strip()]
 _SYMBOL_MARKET: Dict[str, str] = {}
@@ -120,7 +121,7 @@ def multi_quote(symbols: List[str]) -> List[Dict[str, Any]]:
 
 
 def volume_acceleration(it: Dict[str, Any]) -> float:
-    """거래대금 가속도 proxy (당일 누적대금 / 전일 거래량)."""
+    """거래대금 가속도 proxy (당일 거래대금 / 전일 거래대금, 없으면 거래량 비율)."""
     tr_value = _get_first(it, [
         "acml_tr_pbmn", "ACML_TR_PBMN", "stck_acml_tr_pbmn", "STCK_ACML_TR_PBMN"
     ], 0.0)
@@ -129,7 +130,13 @@ def volume_acceleration(it: Dict[str, Any]) -> float:
     ], 0.0)
     if prev_vol <= 0:
         return 0.0
-    return tr_value / prev_vol
+    prdy_tr_value = _get_first(it, [
+        "prdy_tr_pbmn", "PRDY_TR_PBMN", "prdy_acml_tr_pbmn", "PRDY_ACML_TR_PBMN"
+    ], 0.0)
+    if prdy_tr_value <= 0:
+        today_vol = _get_first(it, ["acml_vol", "ACML_VOL", "stck_acml_vol"], 0.0)
+        return today_vol / prev_vol
+    return tr_value / prdy_tr_value
 
 def score_item(it: Dict[str, Any]) -> float:
     """
@@ -178,6 +185,11 @@ def score_item(it: Dict[str, Any]) -> float:
     strength = _get_first(it, [
         "tday_rltv", "exec_str", "trade_strength", "cntrg", "cttr", "power"
     ], 0.0)
+    if strength == 0.0:
+        buy_cnt = _get_first(it, ["shnu_cntg_csnu", "SHNU_CNTG_CSNU"], 0.0)
+        sell_cnt = _get_first(it, ["seln_cntg_csnu", "SELN_CNTG_CSNU"], 0.0)
+        if sell_cnt > 0:
+            strength = (buy_cnt / sell_cnt) * 100.0
 
     # 3) 스프레드/호가 품질(있으면만 사용)
     ask1 = _get_first(it, ["askp1", "ASKP1", "ask1", "ASK1"], 0.0)
@@ -207,7 +219,7 @@ def score_item(it: Dict[str, Any]) -> float:
     score = (
         (max(0.0, r) * 0.7)
         + accel_score
-        + (strength_score * 1.2)
+        + (strength_score * WATCH_STRENGTH_WEIGHT)
         + liquidity_score
         - spread_penalty
         - heat_penalty

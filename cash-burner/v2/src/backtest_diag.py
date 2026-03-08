@@ -78,7 +78,9 @@ def parse_ledger(path: str) -> Tuple[List[dict], List[dict]]:
             if action == "BUY":
                 ledger_buys.append(row)
             elif action == "SELL":
-                ledger_sells.append(row)
+                reason = (row.get("reason") or "").lower()
+                if "partial_take" not in reason:
+                    ledger_sells.append(row)
     return ledger_buys, ledger_sells
 
 

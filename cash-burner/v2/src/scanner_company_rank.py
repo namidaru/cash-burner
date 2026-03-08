@@ -396,7 +396,7 @@ def _parse_float(item: Dict[str, Any], key: str, d: float = 0.0) -> float:
 
 def _parse_price(item: Dict[str, Any]) -> float:
     # API 변형 대응: 현재가 키가 다를 수 있어 다중 후보를 순회
-    for k in ("stck_prpr", "prpr", "stck_clpr", "close", "price", "cur_prc"):
+    for k in ("stck_prpr", "STCK_PRPR", "prpr", "PRPR", "stck_clpr", "STCK_CLPR", "close", "price", "cur_prc"):
         v = _parse_float(item, k, -1.0)
         if v > 0:
             return v
@@ -427,7 +427,7 @@ def _parse_spread_pct(item: Dict[str, Any], default_spread: float) -> float:
 
 def _passes_quality(item: Dict[str, Any], min_price: float, max_price: float, min_chg: float, max_chg: float, min_strength: float, max_strength: float) -> bool:
     px = _parse_price(item)
-    if min_price > 0 and px > 0 and px <= min_price:
+    if min_price > 0 and px > 0 and px < min_price:
         return False
     if max_price > 0 and px > max_price:
         return False
@@ -524,8 +524,7 @@ def _supplement_from_volume_rank(
         spread_score_pct = _pct(sp_is, 1.0 / max(spread_pct, 0.001))
 
         # 추천식 반영:
-        # Score = 0.40*rank_pct(ROC) + 0.30*rank_pct(LiquiditySpread) + 0.30*rank_pct(Vol_Breakout)
-        liquidity_spread_score = (0.5 * tv_pct) + (0.5 * spread_score_pct)
+        # Score = 0.55*rank_pct(ROC) + 0.30*rank_pct(TV) + 0.15*rank_pct(SpreadScore)
         vol_breakout_pct = tv_pct  # 120일 퍼센타일 대체로 당일 cross-section 퍼센타일 사용
 
         if vol_breakout_pct < min_vol_pct:
@@ -533,7 +532,7 @@ def _supplement_from_volume_rank(
         if spread_pct > max_spread_pct:
             continue
 
-        score = (0.40 * roc_pct) + (0.30 * liquidity_spread_score) + (0.30 * vol_breakout_pct)
+        score = (0.55 * roc_pct) + (0.30 * tv_pct) + (0.15 * spread_score_pct)
         scored.append((score, sym))
 
     scored.sort(reverse=True)
@@ -547,7 +546,7 @@ def _supplement_from_volume_rank(
             break
     meta.append(
         f"volume_rank fill={len(out)}/{need_n} pool={len(rows)} "
-        f"formula=0.40*roc_pct+0.30*liqspr_pct+0.30*vol_pct vol>={min_vol_pct:.2f} spread<={max_spread_pct:.2f}"
+        f"formula=0.55*roc_pct+0.30*tv_pct+0.15*spread_score_pct vol>={min_vol_pct:.2f} spread<={max_spread_pct:.2f}"
     )
     return out
 
@@ -593,7 +592,7 @@ def _supplement_from_strength(
         px = _parse_price(it)
         strength = _parse_strength(it)
 
-        if min_price > 0 and px > 0 and px <= min_price:
+        if min_price > 0 and px > 0 and px < min_price:
             continue
         if max_price > 0 and px > max_price:
             continue
@@ -666,7 +665,7 @@ def _supplement_from_conditions(
         tv = _parse_float(it, "acml_tr_pbmn", 0.0)
         px = _parse_price(it)
 
-        if min_price > 0 and px > 0 and px <= min_price:
+        if min_price > 0 and px > 0 and px < min_price:
             continue
         if r >= block_rise:
             continue
@@ -740,7 +739,7 @@ def check_watchlist_integrity(symbols: List[str]) -> Dict[str, int]:
                     quote_miss += 1
                     continue
                 px = _parse_price(it)
-                if min_price > 0 and px > 0 and px <= min_price:
+                if min_price > 0 and px > 0 and px < min_price:
                     low_price += 1
         except Exception:
             quote_miss = len(valid_syms)
@@ -799,8 +798,9 @@ def build_watchlist() -> List[str]:
         if sym not in raw_by_sym:
             raw_by_sym[sym] = it
         elif source in ("condition", "strength"):
-            # condition/strength row는 quote 필드가 더 풍부한 경우가 많아 우선 반영
-            raw_by_sym[sym] = it
+            # condition은 항상 덮어씀. strength는 condition이 없을 때만.
+            if source == "condition" or "condition" not in source_seen[sym]:
+                raw_by_sym[sym] = it
 
         if "condition" in source_seen[sym]:
             src_map[sym] = "condition"
