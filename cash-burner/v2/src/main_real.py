@@ -67,30 +67,19 @@ def _stabilize_watchlist(prev: List[str], new: List[str]) -> List[str]:
         return prev
 
     keep_n = int(os.getenv("WATCH_KEEP_TOP_N", "20"))
-    max_replace = int(os.getenv("WATCH_MAX_REPLACE", "10"))
     want_n = int(os.getenv("WATCH_TOP_N", str(len(new))))
 
     prev_cut = [s for s in prev[:want_n]]
     new_cut = [s for s in new[:want_n]]
 
-    fixed = [s for s in prev_cut[:keep_n] if s in new_cut]
+    new_top = set(new_cut[:keep_n])
+    fixed = [s for s in prev_cut if s in new_top]
     result = list(fixed)
-
-    for s in prev_cut[keep_n:]:
-        if s in result:
-            continue
-        result.append(s)
-
-    add_pool = [s for s in new_cut if s not in result]
-    replace_n = min(max_replace, len(add_pool))
-
-    if replace_n > 0:
-        removable_idx = [i for i in range(len(result) - 1, keep_n - 1, -1)
-                         if i < len(result)]
-        for i in removable_idx[:replace_n]:
-            if not add_pool:
-                break
-            result[i] = add_pool.pop(0)
+    for s in new_cut:
+        if s not in result:
+            result.append(s)
+        if len(result) >= want_n:
+            break
     # deduplicate while preserving order
     seen = set()
     deduped = []
@@ -170,7 +159,7 @@ def main():
     threading.Thread(target=scanner_loop, daemon=True).start()
     cap = WSCapture()
     threading.Thread(target=cap.start, daemon=True).start()
-    run_live(IN_FILE, poll=LIVE_POLL_SEC)
+    run_live(IN_FILE, poll=LIVE_POLL_SEC, cap=cap)
 
 if __name__ == "__main__":
     main()

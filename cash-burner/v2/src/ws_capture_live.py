@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os, json, time, threading, csv, queue, re
+from collections import deque
 from dataclasses import dataclass
 import requests, websocket
 from kis_http import request
@@ -19,10 +20,10 @@ def _dated_out_file() -> str:
     return raw
 
 
-OUT_FILE = _dated_out_file()
 CONTROL_FILE = os.getenv("CONTROL_FILE", os.path.join("data", "ws_control.log"))
 WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
 LEDGER_FILE = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
+RADAR_INJECT_FILE = os.getenv("WATCH_RADAR_INJECT_FILE", os.path.join("data", "radar_inject.txt"))
 PREOPEN_TRACK_MIN = int(os.getenv("PREOPEN_TRACK_MIN", "15"))
 PREOPEN_START_HHMM = int(os.getenv("PREOPEN_START_HHMM", "900"))
 
@@ -37,6 +38,7 @@ MAX_ACTIVE_SUB_KEYS = int(os.getenv("WS_MAX_ACTIVE_SUB_KEYS", "50"))
 WATCH_REMOVE_DELAY_SEC = float(os.getenv("WATCH_REMOVE_DELAY_SEC", "0"))
 LEADER_RADAR_ENABLE = os.getenv("LEADER_RADAR_ENABLE", "0") == "1"
 LEADER_RADAR_RET3S_PCT = float(os.getenv("LEADER_RADAR_RET3S_PCT", "1.0"))
+LEADER_RADAR_RET3S_SEC = float(os.getenv("LEADER_RADAR_RET3S_SEC", "3.0"))
 LEADER_RADAR_MAX_SUBS = max(0, int(os.getenv("LEADER_RADAR_MAX_SUBS", "5")))
 LEADER_RADAR_HOLD_SEC = float(os.getenv("LEADER_RADAR_HOLD_SEC", "120"))
 
@@ -172,7 +174,7 @@ class WSCapture:
         self.last_held_symbols: set[str] = set()
         self.watch_remove_after: dict[str, float] = {}
         self.leader_radar_active_until: dict[str, float] = {}
-        self.leader_radar_price_hist: dict[str, list[tuple[float, float]]] = {}
+        self.leader_radar_price_hist: dict[str, deque] = {}
 
     def _in_preopen_window(self, ts_epoch: float | None = None) -> bool:
         hhmm = _hhmm_now(ts_epoch)
@@ -222,39 +224,34 @@ class WSCapture:
         base_desired = kept_watch | held
         radar_syms = self._leader_radar_symbols(now, excluded=base_desired)
         if radar_syms:
-            _append(CONTROL_FILE, f"{_ts()}\tLEADER_RADAR add={len(radar_syms)} thr={LEADER_RADAR_RET3S_PCT:.2f}%")
-            # watchlist에도 반영 — 엔진이 score_eval을 실행하려면 watchlist.txt에 있어야 함
-            try:
-                wl_path = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
-                existing: set[str] = set()
-                try:
-                    with open(wl_path, "r", encoding="utf-8") as f:
-                        existing = {ln.strip() for ln in f if ln.strip()}
-                except Exception:
-                    pass
-                new_syms = radar_syms - existing
-                if new_syms:
-                    with open(wl_path, "a", encoding="utf-8") as f:
-                        for s in sorted(new_syms):
-                            f.write(s + "\n")
-                    _append(CONTROL_FILE, f"{_ts()}\tLEADER_RADAR watchlist_inject n={len(new_syms)}")
-            except Exception as e:
-                _append(CONTROL_FILE, f"{_ts()}\tLEADER_RADAR watchlist_inject_err {e}")
+            _append(CONTROL_FILE, f"{_ts()}	LEADER_RADAR add={len(radar_syms)} thr={LEADER_RADAR_RET3S_PCT:.2f}%")
+        try:
+            _ensure_dir(RADAR_INJECT_FILE)
+            tmp_path = RADAR_INJECT_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                for s in sorted(radar_syms):
+                    f.write(s + "\n")
+            os.replace(tmp_path, RADAR_INJECT_FILE)
+            if radar_syms:
+                _append(CONTROL_FILE, f"{_ts()}	LEADER_RADAR inject_file n={len(radar_syms)}")
+        except Exception as e:
+            _append(CONTROL_FILE, f"{_ts()}	LEADER_RADAR inject_file_err {e}")
         return base_desired | radar_syms
 
     def feed_leader_price(self, sym: str, price: float, ts: float):
         """WS 체결 틱에서 직접 호출. REST 폴링 불필요."""
         if not LEADER_RADAR_ENABLE:
             return
-        h = self.leader_radar_price_hist.setdefault(sym, [])
+        h = self.leader_radar_price_hist.setdefault(sym, deque())
         h.append((ts, price))
-        cutoff = ts - 4.0
+        keep_sec = max(4.0, LEADER_RADAR_RET3S_SEC + 2.0)
+        cutoff = ts - keep_sec
         while h and h[0][0] < cutoff:
-            h.pop(0)
+            h.popleft()
         if not h:
             self.leader_radar_price_hist.pop(sym, None)
             return
-        base = next((p for t, p in h if (ts - t) >= 3.0), None)
+        base = next((p for t, p in h if (ts - t) >= LEADER_RADAR_RET3S_SEC), None)
         if base and base > 0:
             ret3 = (price / base - 1.0) * 100.0
             if ret3 >= LEADER_RADAR_RET3S_PCT:
@@ -277,11 +274,11 @@ class WSCapture:
             if sym not in keep_syms:
                 self.leader_radar_active_until.pop(sym, None)
 
-        return keep_syms
+        return keep_syms - excluded
 
     def start(self):
-        _ensure_dir(OUT_FILE)
-        _append(OUT_FILE, f"# ---- session start {_ts()} mode=real tr_ids={TR_IDS} ----")
+        _ensure_dir(_dated_out_file())
+        _append(_dated_out_file(), f"# ---- session start {_ts()} mode=real tr_ids={TR_IDS} ----")
         _append(CONTROL_FILE, f"{_ts()}\tBOOT watchlist_file={WATCHLIST_FILE}")
         if DROPPED_TR_IDS:
             _append(CONTROL_FILE, f"{_ts()}\tTR_ID_DROP unsupported={','.join(DROPPED_TR_IDS)}")
@@ -336,7 +333,7 @@ class WSCapture:
                 _append(CONTROL_FILE, f"{_ts()}\t{s[:2000]}")
                 return
             if s.startswith("0|") or s.startswith("1|"):
-                _append(OUT_FILE, f"{_ts()}\t{s}")
+                _append(_dated_out_file(), f"{_ts()}\t{s}")
 
         def on_error(ws, err):
             _append(CONTROL_FILE, f"{_ts()}\tERR {err}")
@@ -422,6 +419,9 @@ class WSCapture:
         ok, reason = self._validate_sub_request(tr_id, sym, tr_type)
         if not ok:
             _append(CONTROL_FILE, f"{_ts()}	SUB_DROP {reason}")
+            return False
+        if not self.approval_key:
+            _append(CONTROL_FILE, f"{_ts()}	SUB_DROP approval_key_none")
             return False
         try:
             payload = build_msg(self.approval_key, tr_id, sym, tr_type)

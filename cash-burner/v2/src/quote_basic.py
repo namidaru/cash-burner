@@ -30,14 +30,22 @@ def extract_prev_close(j: Dict[str,Any]) -> float:
 def load_cache() -> Dict[str,float]:
     try:
         with open(CACHE_PATH,"r",encoding="utf-8") as f:
-            return json.load(f)
+            raw = json.load(f)
+        today = time.strftime("%Y%m%d")
+        out: Dict[str, float] = {}
+        for sym, v in raw.items():
+            if isinstance(v, dict) and v.get("date") == today:
+                out[sym] = float(v.get("price", 0))
+        return out
     except Exception:
         return {}
 
 def save_cache(cache: Dict[str,float]):
     _ensure_dir(CACHE_PATH)
+    today = time.strftime("%Y%m%d")
+    payload = {sym: {"price": price, "date": today} for sym, price in cache.items() if price > 0}
     with open(CACHE_PATH,"w",encoding="utf-8") as f:
-        json.dump(cache,f,ensure_ascii=False)
+        json.dump(payload,f,ensure_ascii=False)
 
 def ensure_prev_close(symbols):
     cache = load_cache()
