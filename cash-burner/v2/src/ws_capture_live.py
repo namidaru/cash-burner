@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import os, json, time, threading, csv, queue, re
-from collections import deque
+import os, json, time, threading, queue, re
 from dataclasses import dataclass
 import requests, websocket
 from kis_http import request
@@ -22,25 +21,20 @@ def _dated_out_file() -> str:
 
 CONTROL_FILE = os.getenv("CONTROL_FILE", os.path.join("data", "ws_control.log"))
 WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", os.path.join("data", "watchlist.txt"))
-LEDGER_FILE = os.getenv("LEDGER_FILE", os.path.join("data", "ledger_real.csv"))
-RADAR_INJECT_FILE = os.getenv("WATCH_RADAR_INJECT_FILE", os.path.join("data", "radar_inject.txt"))
 PREOPEN_TRACK_MIN = int(os.getenv("PREOPEN_TRACK_MIN", "15"))
 PREOPEN_START_HHMM = int(os.getenv("PREOPEN_START_HHMM", "900"))
 
 RAW_TR_IDS = [t.strip() for t in os.getenv("TR_IDS", "H0STCNT0,H0STASP0").split(",") if t.strip()]
-ALLOWED_TR_IDS = {"H0STCNT0", "H0STASP0", "H0NXCNT0"}
+ALLOWED_TR_IDS = {"H0STCNT0", "H0STASP0", "H0NXCNT0", "H0STANC0"}
 ALLOWED_TR_TYPES = {"1", "2"}
 PRIORITY_TRADE_TR_IDS = ("H0STCNT0", "H0NXCNT0")
+# H0STANC0 동시호가 구독 시작 시각 (0=비활성화, 850=8:50부터)
+H0STANC0_START_HHMM = int(os.getenv("H0STANC0_START_HHMM", "0"))
 POLL_WATCH_SEC = float(os.getenv("WATCH_POLL_SEC", "2.0"))
 MAX_SUB_BACKOFF_SEC = float(os.getenv("WS_SUB_BACKOFF_MAX_SEC", "60"))
 BASE_SUB_BACKOFF_SEC = float(os.getenv("WS_SUB_BACKOFF_BASE_SEC", "2"))
 MAX_ACTIVE_SUB_KEYS = int(os.getenv("WS_MAX_ACTIVE_SUB_KEYS", "50"))
 WATCH_REMOVE_DELAY_SEC = float(os.getenv("WATCH_REMOVE_DELAY_SEC", "0"))
-LEADER_RADAR_ENABLE = os.getenv("LEADER_RADAR_ENABLE", "0") == "1"
-LEADER_RADAR_RET3S_PCT = float(os.getenv("LEADER_RADAR_RET3S_PCT", "1.0"))
-LEADER_RADAR_RET3S_SEC = float(os.getenv("LEADER_RADAR_RET3S_SEC", "3.0"))
-LEADER_RADAR_MAX_SUBS = max(0, int(os.getenv("LEADER_RADAR_MAX_SUBS", "5")))
-LEADER_RADAR_HOLD_SEC = float(os.getenv("LEADER_RADAR_HOLD_SEC", "120"))
 
 
 def _normalized_tr_ids(raw_ids: list[str]) -> tuple[list[str], list[str]]:
@@ -112,33 +106,6 @@ def _hhmm_now(ts_epoch: float | None = None) -> int:
     return int(time.strftime("%H%M", time.localtime(ts_epoch)))
 
 
-def _held_symbols_from_ledger() -> set[str]:
-    qty_by_symbol: dict[str, int] = {}
-    try:
-        with open(LEDGER_FILE, "r", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                if len(row) < 4:
-                    continue
-                action = str(row[1]).strip().upper()
-                symbol = str(row[2]).strip()
-                if not symbol:
-                    continue
-                try:
-                    qty = int(float(row[3]))
-                except Exception:
-                    continue
-                if qty <= 0:
-                    continue
-                prev = qty_by_symbol.get(symbol, 0)
-                if action == "BUY":
-                    qty_by_symbol[symbol] = prev + qty
-                elif action == "SELL":
-                    qty_by_symbol[symbol] = max(0, prev - qty)
-    except Exception:
-        return set()
-    return {sym for sym, qty in qty_by_symbol.items() if qty > 0}
-
 
 @dataclass(frozen=True)
 class OutgoingWSMessage:
@@ -153,7 +120,8 @@ class OutgoingWSMessage:
 
 
 class WSCapture:
-    def __init__(self):
+    def __init__(self, engine=None):
+        self.engine = engine  # engine._preopen_whitelist_done 확인용
         self.approval_key = None
         self.ws = None
         self.ws_thread = None
@@ -173,8 +141,6 @@ class WSCapture:
         self.preopen_snapshot: set[str] = set()
         self.last_held_symbols: set[str] = set()
         self.watch_remove_after: dict[str, float] = {}
-        self.leader_radar_active_until: dict[str, float] = {}
-        self.leader_radar_price_hist: dict[str, deque] = {}
 
     def _in_preopen_window(self, ts_epoch: float | None = None) -> bool:
         hhmm = _hhmm_now(ts_epoch)
@@ -216,65 +182,18 @@ class WSCapture:
         else:
             self.watch_remove_after.clear()
 
-        held = _held_symbols_from_ledger()
+        # 보유종목: engine.pos에서 실제 포지션만 (ledger 잔재 방지)
+        held: set[str] = set()
+        if self.engine:
+            try:
+                held = set(self.engine.pos.keys())
+            except Exception:
+                pass
         if held != self.last_held_symbols:
-            _append(CONTROL_FILE, f"{_ts()}	HELD merge n={len(held)}")
+            _append(CONTROL_FILE, f"{_ts()}\tHELD merge n={len(held)}")
             self.last_held_symbols = set(held)
 
-        base_desired = kept_watch | held
-        radar_syms = self._leader_radar_symbols(now, excluded=base_desired)
-        if radar_syms:
-            _append(CONTROL_FILE, f"{_ts()}	LEADER_RADAR add={len(radar_syms)} thr={LEADER_RADAR_RET3S_PCT:.2f}%")
-        try:
-            _ensure_dir(RADAR_INJECT_FILE)
-            tmp_path = RADAR_INJECT_FILE + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                for s in sorted(radar_syms):
-                    f.write(s + "\n")
-            os.replace(tmp_path, RADAR_INJECT_FILE)
-            if radar_syms:
-                _append(CONTROL_FILE, f"{_ts()}	LEADER_RADAR inject_file n={len(radar_syms)}")
-        except Exception as e:
-            _append(CONTROL_FILE, f"{_ts()}	LEADER_RADAR inject_file_err {e}")
-        return base_desired | radar_syms
-
-    def feed_leader_price(self, sym: str, price: float, ts: float):
-        """WS 체결 틱에서 직접 호출. REST 폴링 불필요."""
-        if not LEADER_RADAR_ENABLE:
-            return
-        h = self.leader_radar_price_hist.setdefault(sym, deque())
-        h.append((ts, price))
-        keep_sec = max(4.0, LEADER_RADAR_RET3S_SEC + 2.0)
-        cutoff = ts - keep_sec
-        while h and h[0][0] < cutoff:
-            h.popleft()
-        if not h:
-            self.leader_radar_price_hist.pop(sym, None)
-            return
-        base = next((p for t, p in h if (ts - t) >= LEADER_RADAR_RET3S_SEC), None)
-        if base and base > 0:
-            ret3 = (price / base - 1.0) * 100.0
-            if ret3 >= LEADER_RADAR_RET3S_PCT:
-                self.leader_radar_active_until[sym] = ts + LEADER_RADAR_HOLD_SEC
-
-    def _leader_radar_symbols(self, now: float, excluded: set[str]) -> set[str]:
-        if (not LEADER_RADAR_ENABLE) or LEADER_RADAR_MAX_SUBS <= 0:
-            self.leader_radar_active_until.clear()
-            return set()
-
-        # expire
-        expired = [sym for sym, until in self.leader_radar_active_until.items() if until <= now]
-        for sym in expired:
-            self.leader_radar_active_until.pop(sym, None)
-
-        # enforce max slots by remaining ttl
-        ranked = sorted(self.leader_radar_active_until.items(), key=lambda kv: kv[1], reverse=True)
-        keep_syms = {sym for sym, _ in ranked[:LEADER_RADAR_MAX_SUBS]}
-        for sym in list(self.leader_radar_active_until.keys()):
-            if sym not in keep_syms:
-                self.leader_radar_active_until.pop(sym, None)
-
-        return keep_syms - excluded
+        return kept_watch | held
 
     def start(self):
         out_file = _dated_out_file()
@@ -309,23 +228,20 @@ class WSCapture:
             self.ws_send_thread.start()
 
         def on_open(ws):
+            self._last_connect_ts = time.time()
             _append(CONTROL_FILE, f"{_ts()}\tOPEN {WS_URL}")
             self._sync_subscriptions(ws, self._desired_symbols(), force=True)
 
         def on_message(ws, message):
             s = message if isinstance(message, str) else message.decode("utf-8", "ignore")
             if s == "PINGPONG":
-                try:
-                    self._enqueue_ws_raw("PINGPONG")
-                except Exception:
-                    pass
+                _append(CONTROL_FILE, f"{_ts()}\tPING_ACK text")
                 return
             if s.startswith("{"):
                 j = {}
                 try:
                     j = json.loads(s)
                     if str(j.get("header", {}).get("tr_id", "")).upper() == "PINGPONG":
-                        self._enqueue_ws_raw("PINGPONG")
                         _append(CONTROL_FILE, f"{_ts()}\tPING_ACK json")
                         return
                 except Exception:
@@ -352,7 +268,7 @@ class WSCapture:
                 on_error=on_error,
                 on_close=on_close,
             )
-            self.ws_thread = threading.Thread(target=lambda: self.ws.run_forever(ping_interval=30, ping_timeout=10), daemon=True)
+            self.ws_thread = threading.Thread(target=lambda: self.ws.run_forever(), daemon=True)
             self.ws_thread.start()
 
         _spawn_ws()
@@ -372,12 +288,22 @@ class WSCapture:
                 self.sub_blocked_retry_exp.clear()
                 self.last_sync_desired_symbols = set()
                 self.last_sync_desired_keys = set()
-                _append(CONTROL_FILE, f"{_ts()}\tRECONNECT start")
+                _reconnect_attempt = getattr(self, '_reconnect_attempt', 0) + 1
+                self._reconnect_attempt = _reconnect_attempt
+                # Reset attempt count only if last connection survived > 60s
+                _last_connect_ts = getattr(self, '_last_connect_ts', 0.0)
+                if _last_connect_ts and (time.time() - _last_connect_ts) > 60:
+                    _reconnect_attempt = 1
+                    self._reconnect_attempt = 1
+                _backoff = min(30.0, 2.0 * _reconnect_attempt)
+                _append(CONTROL_FILE, f"{_ts()}\tRECONNECT start attempt={_reconnect_attempt} backoff={_backoff:.0f}s")
+                time.sleep(_backoff)
                 try:
                     self.approval_key = get_approval_key()
                 except Exception as e:
-                    _append(CONTROL_FILE, f"{_ts()}\tRECONNECT approval_err {type(e).__name__}: {e}")
+                    _append(CONTROL_FILE, f"{_ts()}\tRECONNECT approval_err attempt={_reconnect_attempt} {type(e).__name__}: {e}")
                     continue
+                self._last_connect_ts = time.time()
                 _spawn_ws()
 
     def _sub_key(self, sym: str, tr_id: str) -> tuple[str, str]:
@@ -389,16 +315,33 @@ class WSCapture:
         held_syms = sorted(desired_symbols & self.last_held_symbols)
         other_syms = sorted(desired_symbols - self.last_held_symbols)
         ordered_syms = held_syms + other_syms
+
+        # 8:50~9:00 preopen: H0STANC0만 → 종목당 1슬롯 → 최대 50종목 (watch 45 + pos 5)
+        # 9:00~ 장중: H0STCNT0+H0STASP0 → 종목당 2슬롯 → 최대 25종목 (whitelist 5 + pos 5 + 여유)
+        # keys[:50]으로 자르므로 held_syms 우선 보호됨.
+        asp0_syms = ordered_syms
+
+        # 8:50~9:00: H0STANC0 (동시호가). whitelist 확정되면 즉시 H0STCNT0으로 전환.
+        _hhmm = _hhmm_now()
+        _whitelist_done = (self.engine and getattr(self.engine, '_preopen_whitelist_done', False))
+        _stanc0_active = (H0STANC0_START_HHMM > 0 and H0STANC0_START_HHMM <= _hhmm < 900
+                          and not _whitelist_done)
+
         keys: list[tuple[str, str]] = []
-        for trade_tr in PRIORITY_TRADE_TR_IDS:
-            if trade_tr in TR_IDS:
-                for sym in ordered_syms:
-                    keys.append((sym, trade_tr))
-        for tr in TR_IDS:
-            if tr in PRIORITY_TRADE_TR_IDS:
-                continue
+        if _stanc0_active:
             for sym in ordered_syms:
-                keys.append((sym, tr))
+                keys.append((sym, "H0STANC0"))
+        else:
+            for trade_tr in PRIORITY_TRADE_TR_IDS:
+                if trade_tr in TR_IDS:
+                    for sym in ordered_syms:
+                        keys.append((sym, trade_tr))
+            for tr in TR_IDS:
+                if tr in PRIORITY_TRADE_TR_IDS:
+                    continue
+                syms_for_tr = asp0_syms if tr == "H0STASP0" else ordered_syms
+                for sym in syms_for_tr:
+                    keys.append((sym, tr))
         return keys[:max(0, MAX_ACTIVE_SUB_KEYS)]
 
     def _enqueue_ws_raw(self, payload: str):

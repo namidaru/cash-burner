@@ -55,12 +55,20 @@ def _get_first(it: Dict[str, Any], keys: List[str], default: float = 0.0) -> flo
     for k in keys:
         if k in it and it[k] not in (None, "", " "):
             try:
-                return float(str(it[k]).replace(",", ""))
+                v = float(str(it[k]).replace(",", ""))
+                if math.isfinite(v):
+                    return v
             except Exception:
                 pass
     return default
 
 def multi_quote(symbols: List[str]) -> List[Dict[str, Any]]:
+    # BUG-028: 무한 증가 방지
+    MAX_SYMBOL_MARKET = 500
+    if len(_SYMBOL_MARKET) > MAX_SYMBOL_MARKET:
+        trim_keys = list(_SYMBOL_MARKET.keys())[:len(_SYMBOL_MARKET) // 2]
+        for k in trim_keys:
+            _SYMBOL_MARKET.pop(k, None)
     out = []
     for batch in chunk(symbols, 30):
         merged: Dict[str, Dict[str, Any]] = {}
@@ -121,67 +129,77 @@ def multi_quote(symbols: List[str]) -> List[Dict[str, Any]]:
 
 
 def volume_acceleration(it: Dict[str, Any]) -> float:
-    """거래대금 가속도 proxy (당일 거래대금 / 전일 거래대금, 없으면 거래량 비율)."""
+    """전일 동시간대 대비 거래량 배율.
+
+    우선순위:
+    1. PRDY_VOL_VRSS_ACML_VOL_RATE — KIS WS/REST 공통 필드 (전일동시간대비 누적거래량)
+    2. 당일 거래대금 / 전일 거래대금
+    3. 당일 거래량 / 전일 거래량
+    """
+    # 1순위: KIS 직접 제공 pvol_rate 필드
+    pvol_rate = _get_first(it, [
+        "prdy_vol_vrss_acml_vol_rate", "PRDY_VOL_VRSS_ACML_VOL_RATE",
+    ], -1.0)
+    if pvol_rate >= 0.0:
+        return pvol_rate
+
+    # 2순위: 거래대금 비율
     tr_value = _get_first(it, [
         "acml_tr_pbmn", "ACML_TR_PBMN", "stck_acml_tr_pbmn", "STCK_ACML_TR_PBMN"
     ], 0.0)
+    prdy_tr_value = _get_first(it, [
+        "prdy_tr_pbmn", "PRDY_TR_PBMN", "prdy_acml_tr_pbmn", "PRDY_ACML_TR_PBMN"
+    ], 0.0)
+    if prdy_tr_value > 0 and tr_value > 0:
+        return tr_value / prdy_tr_value
+
+    # 3순위: 거래량 비율
     prev_vol = _get_first(it, [
         "prdy_vol", "PRDY_VOL", "prev_vol", "PRDY_ACML_VOL"
     ], 0.0)
     if prev_vol <= 0:
         return 0.0
-    prdy_tr_value = _get_first(it, [
-        "prdy_tr_pbmn", "PRDY_TR_PBMN", "prdy_acml_tr_pbmn", "PRDY_ACML_TR_PBMN"
-    ], 0.0)
-    if prdy_tr_value <= 0:
-        today_vol = _get_first(it, ["acml_vol", "ACML_VOL", "stck_acml_vol"], 0.0)
-        return today_vol / prev_vol
-    return tr_value / prdy_tr_value
+    today_vol = _get_first(it, ["acml_vol", "ACML_VOL", "stck_acml_vol"], 0.0)
+    return today_vol / prev_vol
 
 def score_item(it: Dict[str, Any]) -> float:
     """
-    실전 수익형 워치리스트 점수:
-    - 급등 초입은 감점 위주, 끝물 과열만 하드 제외
-    - 거래대금(유동성) + 등락률(모멘텀) + 거래량을 섞어서 점수화
-    - 거래대금이 너무 작으면 제외
+    워치리스트 점수 (급등 초입 포착 최적화).
 
-    NOTE: 응답 키는 계정/버전마다 약간 다를 수 있어서 best-effort로 여러 키 후보를 탐색함.
+    핵심 변경:
+    - accel: log → sqrt + 10배 초과 선형보너스 (폭발 신호 차별화)
+      pvol=7x→21pt, pvol=15x→31pt, pvol=25x→62pt (기존은 13/17/20pt로 거의 차이없음)
+    - 거래대금 hard filter 제거 → 장초반 소액도 score로만 판단
+    - early_stage_bonus: r < 0.5% 구간도 커버 (아직 안 오른 종목 포함)
+    - liquidity: 절대값 기준 대신 log 스케일 (장초반 불이익 없음)
     """
 
-    # 1) 등락률(전일대비율) - 가장 중요 모멘텀
+    # 1) 등락률
     r = _get_first(it, [
         "prdy_ctrt", "PRDY_CTRT", "prdy_ctrt_rate", "prdy_ctrt_pct",
         "stck_prdy_ctrt", "STCK_PRDY_CTRT"
     ], 0.0)
 
-    # 워치리스트는 초반 급등 포착이 목적이므로 soft/hard 이원화
-    # - hard: 정말 과열 구간은 제외
-    # - soft: 초반 급등은 감점만 적용
-    if r >= max(ENTRY_BLOCK_DAYRISE_PCT + 3.0, WATCH_HARD_HEAT_PCT):
+    if r >= WATCH_HARD_HEAT_PCT:
         return float("-inf")
     heat_penalty = 0.0
     if r > WATCH_SOFT_HEAT_PCT:
         heat_penalty = min(4.0, (r - WATCH_SOFT_HEAT_PCT) * 0.9)
 
-    # 2) 거래대금/거래량 (유동성)
+    # 2) 거래량 최소 필터만 (거래대금 hard filter 제거)
+    vol = _get_first(it, [
+        "acml_vol", "ACML_VOL", "stck_acml_vol", "STCK_ACML_VOL",
+        "vol", "VOL"
+    ], 0.0)
+    if vol < MIN_VOLUME:
+        return float("-inf")
+
     tr_value = _get_first(it, [
         "acml_tr_pbmn", "ACML_TR_PBMN", "stck_acml_tr_pbmn", "STCK_ACML_TR_PBMN",
         "tr_pbmn", "TR_PBMN"
     ], 0.0)
 
-    vol = _get_first(it, [
-        "acml_vol", "ACML_VOL", "stck_acml_vol", "STCK_ACML_VOL",
-        "vol", "VOL"
-    ], 0.0)
-
-    # 체결량 하한 필터(너무 얇은 종목 제거)
-    if vol > 0 and vol < MIN_VOLUME:
-        return float("-inf")
-
-    # 유동성 하한 필터(거래대금 너무 적은 후보는 워치리스트에서 제외)
-    if tr_value > 0 and tr_value < MIN_TRADE_VALUE:
-        return float("-inf")
-
+    # 3) 체결강도
     strength = _get_first(it, [
         "cttr", "cntrg", "tday_rltv", "exec_str", "trade_strength", "power"
     ], 0.0)
@@ -191,38 +209,47 @@ def score_item(it: Dict[str, Any]) -> float:
         if sell_cnt > 0:
             strength = (buy_cnt / sell_cnt) * 100.0
 
-    # 3) 스프레드/호가 품질(있으면만 사용)
+    # 4) 스프레드 패널티
     ask1 = _get_first(it, ["askp1", "ASKP1", "ask1", "ASK1"], 0.0)
     bid1 = _get_first(it, ["bidp1", "BIDP1", "bid1", "BID1"], 0.0)
     spread_penalty = 0.0
     if ask1 > 0 and bid1 > 0 and ask1 >= bid1:
         mid = (ask1 + bid1) / 2.0
         spr_pct = ((ask1 - bid1) / mid) * 100.0 if mid > 0 else 999.0
-        # PROMPT 5: 임계치 0.30→0.20%, 감점 강화 최대 4점
         if spr_pct > 0.20:
             spread_penalty = min(4.0, (spr_pct - 0.20) * 3.0)
 
-    # 4) 점수 조합
-    # PROMPT 5-1: 거래량 가속도 log 스케일 (폭발적 가속 포착)
+    # 5) 가속도 점수 — sqrt 스케일 + 10배 초과 선형 보너스
+    # pvol= 7x: sqrt(7)*8            = 21.2pt
+    # pvol=15x: sqrt(15)*8           = 31.0pt
+    # pvol=25x: sqrt(25)*8 + (25-10)*1.5 = 62.5pt
     accel_raw = volume_acceleration(it)
-    accel_score = math.log1p(max(0.0, accel_raw)) * 6.0
+    accel_base = math.sqrt(max(0.0, accel_raw)) * 8.0
+    accel_bonus = max(0.0, accel_raw - 10.0) * 1.5
+    accel_score = accel_base + accel_bonus
 
-    # PROMPT 5-2: 체결강도 — 등락률 높으면 신뢰도 낮으므로 가중치 축소
+    # 6) 체결강도 — 등락률 높으면 신뢰도 낮아 가중치 축소
     strength_score = max(0.0, (strength - 100.0) / 20.0)
     if r > 2.0:
         strength_score *= 0.7
 
-    # PROMPT 5-3: 유동성 상대화 (MIN_TRADE_VALUE 대비 비율)
-    rel_liquidity = tr_value / max(1.0, MIN_TRADE_VALUE)
-    liquidity_score = math.log1p(rel_liquidity) * 1.5
+    # 7) 유동성 — 1억 단위 log (장초반 소액 불이익 없음)
+    liquidity_score = math.log1p(tr_value / 1e8) * 1.5
+
+    # 8) 초기 단계 보너스 — r < 0.5%도 포함 (아직 안 오른 종목 커버)
+    # r=0%→+8, r=1%→+6, r=2%→+4, r=3%→+2, r>3%→0
+    early_stage_bonus = max(0.0, (3.0 - r) * 2.0 + 2.0) if r < 3.0 else 0.0
+    late_stage_penalty = max(0.0, (r - WATCH_SOFT_HEAT_PCT) * 0.5) if r >= WATCH_SOFT_HEAT_PCT else 0.0
 
     score = (
         (max(0.0, r) * 0.7)
         + accel_score
         + (strength_score * WATCH_STRENGTH_WEIGHT)
         + liquidity_score
+        + early_stage_bonus
         - spread_penalty
         - heat_penalty
+        - late_stage_penalty
     )
 
     return score

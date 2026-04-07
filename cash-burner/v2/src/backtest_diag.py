@@ -142,7 +142,8 @@ def match_trades(diag_buys: List[dict], diag_sells: List[dict],
             sell_price = _f(ls.get("price")) or _f(s.get("price"))
             qty = _f(lb.get("qty")) or 1.0
 
-            pnl_pct_diag = _f(s.get("pnl", "").rstrip("%"))
+            raw_pnl = s.get("pnl", "")
+            pnl_pct_diag = _f(raw_pnl.rstrip("%")) if raw_pnl.strip() else None  # BUG-043
             pnl_pct_ledger = ((sell_price / buy_price - 1.0) * 100.0) if buy_price > 0 and sell_price > 0 else None
             hold_sec = _f(s.get("hold", "").rstrip("s"))
             reason = s.get("reason", "unknown")

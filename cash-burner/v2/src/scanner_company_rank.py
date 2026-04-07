@@ -11,14 +11,14 @@ from kis_http import request
 from scanner_conditions import scan as scan_conditions
 from quote_multi import multi_quote, score_item, volume_acceleration
 
-PATH = "/uapi/domestic-stock/v1/ranking/traded-by-company"
-STRENGTH_PATH = "/uapi/domestic-stock/v1/ranking/volume-power"
-VOLUME_RANK_PATH = "/uapi/domestic-stock/v1/quotations/volume-rank"
 DEFAULT_TR_IDS = "FHPST01860000,VHPST01860000"
 DEFAULT_STRENGTH_TR_IDS = "FHPST01710000,VHPST01710000"
 DEFAULT_VOLUME_TR_IDS = "FHPST01710000,VHPST01710000"
 _LAST_BUILD_META: str = ""
 _LAST_SOURCE_MAP: Dict[str, str] = {}
+_LAST_POOL_SYMS: List[str] = []
+_LAST_DROPPED_DETAIL: List[str] = []
+_SNAPSHOT_SAVED_TODAY: str = ""  # 당일 스냅샷 저장 여부 (YYYYMMDD)
 _WATCH_STATUS_FILE = os.getenv("WATCH_STATUS_FILE", os.path.join("data", "watch_status.json"))
 
 
@@ -29,6 +29,52 @@ def _write_watch_status(payload: Dict[str, Any]):
             os.makedirs(d, exist_ok=True)
         with open(_WATCH_STATUS_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _save_selection_snapshot(pool_syms: List[str], selected: List[str],
+                             src_map: Dict[str, str], dropped_detail: List[str],
+                             scored: List[Tuple[float, str]]):
+    """당일 첫 build_watchlist 결과를 스냅샷으로 저장 (하루 1회).
+
+    장 마감 후 daily_compact에서 시가/종가를 붙여 종목선택 검증에 사용.
+    """
+    global _SNAPSHOT_SAVED_TODAY
+    import time as _time
+    today = _time.strftime("%Y%m%d")
+    if _SNAPSHOT_SAVED_TODAY == today:
+        return
+    # 장 시작 전후(08:50~09:15)에만 스냅샷 저장 — 장중 리빌드는 무시
+    hhmm = int(_time.strftime("%H%M"))
+    if not (850 <= hhmm <= 915):
+        return
+    try:
+        snap_dir = os.path.join("data", "logs", today)
+        os.makedirs(snap_dir, exist_ok=True)
+        snap_path = os.path.join(snap_dir, "selection_snapshot.json")
+        # 탈락 사유를 dict로 정리
+        drop_map: Dict[str, str] = {}
+        for line in dropped_detail:
+            parts = line.split(" DROP ", 1)
+            if len(parts) == 2:
+                drop_map[parts[0].strip()] = parts[1].strip()
+        # scored → dict
+        score_map = {sym: round(sc, 3) for sc, sym in scored}
+        payload = {
+            "date": today,
+            "saved_at": _time.strftime("%H:%M:%S"),
+            "pool_count": len(pool_syms),
+            "selected_count": len(selected),
+            "pool_symbols": pool_syms,
+            "selected": selected,
+            "source_map": {sym: src_map.get(sym, "") for sym in pool_syms if sym in src_map},
+            "scores": score_map,
+            "dropped": drop_map,
+        }
+        with open(snap_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        _SNAPSHOT_SAVED_TODAY = today
     except Exception:
         pass
 
@@ -49,7 +95,8 @@ def _operator_summary_watch(selected: int, want_n: int, filtered_total: int, poo
     return "watch_ok monitoring"
 
 
-def _emit_watch_status(pool_size: int, selected: int, want_n: int, dropped: Dict[str, int], scored: List[Tuple[float, str]], quote_count: int):
+def _emit_watch_status(pool_size: int, selected: int, want_n: int, dropped: Dict[str, int], scored: List[Tuple[float, str]], quote_count: int,
+                       pool_syms: List[str] | None = None, dropped_detail: List[str] | None = None):
     top5 = [{"symbol": sym, "score": round(float(sc), 3)} for sc, sym in scored[:5]]
     filtered_total = int(sum(int(v) for v in dropped.values()))
     filter_ratio = (filtered_total / max(1, pool_size)) if pool_size > 0 else 0.0
@@ -69,6 +116,10 @@ def _emit_watch_status(pool_size: int, selected: int, want_n: int, dropped: Dict
         "top5_scores": top5,
         "operator_summary": _operator_summary_watch(selected, want_n, filtered_total, pool_size, scored[:5]),
     }
+    if pool_syms is not None:
+        payload["pool_symbols"] = pool_syms
+    if dropped_detail:
+        payload["dropped_detail"] = dropped_detail
     _write_watch_status(payload)
 
 
@@ -97,6 +148,20 @@ def _in_preopen_window() -> bool:
     return start_min <= now_min < (start_min + track_min)
 
 
+
+_preopen_fetched: bool = False
+
+
+def _should_fetch_preopen() -> bool:
+    global _preopen_fetched
+    hhmm = _time_hhmm()
+    if hhmm < 900:
+        return True
+    if hhmm < 920 and not _preopen_fetched:
+        return True
+    return False
+
+
 def _normalize_rank_rows(j: Dict[str, Any]) -> List[Dict[str, Any]]:
     for k in ("output", "output1", "output2"):
         v = j.get(k)
@@ -115,7 +180,7 @@ def _normalize_rank_rows(j: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def fetch_strength_rank(market: str) -> Tuple[List[Dict[str, Any]], List[str]]:
-    path = os.getenv("STRENGTH_PATH", STRENGTH_PATH).strip() or STRENGTH_PATH
+    path = os.getenv("STRENGTH_PATH", "/uapi/domestic-stock/v1/ranking/volume-power").strip() or "/uapi/domestic-stock/v1/ranking/volume-power"
     tr_ids = [x.strip() for x in os.getenv("STRENGTH_TR_IDS", DEFAULT_STRENGTH_TR_IDS).split(",") if x.strip()]
     scr_codes = [x.strip() for x in os.getenv("STRENGTH_SCR_CODES", os.getenv("RANK_SCR_CODES", "20170")).split(",") if x.strip()]
     limit_n = int(os.getenv("STRENGTH_TOPK", "120"))
@@ -136,7 +201,8 @@ def fetch_strength_rank(market: str) -> Tuple[List[Dict[str, Any]], List[str]]:
                 rows = _normalize_rank_rows(j)
                 if rows:
                     all_rows.extend(rows)
-                    debug_meta.append(f"s-ok m={market} tr={tr_id} scr={scr} rows={len(rows)}")
+                    syms_in = [_parse_sym(r) for r in rows]
+                    debug_meta.append(f"s-ok m={market} tr={tr_id} scr={scr} rows={len(rows)} syms={syms_in}")
                 else:
                     debug_meta.append(f"s-empty m={market} tr={tr_id} scr={scr} rt_cd={j.get('rt_cd','?')} msg1={j.get('msg1','')[:40]}")
             except Exception as e:
@@ -167,11 +233,12 @@ def fetch_volume_rank(market: str) -> Tuple[List[Dict[str, Any]], List[str]]:
             "fid_input_date_1": os.getenv("VOLUME_RANK_DATE1", ""),
         }
         try:
-            j = request("GET", VOLUME_RANK_PATH, tr_id, params=params)
+            j = request("GET", "/uapi/domestic-stock/v1/quotations/volume-rank", tr_id, params=params)
             rows = _normalize_rank_rows(j)
             if rows:
                 all_rows.extend(rows)
-                debug_meta.append(f"v-ok m={market} tr={tr_id} rows={len(rows)}")
+                syms_in = [_parse_sym(r) for r in rows]
+                debug_meta.append(f"v-ok m={market} tr={tr_id} rows={len(rows)} syms={syms_in}")
             else:
                 debug_meta.append(f"v-empty m={market} tr={tr_id} rt_cd={j.get('rt_cd','?')} msg1={j.get('msg1','')[:40]}")
         except Exception as e:
@@ -181,16 +248,114 @@ def fetch_volume_rank(market: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     return all_rows[:limit_n], debug_meta
 
 
-def _fallback_symbols() -> List[str]:
-    raw = os.getenv("WATCH_FALLBACK_SYMBOLS", os.getenv("FALLBACK_SYMBOLS", ""))
-    if not raw:
-        return []
-    out: List[str] = []
-    for tok in raw.split(","):
-        sym = tok.strip()
-        if sym:
-            out.append(sym.zfill(6))
-    return out
+def fetch_fluctuation_rank(market: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    limit_n = int(os.getenv("FLUCTUATION_TOPK", "80"))
+    params = {
+        "fid_cond_mrkt_div_code": market,
+        "fid_cond_scr_div_code": os.getenv("FLUCTUATION_SCR", "20006"),
+        "fid_input_iscd": os.getenv("FLUCTUATION_INPUT_ISCD", "0000"),
+        "fid_rank_sort_cls_code": os.getenv("FLUCTUATION_SORT", "0"),
+        "fid_input_cnt_1": os.getenv("FLUCTUATION_CNT", "0"),
+        "fid_trgt_cls_code": "0",
+        "fid_trgt_exls_cls_code": "0",
+        "fid_input_price_1": "",
+        "fid_input_price_2": "",
+        "fid_vol_cnt": os.getenv("FLUCTUATION_VOL_CNT", "100000"),
+        "fid_prc_cls_code": os.getenv("FLUCTUATION_PRC_CLS_CODE", "0"),
+        "fid_div_cls_code": os.getenv("FLUCTUATION_DIV_CLS_CODE", "0"),
+        "fid_rsfl_rate1": os.getenv("FLUCTUATION_RSFL_RATE1", ""),
+        "fid_rsfl_rate2": os.getenv("FLUCTUATION_RSFL_RATE2", ""),
+    }
+    try:
+        j = request("GET", "/uapi/domestic-stock/v1/ranking/fluctuation", "FHPST01700000", params=params)
+        rows = _normalize_rank_rows(j)
+        return rows[:limit_n], []
+    except Exception as e:
+        return [], [f"fetch_fluctuation_rank fail: {type(e).__name__}: {e}"]
+
+
+def fetch_bulk_trans(market: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    limit_n = int(os.getenv("BULK_TRANS_TOPK", "60"))
+    params = {
+        "fid_cond_mrkt_div_code": market,
+        "fid_cond_scr_div_code": os.getenv("BULK_TRANS_SCR", "20009"),
+        "fid_input_iscd": "0000",
+        "fid_trgt_cls_code": "0",
+        "fid_trgt_exls_cls_code": "0",
+        "fid_input_price_1": "",
+        "fid_input_price_2": "",
+        "fid_vol_cnt": "",
+    }
+    try:
+        j = request("GET", "/uapi/domestic-stock/v1/ranking/bulk-trans-num", "FHKST190900C0", params=params)
+        rows = _normalize_rank_rows(j)
+        return rows[:limit_n], []
+    except Exception as e:
+        return [], [f"fetch_bulk_trans fail: {type(e).__name__}: {e}"]
+
+
+def fetch_preopen_rank() -> Tuple[List[Dict[str, Any]], List[str]]:
+    errs: List[str] = []
+    combined: List[Dict[str, Any]] = []
+    seen_syms: set[str] = set()
+
+    # 3-1. 시간외등락율순위 (API: v1_국내주식-104, FHPST02340000)
+    overtime_limit = int(os.getenv("PREOPEN_OVERTIME_TOPK", "50"))
+    params_ot = {
+        "fid_cond_mrkt_div_code": os.getenv("PREOPEN_MARKET", "J"),
+        "fid_cond_scr_div_code": "20234",
+        "fid_input_iscd": "0000",
+        "fid_mrkt_cls_code": "",           # 필수: 공백
+        "fid_div_cls_code": "2",           # 필수: 2=상승률
+        "fid_input_price_1": "",
+        "fid_input_price_2": "",
+        "fid_vol_cnt": "",
+        "fid_trgt_cls_code": "",           # 필수: 공백
+        "fid_trgt_exls_cls_code": "",      # 필수: 공백
+    }
+    try:
+        j = request("GET", "/uapi/domestic-stock/v1/ranking/overtime-fluctuation", "FHPST02340000", params=params_ot)
+        rt_cd = j.get("rt_cd", "")
+        if rt_cd != "0":
+            errs.append(f"fetch_preopen_rank(overtime) rt_cd={rt_cd} msg={j.get('msg1','')[:60]}")
+        rows = _normalize_rank_rows(j)[:overtime_limit]
+        for it in rows:
+            sym = _parse_sym(it)
+            if sym and sym not in seen_syms:
+                seen_syms.add(sym)
+                combined.append(it)
+    except Exception as e:
+        errs.append(f"fetch_preopen_rank(overtime) fail: {type(e).__name__}: {e}")
+
+    # 3-2. 예상체결 상승상위 (API: v1_국내주식-103, FHPST01820000)
+    exp_limit = int(os.getenv("PREOPEN_EXP_TOPK", "50"))
+    params_exp = {
+        "fid_cond_mrkt_div_code": os.getenv("PREOPEN_MARKET", "J"),
+        "fid_cond_scr_div_code": "20182",
+        "fid_input_iscd": "0000",
+        "fid_rank_sort_cls_code": "0",     # 필수: 0=상승률
+        "fid_div_cls_code": "0",           # 필수: 0=전체
+        "fid_aply_rang_prc_1": "",         # 필수: 공백=전체
+        "fid_vol_cnt": "",
+        "fid_pbmn": "",                    # 필수: 공백=전체 (거래대금, 천원단위)
+        "fid_blng_cls_code": "0",          # 필수: 0=전체
+        "fid_mkop_cls_code": "0",          # 필수: 0=장전예상
+    }
+    try:
+        j = request("GET", "/uapi/domestic-stock/v1/ranking/exp-trans-updown", "FHPST01820000", params=params_exp)
+        rt_cd = j.get("rt_cd", "")
+        if rt_cd != "0":
+            errs.append(f"fetch_preopen_rank(exp_trans) rt_cd={rt_cd} msg={j.get('msg1','')[:60]}")
+        rows = _normalize_rank_rows(j)[:exp_limit]
+        for it in rows:
+            sym = _parse_sym(it)
+            if sym and sym not in seen_syms:
+                seen_syms.add(sym)
+                combined.append(it)
+    except Exception as e:
+        errs.append(f"fetch_preopen_rank(exp_trans) fail: {type(e).__name__}: {e}")
+
+    return combined, errs
 
 
 def _parse_sym(item: Dict[str, Any]) -> str:
@@ -557,6 +722,14 @@ def get_last_source_map() -> Dict[str, str]:
     return dict(_LAST_SOURCE_MAP)
 
 
+def get_last_pool_syms() -> List[str]:
+    return list(_LAST_POOL_SYMS)
+
+
+def get_last_dropped_detail() -> List[str]:
+    return list(_LAST_DROPPED_DETAIL)
+
+
 def check_watchlist_integrity(symbols: List[str]) -> Dict[str, int]:
     """watchlist 기본 무결성 점검.
 
@@ -619,9 +792,6 @@ def check_watchlist_integrity(symbols: List[str]) -> Dict[str, int]:
 
 
 
-def _radar_mode_enabled() -> bool:
-    return os.getenv("WATCH_RADAR_MODE", "0") == "1"
-
 def build_watchlist() -> List[str]:
     """REST 데이터로 1차 선별 후 점수 상위 종목만 워치리스트에 반영.
 
@@ -630,17 +800,20 @@ def build_watchlist() -> List[str]:
     - 필터: 가격/등락/거래대금/스프레드 최소한만 적용
     - 정렬: score_item 기반 + 거래대금 보너스
     """
-    global _LAST_BUILD_META, _LAST_SOURCE_MAP
+    global _LAST_BUILD_META, _LAST_SOURCE_MAP, _LAST_POOL_SYMS, _LAST_DROPPED_DETAIL, _preopen_fetched
 
-    want_n = int(os.getenv("WATCH_TOP_N", "15"))  # 12→15: WS 슬롯 여유 있어 감시 종목 확대
+    want_n = int(os.getenv("WATCH_TOP_N", "45"))  # 8:50 H0STANC0=1슬롯/종목 → 50슬롯 중 45개 사용
     min_price = float(os.getenv("WATCH_MIN_PRICE", "5000"))
-    max_price = float(os.getenv("WATCH_MAX_PRICE", "200000"))
-    min_chg = float(os.getenv("WATCH_MIN_CHANGE_PCT", "0.5"))   # 1.0→0.5: 급등 초입 선점
-    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "20.0"))  # 10.0→20.0: engine hard block(20%)과 동기화
-    hard_heat = float(os.getenv("WATCH_HARD_HEAT_PCT", "20.0"))  # 14.0→20.0: quote_multi/engine과 동기화
-    soft_heat = float(os.getenv("WATCH_SOFT_HEAT_PCT", "14.0"))  # 10.5→14.0: quote_multi와 동기화
-    min_tv = float(os.getenv("WATCH_MIN_TR_VALUE", "600000000"))
-    min_vol = float(os.getenv("WATCH_MIN_VOLUME", "30000"))
+    max_price = float(os.getenv("WATCH_MAX_PRICE", "150000"))
+    # 장전(~09:00)에는 prdy_ctrt=0이므로 chg/tv/vol 필터 바이패스
+    import time as _time
+    _premarket = int(_time.strftime("%H%M")) < 900
+    min_chg = 0.0 if _premarket else float(os.getenv("WATCH_MIN_CHANGE_PCT", "0.5"))
+    max_chg = float(os.getenv("WATCH_MAX_CHANGE_PCT", "20.0"))
+    hard_heat = float(os.getenv("WATCH_HARD_HEAT_PCT", "20.0"))
+    soft_heat = float(os.getenv("WATCH_SOFT_HEAT_PCT", "14.0"))
+    min_tv = 0.0 if _premarket else float(os.getenv("WATCH_MIN_TR_VALUE", "600000000"))
+    min_vol = 0.0 if _premarket else float(os.getenv("WATCH_MIN_VOLUME", "30000"))
     max_spread_pct = float(os.getenv("WATCH_MAX_SPREAD_PCT", "0.35"))
 
     markets = [m.strip() for m in os.getenv("RANK_MARKETS", "J,NX").split(",") if m.strip()]
@@ -670,108 +843,6 @@ def build_watchlist() -> List[str]:
         else:
             src_map[sym] = "volume_rank"
 
-    if _radar_mode_enabled():
-        radar_markets = [m.strip() for m in os.getenv("RADAR_VOLUME_MARKETS", os.getenv("VOLUME_RANK_MARKETS", "J")).split(",") if m.strip()]
-        radar_pool = int(os.getenv("RADAR_VOLUME_TOPK", "100"))
-        strength_markets = [m.strip() for m in os.getenv("RADAR_STRENGTH_MARKETS", os.getenv("RANK_MARKETS", "J,NX")).split(",") if m.strip()]
-        strength_pool = int(os.getenv("RADAR_STRENGTH_TOPK", "120"))
-        cond_pool = int(os.getenv("RADAR_CONDITION_TOPK", "80"))
-        src_counts = {"volume_rank": 0, "strength": 0, "condition": 0}
-        dropped = {"price": 0, "chg": 0, "heat": 0, "tv": 0, "vol": 0, "spread": 0, "score": 0}
-        scored: List[Tuple[float, str]] = []
-
-        for m in radar_markets:
-            rows, dbg = fetch_volume_rank(m)
-            meta.extend(dbg)
-            if radar_pool > 0:
-                rows = rows[:radar_pool]
-            for it in rows:
-                before = len(raw_by_sym)
-                _add_candidate(it, "volume_rank")
-                if len(raw_by_sym) > before:
-                    src_counts["volume_rank"] += 1
-
-        for m in strength_markets:
-            rows, dbg = fetch_strength_rank(m)
-            meta.extend(dbg)
-            if strength_pool > 0:
-                rows = rows[:strength_pool]
-            for it in rows:
-                before = len(raw_by_sym)
-                _add_candidate(it, "strength")
-                if len(raw_by_sym) > before:
-                    src_counts["strength"] += 1
-
-        if seqs:
-            try:
-                cond_syms = scan_conditions(seqs)
-                if cond_pool > 0:
-                    cond_syms = cond_syms[:cond_pool]
-                items = multi_quote(cond_syms) if cond_syms else []
-            except Exception as e:
-                meta.append(f"cond err({type(e).__name__})")
-                items = []
-            for it in items:
-                before = len(raw_by_sym)
-                _add_candidate(it, "condition")
-                if len(raw_by_sym) > before:
-                    src_counts["condition"] += 1
-
-        for sym, it in raw_by_sym.items():
-            px = _parse_price(it)
-            if (min_price > 0 and px > 0 and px < min_price) or (max_price > 0 and px > max_price):
-                dropped["price"] += 1
-                continue
-
-            chg = _parse_float(it, "prdy_ctrt", 0.0)
-            if chg < min_chg or chg > max_chg:
-                dropped["chg"] += 1
-                continue
-            # max_chg 완화 시를 대비한 추가 과열 차단
-            if chg > hard_heat:
-                dropped["heat"] += 1
-                continue
-
-            tv = _parse_float(it, "acml_tr_pbmn", 0.0)
-            if tv > 0 and tv < min_tv:
-                dropped["tv"] += 1
-                continue
-
-            vol = _parse_float(it, "acml_vol", 0.0)
-            if vol > 0 and vol < min_vol:
-                dropped["vol"] += 1
-                continue
-
-            spread_pct = _parse_spread_pct(it, max_spread_pct * 0.8)
-            if spread_pct >= max_spread_pct:
-                dropped["spread"] += 1
-                continue
-
-            score = score_item(it)
-            if not math.isfinite(score):
-                dropped["score"] += 1
-                continue
-            scored.append((score, sym))
-
-        scored.sort(reverse=True)
-        out = [sym for _, sym in scored[:want_n]]
-        if not out:
-            fb = _fallback_symbols()[:want_n]
-            _LAST_BUILD_META = f"radar_volume empty drop={dropped} -> fallback"
-            _LAST_SOURCE_MAP = {sym: "fallback" for sym in fb}
-            _emit_watch_status(len(raw_by_sym), len(fb), want_n, dropped, scored, len(raw_by_sym))
-            return fb
-
-        _LAST_BUILD_META = (
-            f"radar_combo markets={radar_markets} pool={len(raw_by_sym)} selected={len(out)} "
-            f"volume_rank={src_counts['volume_rank']} strength={src_counts['strength']} condition={src_counts['condition']} "
-            f"drop_price={dropped['price']} drop_chg={dropped['chg']} drop_heat={dropped['heat']} "
-            f"drop_tv={dropped['tv']} drop_vol={dropped['vol']} drop_spread={dropped['spread']} drop_score={dropped['score']} soft_heat={soft_heat:.1f}"
-        )
-        _LAST_SOURCE_MAP = {sym: src_map.get(sym, "volume_rank") for sym in out}
-        _emit_watch_status(len(raw_by_sym), len(out), want_n, dropped, scored, len(raw_by_sym))
-        return out
-
     for m in markets:
         rows, dbg = fetch_volume_rank(m)
         meta.extend(dbg)
@@ -794,12 +865,44 @@ def build_watchlist() -> List[str]:
         for it in items:
             _add_candidate(it, "condition")
 
+    # preopen / fluctuation / bulk_trans 후보 수집
+    if _should_fetch_preopen():
+        rows, errs = fetch_preopen_rank()
+        meta.extend(errs)
+        if rows:
+            _preopen_fetched = True
+        for it in rows:
+            sym = _parse_sym(it)
+            if sym and sym not in raw_by_sym:
+                raw_by_sym[sym] = it
+                src_map[sym] = "preopen"
+    else:
+        markets_j = [m for m in markets if m == "J"]  # J만 (API 제약)
+        for m in markets_j:
+            rows, errs = fetch_fluctuation_rank(m)
+            meta.extend(errs)
+            for it in rows:
+                sym = _parse_sym(it)
+                if sym and sym not in raw_by_sym:
+                    raw_by_sym[sym] = it
+                    src_map[sym] = "fluctuation"
+
+            rows, errs = fetch_bulk_trans(m)
+            meta.extend(errs)
+            for it in rows:
+                sym = _parse_sym(it)
+                if sym and sym not in raw_by_sym:
+                    raw_by_sym[sym] = it
+                    src_map[sym] = "bulk_trans"
+
     if not raw_by_sym:
-        fb = _fallback_symbols()[:want_n]
-        _LAST_BUILD_META = "empty_pool -> fallback"
-        _LAST_SOURCE_MAP = {sym: "fallback" for sym in fb}
-        _emit_watch_status(0, len(fb), want_n, {"price": 0, "chg": 0, "heat": 0, "tv": 0, "vol": 0, "spread": 0, "score": 0}, [], 0)
-        return fb
+        _LAST_BUILD_META = "empty_pool -> no_trade"
+        _LAST_SOURCE_MAP = {}
+        _LAST_POOL_SYMS = []
+        _LAST_DROPPED_DETAIL = []
+        _emit_watch_status(0, 0, want_n, {"price": 0, "chg": 0, "heat": 0, "tv": 0, "vol": 0, "spread": 0, "score": 0, "largecap": 0}, [], 0,
+                           pool_syms=[], dropped_detail=[])
+        return []
 
     syms = list(raw_by_sym.keys())
     try:
@@ -813,44 +916,66 @@ def build_watchlist() -> List[str]:
         if sym and sym not in by_sym_q:
             by_sym_q[sym] = it
 
+    # 초대형주 블랙리스트 — 모멘텀 전략에 부적합한 시총 상위 종목
+    # 대형주 블랙리스트 + 사용자 블랙리스트 통합
+    _largecap_bl = set(s.strip() for s in os.getenv(
+        "WATCH_LARGECAP_BLACKLIST",
+        "005930,000660,035420,005380,005490,051910,006400,035720,068270,028260"
+    ).split(",") if s.strip())
+    _user_bl = set(s.strip() for s in os.getenv("WATCH_BLACKLIST", "").split(",") if s.strip())
+    _largecap_bl |= _user_bl
+
     scored: List[Tuple[float, str]] = []
-    dropped = {"price": 0, "chg": 0, "heat": 0, "tv": 0, "vol": 0, "spread": 0, "score": 0}
+    dropped = {"price": 0, "chg": 0, "heat": 0, "tv": 0, "vol": 0, "spread": 0, "score": 0, "largecap": 0}
+    dropped_detail: List[str] = []  # 탈락 종목 상세 로그
 
     for sym in syms:
+        if sym in _largecap_bl:
+            dropped["largecap"] += 1
+            dropped_detail.append(f"{sym} DROP largecap_blacklist")
+            continue
+
         it = by_sym_q.get(sym) or raw_by_sym.get(sym) or {}
 
         px = _parse_price(it)
         if (min_price > 0 and px > 0 and px < min_price) or (max_price > 0 and px > max_price):
             dropped["price"] += 1
+            dropped_detail.append(f"{sym} DROP price={px:.0f}")
             continue
 
         chg = _parse_float(it, "prdy_ctrt", 0.0)
         if chg < min_chg or chg > max_chg:
             dropped["chg"] += 1
+            dropped_detail.append(f"{sym} DROP chg={chg:.2f}%")
             continue
         # max_chg 완화 시를 대비한 추가 과열 차단
         if chg > hard_heat:
             dropped["heat"] += 1
+            dropped_detail.append(f"{sym} DROP heat={chg:.2f}%")
             continue
 
         tv = _parse_float(it, "acml_tr_pbmn", 0.0)
         if tv > 0 and tv < min_tv:
             dropped["tv"] += 1
+            dropped_detail.append(f"{sym} DROP tv={tv:.0f}<{min_tv:.0f}")
             continue
 
         vol = _parse_float(it, "acml_vol", 0.0)
         if vol > 0 and vol < min_vol:
             dropped["vol"] += 1
+            dropped_detail.append(f"{sym} DROP vol={vol:.0f}<{min_vol:.0f}")
             continue
 
         spread_pct = _parse_spread_pct(it, max_spread_pct * 0.8)
         if spread_pct >= max_spread_pct:
             dropped["spread"] += 1
+            dropped_detail.append(f"{sym} DROP spread={spread_pct:.3f}%>={max_spread_pct:.3f}%")
             continue
 
         score = score_item(it)
         if not math.isfinite(score):
             dropped["score"] += 1
+            dropped_detail.append(f"{sym} DROP score=NaN")
             continue
 
         scored.append((score, sym))
@@ -891,18 +1016,27 @@ def build_watchlist() -> List[str]:
         for sym in out[prev_n:]:
             src_map[sym] = "condition"
 
-    if not out:
-        fb = _fallback_symbols()[:want_n]
-        _LAST_BUILD_META = f"all_filtered drop={dropped} -> fallback"
-        _LAST_SOURCE_MAP = {sym: "fallback" for sym in fb}
-        _emit_watch_status(len(raw_by_sym), len(fb), want_n, dropped, scored, len(by_sym_q))
-        return fb
+    _LAST_POOL_SYMS = syms
+    _LAST_DROPPED_DETAIL = dropped_detail
 
+    if not out:
+        _LAST_BUILD_META = f"all_filtered drop={dropped} -> no_trade"
+        _LAST_SOURCE_MAP = {}
+        _emit_watch_status(len(raw_by_sym), 0, want_n, dropped, scored, len(by_sym_q),
+                           pool_syms=syms, dropped_detail=dropped_detail)
+        return []
+
+    c_preopen = sum(1 for s in out if src_map.get(s) == "preopen")
+    c_fluctuation = sum(1 for s in out if src_map.get(s) == "fluctuation")
+    c_bulk_trans = sum(1 for s in out if src_map.get(s) == "bulk_trans")
     _LAST_BUILD_META = (
         f"simple_rest pool={len(raw_by_sym)} quote={len(by_sym_q)} selected={len(out)} "
         f"drop_price={dropped['price']} drop_chg={dropped['chg']} drop_heat={dropped['heat']} "
-        f"drop_tv={dropped['tv']} drop_vol={dropped['vol']} drop_spread={dropped['spread']} drop_score={dropped['score']} soft_heat={soft_heat:.1f}"
+        f"drop_tv={dropped['tv']} drop_vol={dropped['vol']} drop_spread={dropped['spread']} drop_score={dropped['score']} soft_heat={soft_heat:.1f} "
+        f"pre={c_preopen} fluc={c_fluctuation} bulk={c_bulk_trans}"
     )
     _LAST_SOURCE_MAP = {sym: src_map.get(sym, "rest") for sym in out}
-    _emit_watch_status(len(raw_by_sym), len(out), want_n, dropped, scored, len(by_sym_q))
+    _emit_watch_status(len(raw_by_sym), len(out), want_n, dropped, scored, len(by_sym_q),
+                       pool_syms=syms, dropped_detail=dropped_detail)
+    _save_selection_snapshot(syms, out, src_map, dropped_detail, scored)
     return out

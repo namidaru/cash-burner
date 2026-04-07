@@ -55,16 +55,19 @@ class DiscordNotifier:
                 }
             ],
         }
-        for attempt in range(3):
+        attempt = 0
+        while attempt < 3:
             try:
                 r = requests.post(self.webhook_url, json=payload, timeout=self.timeout)
                 if r.status_code == 429:
                     retry_after = float((r.json() or {}).get("retry_after", 1.0))
-                    time.sleep(min(retry_after, 5.0))
-                    continue
+                    time.sleep(min(retry_after, 10.0))
+                    continue  # BUG-036: attempt 증가 없이 재시도
+                # BUG-035: 429 외 HTTP 오류도 stderr에 기록
+                if r.status_code >= 400:
+                    import sys
+                    print(f"[notifier] HTTP {r.status_code} title={title!r:.80} body={r.text[:120]}", file=sys.stderr)
                 return
             except Exception:
-                if attempt >= 2:
-                    return
                 time.sleep(0.5)
-                continue
+            attempt += 1

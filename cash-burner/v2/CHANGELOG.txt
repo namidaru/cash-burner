@@ -1,0 +1,906 @@
+================================================================================
+0310 — KIS 자동매매 개선 작업 시작
+================================================================================
+
+목표: 3/20(금)까지 실거래 3회 이상 + 승률 산출. 9~10시 변동성 구간 2~3회 진입.
+
+확인된 버그:
+  BUG-1: H0STASP0 슬롯 초과 → imb/spread 57% 동결
+  BUG-2: mxpr_dist_pct 항상 0 (STCK_SDPR 없는 필드)
+  BUG-3: CCLD_DVSN 주석 반대 표기
+  BUG-4: vi_stnd_prc 중복 추출
+
+확인된 상관관계 (15시 데이터 — 신뢰 낮음):
+  ret5 r=-0.73 (역방향), score r=-0.04, ofi r=-0.03, imb r=-0.02
+
+AI 작업 규칙: KIS API 필드명 절대 짐작 금지, xlsx 확인 후 작업
+
+================================================================================
+0311 — 스코어링/게이트 대규모 패치
+================================================================================
+
+① 스코어 함수 리팩터
+  momentum: ret10*32 → sqrt(ret10)*32
+  liquidity: accel*10 → sqrt*14
+  orderflow: cap(50) 제거
+
+② gate_overextension 예외: ofi>=5 AND ret10>=0.5% → overextension 무시
+③ imb_weak 예외: ofi>=8 → imb 낮아도 통과
+④ dayrise 패널티 ofi 연동: ofi 강할수록 패널티 최대 70% 감면
+
+⑤ 2tick 게이트 추가:
+  gate_ofi_2tick: ofi 직전값 대비 스파이크 차단
+  gate_burst_2tick: 단일 대량체결 차단
+  gate_imb_2tick: 매도벽 순간 증발 차단
+
+⑥ 보유종목 _watchlist_scores 버그 수정:
+  보유 중인 종목이 순위 영구 점령 → not_top_k 오작동 → 신규 진입 차단
+  수정: 보유 종목을 scores/top_scored에서 제외
+
+⑦ 수동/자동 포지션 구분 (manual flag):
+  SYNC_ADD → manual=True → max_hold/손절 제외, 가격 추적만
+
+================================================================================
+0312 — 워치리스트/구독 슬롯 정리
+================================================================================
+
+WATCH_TOP_N=40→20, MAX_POSITIONS=10→3, ENTRY_TOP_K=5→3
+H0STASP0를 H0STCNT0와 동일 종목 구독 (슬롯 계산 단순화)
+PRE_SUB 8:59 등락률 순위 구독 추가
+
+================================================================================
+0315 — 진입 게이트 리팩터 (고점매수 차단)
+================================================================================
+
+문제: 매수 4건 중 3건이 고점/쓰레기 진입
+  064820: dayrise=16% gap_pct=0.24% → SL
+  003490: 일일 고점 정확히 매수 → max_hold
+  010170: dayrise=-7.56% 하락 종목 → 의미없음
+
+변경:
+  후행 게이트 6개 제거 (gate_ret10 등)
+  선행 게이트 2개 추가:
+    gate_falling: dayrise<=-3% hard block
+    gate_near_high: 20초 고점 대비 0.2% 이내 차단
+  fast_path gap 필터: FAST_GAP_MIN_PCT=0.3%, dayrise_max 20%→12%
+  buy_trv10_min 20M→10M
+
+백테스트 (3/12): 5건 승률 60%, 쓰레기 진입 3건 전부 차단
+
+================================================================================
+0316 — 포지션/배분/트레일 리팩터 + 전략 전환
+================================================================================
+
+실전 결과 (3/16 09:00~09:07):
+  3건 거래, 승률 33%, 일손익 약 -3,000원
+  007340: fast_path +2.74% (TP=3% 청산, 실제 +16.6%까지) ★
+  006800: engine -0.56% (max_hold)
+  009830: engine -1.54% (SL, 정당)
+
+핵심 발견:
+  gap_discount(동시호가등락-실제갭)가 승패 최강 예측 지표
+  fast_path 1건이 엔진 2건 손실 커버
+
+변경:
+  [morning_fastpath.py] score_stub → gap_discount 최우선
+    disc>=8%→score220(25%), >=4%→200(18%), >=2%→170(12%), else pvol fallback
+    gap_discount>=4% → FAST_GAP_MIN_PCT 필터 면제 (085620 케이스)
+
+  [engine_simple.py] 트레일 → 비율 기반
+    drop = peak * 25%, 최소 1.5%, 최대 2.5%
+    TP = 20% (상한가급 즉시 익절)
+    분할매도 OFF
+
+  [engine_simple.py] 렌더링 분리
+    엔진 print() → _console_msgs 큐
+    runner_live가 drain → 로그 위/대시보드 아래
+    청산 중복 메시지 제거
+    SELL pnl 컬러 (빨/파), BUY score 초록, HALT/FAIL 노랑
+
+  [engine_simple.py] 디스코드 알림 개선
+    BUY: gap_disc, 배분% 추가
+    SELL: score 추가
+
+  [run_real_auto.cmd]
+    MAX_POSITIONS=5
+    TRADING_END_HHMM=915 (fast_path 집중, 엔진 진입 중단)
+    TRAIL_DROP_PCT=1.5
+    TAKE_PROFIT_PCT=20.0
+    WATCH_BLACKLIST=005930
+
+  [scanner_company_rank.py] 워치리스트 블랙리스트
+  [engine_simple.py] 매도 후 현금 즉시 갱신, signal_diag 롤링 OFF
+  [backtest_replay.py] sync_pending 우회 수정, 새 파라미터 반영
+
+신규: .claude/skills/dailyanalysis 당일 분석 자동화
+
+================================================================================
+0317 — on_timer 진입 차단 + 동시호가 퀄리티 랭킹
+================================================================================
+
+BUG: TRADING_END_HHMM=915는 9:15 이후만 차단 — 9:00~9:15 사이
+  on_timer SELECT가 계속 작동하여 엔진이 fast_path와 별도로 매수.
+  3/16 실전 3건 중 2건(006800, 009830)이 엔진 진입 → 둘 다 손실.
+  fast_path only였으면 +6,600원 (백테스트 확인).
+
+변경:
+  [engine_simple.py] TIMER_ENTRY_ENABLED=0 → _select_and_enter() 비활성화
+  [run_real_auto.cmd] set TIMER_ENTRY_ENABLED=0 추가
+
+  [engine_simple.py] 동시호가 퀄리티 랭킹 (_preopen_whitelist)
+    8:59:50부터 _preopen_data 기반 복합 점수 산출, 상위 N개만 whitelist
+    퀄리티 = ba_ratio*5(max40) + gap_slope*15(max30) + 갭구간(max20) + pvol_pre(max10)
+    PREOPEN_WHITELIST_N=10 (기본값)
+    fast_path 진입 시 whitelist 필터 적용 (빈 경우 필터 OFF)
+
+  [morning_fastpath.py] score_stub 보조 신호 4종 보너스 통합
+    gap_slope: ≥0.5→+10, ≥1.0→+15, ≥2.0→+20
+    ba_ratio: ≥1.5→+5, ≥2.0→+10, ≥3.0→+15
+    pvol_rate_pre: ≥50→+5, ≥100→+10, ≥200→+15
+    외국인+기관 순매수: >0→+5, ≥1000→+10, ≥5000→+15
+    보너스 합산 최대 +40
+
+  [backtest_replay.py] 새 파라미터 반영 (TP=20, trail ratio, MAX_POS=5, TIMER_ENTRY=0)
+  [ws_capture_live.py] 슬롯 코멘트 pos(7)→pos(5) 수정
+
+================================================================================
+0317 실전 결과 + 청산 로직 정리
+================================================================================
+
+실전 결과 (3/17 09:01~09:14):
+  2건 거래, 승률 50%, 일손익 -4,500원 (실질 0승 — 아래 참고)
+  fast_path 2건 / engine 0건 (TIMER_ENTRY_ENABLED=0 정상 작동)
+  cash: 2,037,457원
+
+  200710: fast_path entry=51000 exit=50300 pnl=-1.37% (-4,900원)
+    score=225, pvol=16.8x, ticks=98, dayrise=5.70%
+    → SL 정상. 최대수익 +0.59%밖에 안 됨, 진입 근거 자체 약했음
+
+  131970: fast_path_ext entry=78300 exit=78400 pnl=+0.13% (+400원)
+    score=240, pvol=50x, ticks=2033, dayrise=7.55%
+    → vwap_exit(-3.97%<-0.15%)로 진입 20초 만에 청산 ★★★
+    → 이후 고가 84,500 (+7.92%까지). trail이었으면 +5~6% 가능
+    → 진입 정당 / 청산 조기 (vwap_exit가 수익 파괴)
+
+놓친 기회 (CAND pass=1):
+  437730: score=262, gap_disc=+3.17%, 최대수익 +3.81% → gate_block
+  034020: score=202, gap_disc=+1.31%, 최대수익 +1.42%
+  338840: score=194, gap_disc=+1.77%, 최대수익 +2.11%
+
+gate_block 분포:
+  gate_near_high=2808, gate_dayrise_hard=1425, gate_falling=519
+  FAST_PATH_SKIP=6981 (gap_too_low=6965, tick_not_rising=16)
+
+핵심 발견:
+  vwap_exit, dynamic_tp(ATR 기반), take_profit_after_grace가
+  3/16~3/17 양일간 수익 거래를 반복적으로 조기청산.
+  007340(3/16): TP 3.4%에서 청산 → 실제 +17%
+  131970(3/17): vwap_exit +0.13%에서 청산 → 실제 +7.92%
+  → 진입은 정확했으나 청산이 발목 잡음
+
+변경:
+  [engine_simple.py] vwap_exit 제거 — _vwap_exit_check 메서드 + 호출부 삭제
+  [engine_simple.py] dynamic_tp/dynamic_sl/dynamic_trail_drop 제거
+    → ATR 기반 동적 TP/SL/trail 전부 삭제
+    → 고정값 사용: SL=STOP_LOSS_PCT, trail=TRAIL_DROP_PCT
+  [engine_simple.py] take_profit_after_grace 라인 제거
+    → 청산은 SL + trail_stop + max_hold 3개만 남음
+  [kis_orders.py] account_cash_snapshot 단순화
+    → ord_psbl_cash 하나만 반환, fallback 우선순위 제거
+  [engine_simple.py] 엔진 현금 읽기도 orderable 하나만 사용
+
+현재 청산 구조 (정리 후):
+  1. stop_loss_panic — grace 전 긴급 SL (STOP_LOSS_EMERGENCY_PCT=2.5%)
+  2. stop_loss_early — grace 전 완화 SL
+  3. stop_loss_after_grace — grace 후 고정 SL (STOP_LOSS_PCT=1.5%)
+  4. trail_stop — peak 대비 drop (TRAIL_ARM=1.5%, DROP=peak*25%, min1.5%, max2.5%)
+  5. max_hold — 시간 초과 (MAX_HOLD_SEC=300)
+
+================================================================================
+0318 — 동시호가 풀 확대 + fast_path 즉시매수 수정
+================================================================================
+
+3/18 실전 문제:
+  fast_path 진입 3분 지연 — 원인 3가지:
+    1. tick_not_rising: 장초반 틱 변동으로 연속상승 조건 실패 (078600)
+    2. dayrise_max: 상한 초과 차단 (001820)
+    3. NO_WL: whitelist 종목이 watchlist에 미포함 (376900, 475150)
+
+변경:
+
+  [morning_fastpath.py] 게이트 정리
+    dayrise_max 상한 제거 (상한 없음)
+    gap_filter 기본 OFF → ON 시 환경변수로
+    tick_rise: n=3→2, 기본 ON 복원
+      → "2번째 틱 > 1번째 틱"만 확인 (눌림탈출 최소 체크)
+    min_ticks=2 유지
+
+  [engine_simple.py] _rebuild_preopen_whitelist 개선
+    watchlist.txt에 whitelist 5개만 쓰기 (기존 20개 → 5개)
+    → 나머지 15개 구독 해제, WS 슬롯 절약
+    _preopen_whitelist_done 플래그를 rebuild 완료 시 즉시 설정
+    → ws_capture가 H0STCNT0으로 사전 전환 (9:00 대기 없음)
+
+  [ws_capture_live.py] 동시호가 구독 단순화
+    H0STANC0 구간에서 H0STASP0 제거 (스코어링에 불필요)
+    → 종목당 1 TR = 최대 50종목 구독 가능
+    오버랩 구간(8:59~9:00) 제거 — whitelist 확정 시 즉시 전환
+    engine 참조 추가 → _preopen_whitelist_done 확인
+
+  [main_real.py] scanner_loop 단순화
+    PRE_SUB 타이머/fallback 전부 제거 (3일간 100% 실패)
+    장중 build_watchlist/fluctuation_rank 호출 제거
+    8:45 초기 watchlist 확보만 유지
+    engine → cap 참조 순서 변경 (cap이 engine 참조 필요)
+
+  [run_real_auto.cmd]
+    WATCH_TOP_N=20→45 (동시호가 비교 풀 확대)
+
+흐름 (내일 3/19):
+  8:45    build_watchlist() → 45종목 watchlist → WS 구독
+  8:50    H0STANC0 × 45종목 (45슬롯) 수신 시작
+  8:59:50 _rebuild_preopen_whitelist → 상위 5개 whitelist 확정
+          watchlist.txt = 5개, _preopen_whitelist_done = True
+  ~8:59:52 ws_capture 폴링 → H0STANC0 해제 → H0STCNT0 구독 (10슬롯)
+  9:00    체결 데이터 즉시 수신 → 2번째 틱 양봉이면 매수
+
+================================================================================
+0319 — 50/50 분할청산 + trail 완화
+================================================================================
+
+3/19 실전 문제:
+  475150: +25.7% 고점 → trail(arm=1.5, drop=1.5)이 +1.8%에서 조기청산
+  → 3일간 fast_path 승리 종목(007340 +16.2%, 475150 +25.7%) 전부 수익 미확보
+  → 시뮬 결과: 50/50 분할이면 -9,950원 → +21,750원 전환 가능
+
+변경:
+
+  [engine_simple.py] 50/50 분할청산 구현
+    Position에 split_a_sold 필드 추가
+    A물량(50%): trail — arm=3.0%, ratio=25%, min=2.0%, max=4.0%
+    B물량(50%): SL(-1.5%) or TP(+20%) or 장마감(15:19)
+    trail 발동 시 A물량만 매도, B물량은 trail 무시하고 홀드
+    SPLIT_EXIT_ENABLED=1 환경변수로 on/off
+    SPLIT_B_TP_PCT=20.0 B물량 TP 기준
+    PAPER_TRADE/실계좌 양쪽 경로 구현
+    state 저장/복원 시 split_a_sold 유지
+
+  [run_real_auto.cmd] trail 파라미터 변경
+    TRAIL_ARM_PCT=1.5→3.0 (무장 기준 완화)
+    TRAIL_DROP_PCT=1.5→2.0 (되돌림 최소값)
+    TRAIL_DROP_MAX_PCT=2.5→4.0 (되돌림 최대값)
+    SPLIT_EXIT_ENABLED=1, SPLIT_B_TP_PCT=20.0 추가
+
+  기존 partial_take (PROMPT 1) 비활성 유지 — split exit가 대체
+
+동작 요약:
+  매수 10주 → A=5주 + B=5주
+  A: trail arm=3% 도달 후 고점 대비 되돌림 시 매도
+  B: SL(-1.5%) or TP(+20%) or 15:19 장마감
+  SL: A+B 전량 동시 청산 (분할 무관)
+  홀수 수량(3주): A=1주 trail, B=2주 홀드 (qty//2)
+
+  [engine_simple.py] whitelist rebuild를 on_timer로 이동
+    기존: on_preopen_tick에서 트리거 (H0STANC0 틱 필요)
+    변경: on_timer에서 시간 기반 트리거 (매초 실행, WS 상태 무관)
+    → 08:59:20 + _preopen_data 있으면 rebuild → _whitelist_done=True
+    → WS 크래시해도 축적 데이터로 순위 산출 가능
+    preopen 데이터 없으면 whitelist 빈 상태 → fast_path 매수 차단
+
+  [morning_fastpath.py] whitelist 비어있으면 매수 차단
+    기존: _preopen_whitelist 비어있으면 필터 OFF (아무 종목이나 매수)
+    변경: 비어있으면 return False (preopen 데이터 없이 매수 금지)
+
+3/19 지연 원인 분석:
+  08:59:37 WS 깨진 패킷으로 연결 끊김 → 08:59:39 재연결
+  08:59:45 또 끊김 → 또 재연결
+  08:59:51 whitelist 확정 → H0STCNT0 구독 (시장 오픈 9초 전, 너무 촉박)
+  09:00:15 475150 첫틱 (KIS 피드 활성화 ~15초 소요)
+  → 시가 43,500에서 이미 45,050까지 급등, 실체결 슬리피지 +3.6%
+
+흐름 (내일 3/20):
+  8:45     build_watchlist() → 45종목 watchlist
+  8:50     H0STANC0 구독 → _preopen_data 축적
+  8:59:20  on_timer → rebuild → whitelist 5종목 확정 → _whitelist_done=True
+  ~8:59:22 ws_capture → H0STCNT0 전환 (38초 여유)
+  9:00:00  첫 틱 즉시 수신 → tick_rise → 매수
+           A물량(50%): trail arm=3% / B물량(50%): TP=20% or 장마감
+
+  [ws_capture_live.py] WS reconnect backoff 버그 수정
+    기존: approval_key 발급 성공 시 attempt=0 리셋 → 크래시 루프에서 매번 2초만 대기
+    변경: 연결이 60초 이상 생존했을 때만 attempt 리셋
+    → 크래시 루프: backoff 2→4→6→...→30초로 점진 증가 (CPU/네트워크 절약)
+    → 장중 안정 연결 후 끊기면: attempt 리셋되어 즉시 재연결
+    3/19 실측: 장전 07:38~08:29 크래시 루프 (12초 주기 무한반복, backoff 미적용)
+              장중 09:00~15:56 크래시 0건 (안정)
+              장후 16:00~16:21 크래시 루프 (2847회, backoff 미적용)
+
+  [engine_simple.py] KIS API 체결 내역 대사 (reconcile) 추가
+    15:19 이후 포지션 전량 청산 완료 시, KIS TTTC8001R(inquire_daily_ccld) 호출
+    ledger 기록 가격 vs 실체결 가격 비교 → 슬리피지 보정
+    _reconcile_done 플래그로 1일 1회만 실행
+
+  [kis_orders.py] inquire_daily_ccld() 함수 추가
+    TTTC8001R 주식일별주문체결조회 API — 당일 체결 내역 조회
+
+  [engine_simple.py] 동시호가 whitelist 스코어링 개선
+    gap < 0.3% 종목 제외 (음갭/무갭 차단)
+    ba_trend 가중치 축소: 15→10 (과대평가 방지)
+    gap 5~15% 구간 가중치 상향: 20→30 (큰 갭이 수익과 상관)
+    ba_ratio 가중치 축소: 5→4, max 40→30
+
+  [engine_simple.py] RVOL 로딩 제거
+    엔진 __init__에서 RvolLoader import/로딩 삭제
+    _reset_daily_state에서 RVOL reload 삭제
+    fast_path에 rvol_loader=None 전달 (RVOL 보너스 비활성)
+
+  [run_real_auto.cmd] KOSDAQ 제거
+    RANK_MARKETS=J,NX → J (KOSPI만)
+    STRENGTH_MARKETS=J,NX → J
+
+  [run_real_auto.cmd] SL 상향
+    STOP_LOSS_PCT=1.5→2.0 (098070이 -1.59%에서 잘린 뒤 +4.4% 반등)
+    STOP_LOSS_EMERGENCY_PCT=2.5→3.0
+
+  [dailyanalysis skill] 간소화
+    불필요 STEP 제거: RVOL, 놓친기회, 승패구분, 시뮬레이션, 파라미터영향, 장중fast_path시뮬
+    STEP 7 추가: 동시호가 whitelist 스코어링 검증 (순위 vs 실제 수익률 상관분석)
+    청산 그리드 시뮬: 36조합으로 축소 (TP=20 고정, drop_max 옵션 추가)
+
+================================================================================
+0322 — 날짜별 로그 폴더 + 덤프 압축 + 매도 파라미터 + 버그 수정
+================================================================================
+
+문제:
+  1. ws_dump 35~48MB/일, ws_control 33MB 누적, signal_diag 11MB 누적
+  2. 매도 파라미터 보수적 (SL=2%, grace=10s, trail_arm=3%)
+  3. 3/20 종목선정 실패 — multi_quote()=0 → 5종목만 반환 → scanner 재시도 안 함
+  4. scanner_loop 8:45 시작 → 8:50 H0STANC0 데이터 시작 전에 불필요한 API 호출
+
+변경:
+
+  [run_real_auto.cmd] 날짜별 로그 폴더 구조
+    OUT_FILE=data\logs\{date}\ws_dump.log
+    CONTROL_FILE=data\logs\{date}\ws_control.log
+    SIGNAL_DIAG_FILE=data\logs\{date}\signal_diag.log
+    WATCHLIST_DEBUG=data\logs\{date}\watchlist_debug.log
+    → 일별 로그 자동 분리, 누적 로그 문제 해결
+
+  [run_real_auto.cmd] 매도 파라미터 변경
+    STOP_LOSS_PCT=2.0→3.5 (변동성 큰 급등주 노이즈 흡수)
+    STOP_LOSS_EMERGENCY_PCT=3.0→5.0
+    EXIT_GRACE_SEC=10→30 (시장가 체결 후 bid-ask 스프레드 노이즈)
+    STOP_LOSS_EARLY_GRACE_SEC=8→15
+    TRAIL_ARM_PCT=3.0→5.0 (조기 매도 방지)
+    TRAIL_DROP_PCT=2.0→3.0
+    TRAIL_DROP_MAX_PCT=4.0→5.0
+    FORCE_EXIT_HHMM 비활성화 (하루 보유 허용, trail/SL이 청산 담당)
+
+  [engine_simple.py] 매도 파라미터 기본값 동기화
+    코드 기본값을 cmd 설정과 일치시킴 (cmd 없이 실행해도 동일 동작)
+    FORCE_EXIT 기본값 9999 (비활성)
+
+  [engine_simple.py] enter_position REST 동기 호출 제거
+    기존: 매수 시마다 account_cash_snapshot REST 호출 (블로킹)
+    변경: on_timer가 1초마다 갱신하는 캐시 사용, 캐시 없을 때만 REST 호출
+    → 매수 지연 ~200ms 절감
+
+  [main_real.py] scanner_loop 시작 8:45→8:50
+    H0STANC0 호가 데이터 시작 시각과 동기화, REST API 품질도 8:50 이후 안정
+
+  [main_real.py] 후보풀 최소 크기 검증 (WATCH_MIN_POOL=20)
+    기존: watch가 1개라도 있으면 _pool_done_today 설정 → 재시도 안 함
+    변경: 20개 미만이면 재시도, watchlist는 기록 (WSCapture 구독 유지)
+    → 3/20 종목선정 실패 방지
+
+  [main_real.py] {date} 패턴 치환 로직 추가
+    import 전에 OUT_FILE, CONTROL_FILE, SIGNAL_DIAG_FILE, WATCHLIST_DEBUG의
+    {date}를 당일 날짜로 치환 → 모든 모듈이 날짜별 경로 참조
+
+  [daily_compact.py] 신규 — 장 마감 후 로그 압축/요약
+    compact: H0STASP0 제거 → ws_dump_compact.log (백테스트용, ~43% 크기)
+    gzip: 원본 압축 → ws_dump.log.gz (34MB→4.6MB)
+    summary: 일일 요약 (P&L, 틱 통계, 종목별 틱 수)
+    --split: 기존 누적 로그(ws_control/signal_diag/watchlist_debug) 날짜별 분할
+
+  [backtest_replay.py] 날짜별 폴더 지원
+    bt_ 출력을 data/logs/{date}/ 에 저장
+    자동 탐색: data/logs/*/ws_dump_compact.log
+
+  기존 누적 로그(ws_control 33MB, signal_diag 11MB 등) 날짜별 분할 완료
+  3/15 이전 로그 삭제 (코드 안정성 이전 데이터, 의미 없음)
+  bt_ 파일 삭제 (백테스트 재실행으로 재생성 가능)
+
+================================================================================
+0322 (2차) — 동시호가 스코어링 재설계 + 스캐너 진단 + 덤프 다운샘플링
+================================================================================
+
+문제:
+  1. 동시호가 whitelist 스코어링 차별력 부족 — 상위 5개 점수 거의 동일
+     실제 고수익 종목(007340 +32%, 047040 +30%)이 하위 랭크
+  2. 047040(대우건설) 금요일 거래량 2등인데 45종목에도 미포함 — 스캐너 진단 불가
+  3. H0STASP0 완전 제거 → 백테스트 호가 데이터 소실
+  4. pvol_pre가 H0STANC0에서 항상 0 — 10점 배점 낭비
+
+변경:
+
+  [engine_simple.py] 동시호가 whitelist 스코어링 재설계
+    gap 점수: 스텝(5-15%=30, >15%=0) → 연속 곡선
+      0~3%: gap*3.0 (최대 9)
+      3~8%: 9 + (gap-3)*3.6 (최대 27)
+      8~15%: 27 + (gap-8)*1.86 (최대 40)
+      15~30%: 40 - (gap-15)*0.5 (완만 감소)
+      >30%: 25 고정
+    ba_ratio: max 30→20, 가중치 축소 (min(20, ba*2.0))
+    ba_trend: max 10→8
+    gap×ba 시너지 보너스 신규 (max 15):
+      gap>=5% AND ba>=8 일 때: (gap/10)*(ba/10)*3.0
+    pvol_pre 제거 (H0STANC0에서 항상 0 확인)
+    총 배점: 105→108 (gap40 + ba20 + trend8 + slope25 + synergy15)
+
+    시뮬 결과 (6종목 백테스트):
+      기존: 007340(+32%) 하위 → 변경: 007340 2위로 상승
+      gap>15%=0점 버그 해소, 고갭 종목 정당한 점수 부여
+
+  [scanner_company_rank.py] 스캐너 진단 로깅 추가
+    build_watchlist() 필터 루프에서 탈락 사유+값 기록 (dropped_detail)
+    _emit_watch_status()에 pool_syms, dropped_detail 출력
+    fetch_volume_rank/fetch_strength_rank에 API 응답 종목 로깅
+    _LAST_POOL_SYMS, _LAST_DROPPED_DETAIL 글로벌 + getter 함수
+    → 월요일 실전에서 047040 누락 원인 확인 가능
+
+  [main_real.py] 스캐너 풀/탈락 로깅
+    scanner_loop에서 get_last_pool_syms(), get_last_dropped_detail() 호출
+    → rank pool 크기 + 탈락 상세 로그 출력
+
+  [daily_compact.py] H0STASP0 다운샘플링 (완전 제거 → 1/5 보존)
+    compact_dump(asp_keep_every=5): 종목별 카운터로 매 5번째 레코드 보존
+    h0stasp0_kept 통계 추적, 요약에 보존 비율 출력
+    결과: 49.9MB → 35.7MB (72%) vs 기존 완전 제거 32.2MB (64%)
+    3/16, 3/18 compact 파일 재생성 완료
+
+  [morning_fastpath.py] 디버그 로그 날짜별 폴더
+    기존: data/fastpath_debug_{today}.log
+    변경: data/logs/{today}/fastpath_debug.log
+    기존 파일 3개 이동 완료 (0318, 0319, 0320)
+
+  PINGPONG 참조 완전 제거
+    ARCHITECTURE.md에서 PINGPONG echo 관련 문구 삭제
+    memory/reference_codebase_map.md에서 제거
+    관련 plan 파일 삭제
+
+  메모리 업데이트
+    feedback_fastpath_only_architecture.md — 스캐너 분석 시 다른 진입경로 혼동 금지
+    reference_market_hours.md — 월~금 09:00만 장 개시, 토/일/공휴일 휴장
+    user_trading_philosophy.md — fast_path 전용 운영 명시
+
+================================================================================
+0323 — 스캐너 시작시간 복원 + 워치리스트 리셋 + 매수 크래시 수정
+================================================================================
+
+3/23 실전 문제:
+  0건 거래 — 원인 3가지:
+    1. 스캐너 시작 8:50 → API가 이미 당일 데이터로 리셋(chg=0%) → 전종목 필터 탈락
+       0322 패치에서 8:45→8:50 변경이 원인 (8:45에는 전일 데이터 유효, 로그 4일치 확인)
+    2. 워치리스트 전일 잔류: scanner 실패 → 전일 3종목(000660,005930,051910) 유지
+       → preopen 랭킹 대상이 3종목뿐 → 삼전/하닉 → gate_near_high 2688회 차단
+    3. enter_position UnboundLocalError: orderable_cash 변수 미할당 (0322 버그)
+       → 매수 시도할 때마다 함수 크래시 → 설령 gate 통과해도 매수 불가
+       → 09:13~09:17 반복 에러 확인 (콘솔 캡처)
+
+변경:
+
+  [scanner_company_rank.py] 장전 분기 제거 — 원래 로직 복원
+    8:45에 volume_rank/strength_rank는 전일 데이터가 유효 (3/16,3/18,3/19 확인)
+    8:50으로 옮긴 게 chg=0% 문제의 원인이었음 (API가 8:50에 당일 데이터로 리셋)
+    장전 바이패스/premarket 분기 전부 제거, 필터 원본 유지
+
+  [main_real.py] scanner_loop 시작 8:50→8:45 복원
+    8:45에 volume_rank+strength API가 전일 데이터 반환 (로그 4일치 검증)
+    8:50 변경은 3/20 multi_quote 실패에 대한 오진이었음
+    multi_quote 실패는 WATCH_MIN_POOL 재시도로 대응 (0322에서 추가됨)
+
+  [main_real.py] WATCH_MIN_POOL 기본값 = WATCH_TOP_N
+    기존: 하드코딩 20 → 45슬롯 중 20개만 채워도 완료 처리
+    변경: WATCH_TOP_N(=45)을 기본값으로 사용, 미달 시 8:55까지 재시도
+
+  [engine_simple.py] orderable_cash UnboundLocalError 수정 ★ 매수 차단 버그
+    0322에서 enter_position REST 동기호출 제거 시 발생한 버그
+    캐시 히트 경로에서 orderable_cash 변수 미할당 → _log_diag에서 UnboundLocalError
+    → enter_position 함수 전체 크래시 → 매수 주문 코드 미도달
+    09:13~09:17 반복 에러 = 매수 시도할 때마다 실패하고 있었음
+
+  [main_real.py] 세션 시작 시 워치리스트 리셋
+    기존: _load_watchlist_file()로 전일 종목 유지 (BOOT keep existing)
+    변경: last_watch=[] + write_watchlist([])로 빈 상태 시작
+    → 전일 종목과 당일 TOP5가 섞이지 않음
+
+  [main_real.py] _stabilize_watchlist 빈 결과 처리
+    기존: new가 비면 prev(전일 것) 반환 → 전일 종목 영구 잔류
+    변경: new가 비면 [] 반환 → 리셋 원칙 유지
+
+  [.claude/skills/dailyanalysis/skill.md] STEP 11 추가 — 장초반 되돌림 패턴 분석
+    09:00~09:05 틱 데이터 기반 pullback 분석
+    4가지 진입 시나리오 시뮬: A(즉시) B(30s저점) C(60s저점) D(반등확인)
+    패턴 분류: 직행(pb<0.3%) / 눌림(0.3~2.0%) / 급락(>2.0%)
+    ws_dump/signal_diag/fastpath_debug 경로 날짜별 폴더로 통일
+
+================================================================================
+0324 — 스캐너 10대 버그 수정 + 테마 크롤링 스캐너 신규
+================================================================================
+
+3/24 실전 문제 (최악의 날):
+  스캐너 완전 실패 → 0종목 → 전일 보유 종목(005930,010170)만 구독
+  005930: 29회 BUY_FAIL (예수금 초과) — 무한 재시도
+  010170: 고점 근접 진입 → SL -3.46% (-12,300원)
+  일손익 -12,300원
+
+근본 원인 체인:
+  CMD WATCH_MIN_CHANGE_PCT=1.0 (코드 0.5 오버라이드)
+  → 장전 prdy_ctrt=0 → 전종목 chg 필터 탈락 → pool=0
+  → 전일 held symbols(005930,010170)만 구독
+  → preopen whitelist에 대형주 진입 → 매수 시도 → 실패/손실
+
+수정 (10건):
+
+  [run_real_auto.cmd] 환경변수 수정
+    WATCH_MIN_CHANGE_PCT=1.0 → 0.5
+    WATCH_MAX_PRICE=500000 → 150000
+    PAPER_TRADE=0 → 1 (페이퍼 모드 전환, 양전까지)
+
+  [scanner_company_rank.py] premarket bypass 추가
+    int(time.strftime("%H%M")) < 900 이면 min_chg=0, min_tv=0, min_vol=0
+    → 장전 prdy_ctrt=0 문제 해결
+    WATCH_TOP_N 기본값 "15" → "45"
+    WATCH_MAX_PRICE 기본값 "200000" → "150000"
+    WATCH_BLACKLIST 환경변수 읽어서 _largecap_bl에 통합
+    초대형주 블랙리스트 (WATCH_LARGECAP_BLACKLIST) 추가
+      기본: 005930,000660,035420,005380,005490,051910,006400,035720,068270,028260
+      필터 루프에서 largecap → dropped["largecap"] 집계
+
+  [engine_simple.py] BUY_FAIL 무한 재시도 방지
+    rt_cd != "0" → 120초 쿨다운 + 캐시 잔고 무효화
+    _buy_fail_count: 동일 종목 3회 실패 → _session_blacklist
+    enter_position 진입부에 _session_blacklist 체크
+    _rebuild_preopen_whitelist에 largecap 블랙리스트 적용
+
+  [ws_capture_live.py] _held_symbols_from_ledger rt_cd 체크
+    BUY 레코드 중 rt_cd != "0" (주문 실패) → 보유로 카운트하지 않음
+    → 실패 BUY가 held symbols에 남는 버그 수정
+
+  [main_real.py] scanner_loop 8:54 확정 커밋 패턴
+    8:45~8:53: build_watchlist() 반복, _pending_watch에만 보관 (WS 구독 없음)
+    8:54 (SCAN_COMMIT_HHMM): write_watchlist → WS H0STANC0 구독 시작
+    8:55+: late-commit fallback
+    부트 시 워치리스트 리셋 (전일 종목 제거)
+    SCANNER_MODE 환경변수 분기 추가 (rank/theme)
+
+  [scanner_theme.py] 신규 — 네이버 금융 테마 크롤링 기반 워치리스트
+    독립 모듈, 기존 scanner_company_rank와 코드 공유 없음
+    네이버 테마 목록 (264개) → 상위 상승 테마 20개 → 구성종목 수집
+    종목별 "테마 빈도" (상승 테마 몇 개에 동시 소속) × 평균 테마 상승률 = score
+    가격 필터 + 대형주 블랙리스트 → 상위 5종목 반환
+    로그: data/logs/{date}/theme_debug.log (fast_path 경로와 무관하게 기록)
+    활성화: set SCANNER_MODE=theme (CMD)
+    테스트 결과: pool=278, 20테마 크롤링 성공, 5종목 선별
+
+  [reference_codebase_map.md] 갱신
+    CMD 환경변수 현행화 (MAX_PRICE=150000, CHG=0.5 등)
+    Runtime Flow 8:54 확정 커밋 패턴 반영
+    scanner_theme.py 미포함 (독립 모듈, 탈부착식)
+    Risk Point #9 추가: CMD 환경변수가 코드 기본값 오버라이드
+
+테스트:
+  build_watchlist (rank): pool=53, 필터 후 10종목 (장마감 기준)
+    premarket bypass 시 chg 7건 추가 통과 → ~17종목 예상
+  build_watchlist_theme: pool=278, 20테마/120총테마, 5종목 선별
+    통신장비/양자/5G/광통신 교차 종목이 상위 (우리넷 freq=4, score=33.8)
+
+================================================================================
+0325 — ENTRY_MODE 아키텍처 + 워치리스트 무결성
+================================================================================
+
+① ENTRY_MODE 아키텍처 (theme / fastpath 택1)
+  양쪽 스캐너 모두 main_real.py에 import. ENTRY_MODE로 활성 선택.
+  ENTRY_MODE=theme (기본): 네이버 테마 크롤링 → 45개 후보 풀.
+  ENTRY_MODE=fastpath: KIS 등락률/거래대금 랭크 → 45개 후보 풀.
+  공통 다운스트림: 45개 → H0STANC0(8:50) → PREOPEN 퀄리티 랭킹(8:59) → 상위 5개 확정 → fast_path 진입(9:00).
+  비활성 모드 결과는 watchlist_shadow.txt에 저장 (비교용).
+
+② 테마 스캐너 장전 대응 (scanner_theme.py)
+  장전(8:45)에 chg_pct=0 문제: 네이버가 당일 등락률 리셋.
+  chg_pct 전부 0이면 chg_3d(3일 등락률) 기준으로 정렬/스코어링.
+  스코어: theme_freq × avg(sort_key) — 여러 상승테마에 걸친 종목 우선.
+
+③ 워치리스트 무결성 보장
+  문제: 스캐너 실패해도 보유종목이 PREOPEN 타고 매수 가능 상태 됨.
+  수정:
+    - scanner_loop: 매 스캔 성공 시 즉시 watchlist 반영 (H0STANC0 8:50 구독용)
+    - 종목선정 실패 시 write_watchlist([]) 명시적 비움 → 매수 차단
+    - 장전(<855) 부팅: watchlist 비움. 장중(>=855) 재시작: 기존 유지.
+    - PREOPEN이 양쪽 모드에서 watchlist 덮어씀 (45개→5개 축소가 의도된 동작)
+    - _reload_watchlist: 빈 watchlist도 eng.watch에 반영 (if new_watch: 가드 제거)
+
+④ _held_symbols_from_ledger 제거 (ws_capture_live.py)
+  ledger CSV에서 BUY/SELL 누적 계산 → 과거 잔재(삼전 등) 좀비 구독.
+  engine.pos (메모리 실제 포지션, JSON에서 복원) 직접 참조로 대체.
+
+⑤ CMD 정리
+  run_real_auto_new.cmd 삭제, 하나로 통합.
+  ENTRY_MODE=theme, THEME_TOP_N=45. PAPER_TRADE=1.
+
+⑥ dailyanalysis 스킬 축소 (11단계→6단계)
+  제거: 승패구분지표, 시뮬레이션, 파라미터영향, 그리드시뮬, 되돌림패턴.
+  유지: 데이터수집, 전종목성과표, 거래상세, 놓친기회, 동시호가whitelist검증, fast_path백엔드.
+
+⑦ fetch_preopen_rank 신규 구현 (scanner_company_rank.py)
+  ENTRY_MODE=fastpath일 때 장전(~09:00) 후보 풀 확보용.
+  원래 프리오픈 전용 API 호출이 구현 안 되어 있었음 → 신규 추가.
+  - 시간외등락율순위 API (FHPST02340000, SCR=20234): 필수 파라미터 xlsx 문서 기준 구현
+  - 예상체결 상승상위 API (FHPST01820000, SCR=20182): fid_mkop_cls_code=0(장전예상) 등
+  - rt_cd!=0 시 에러 로깅 추가 (기존: 빈 결과를 정상으로 처리하는 무음 실패)
+
+패착 기록:
+  - 테마 chg_3d fallback 코드 추가했지만 프로세스 미재시작 → 장전 0개
+  - 프리오픈 스캐너(시간외등락율+예상체결 API)가 원래 구현 안 되어 있었음.
+    build_watchlist_rank()는 거래량/체결강도(장중 전용)만 호출 → 장전엔 항상 0개.
+    fetch_preopen_rank 신규 구현으로 해결.
+  - _held_symbols_from_ledger가 과거 잔재(010170)를 WS 구독 포함 → 스캐너 실패임에도 매수 발생
+
+================================================================================
+0327 — whitelist 무조건 진입 + preopen 스코어링 ba 강화
+================================================================================
+
+배경: 3/27 페이퍼 실전에서 quality 1위 046970(ba=62.5, 예산34%)이
+  pvol=0.00(KIS API 계산오류)으로 진입 실패 → 상한가(+20.25%) 놓침.
+  동시호가에서 충분히 검증된 whitelist 종목이 장중 게이트에 걸리는 건 불합리.
+
+① whitelist 종목 품질 게이트 전면 면제 (morning_fastpath.py)
+  면제: pvol_rate, dayrise_min, gap_filter, ntby_filter, tick_rise
+  유지: min_ticks=2(가격 데이터 최소), cooldown 30s, loss_streak, session_entries
+  → 동시호가 quality가 종목을 고르면, 2틱째에 바로 진입
+
+② preopen whitelist 스코어링 ba 가중치 상향 (engine_simple.py)
+  ba_ratio: min(20, ba×2) → min(30, ba×2.5)
+  시너지 문턱: ba≥8 → ba≥5
+  검증: 3/26 115440(ba=8.68) quality 1위 → 시가후 +17.6% 최고수익
+
+③ fast_path score_stub ba 보정 (morning_fastpath.py)
+  ba≥5.0이면 base 최소 170 보장 (gap_discount 음수여도)
+  과열 페널티(gap_dc<-2%) ba≥5이면 면제
+  ba 보너스 구간 추가: ba≥5.0→+20 (기존 ba≥3.0→+15가 최대)
+  디버그 표시 로직도 동일 동기화
+
+3/27 실전 결과 (페이퍼):
+  4건 매매, 승률 50%, 총손익 +8,440원
+  033790: +4.83% (trail+SL, 최대+16.6%→청산조기)
+  032500: 보유중 +3.2%
+  115440: -3.54% (SL, 전일급등 후 피로)
+  042370: 보유중 -1.7% (score=135 약한 진입)
+
+================================================================================
+0330 — 매도최적화 + limit_up_tp + 테마스캐너 강화
+================================================================================
+
+배경: 3/30 실전 +50,620원(계좌 5%+). 매도 정확도/슬리피지 개선 요청.
+  종목선택/파라미터는 현행 유지, 실행 품질만 깎기.
+
+① limit_up_tp — 상한가 근접 전량매도 (engine_simple.py)
+  LIMIT_UP_TP_PCT=27.0 (기준가 +27% 도달 시 전량매도)
+  매수가 기반이 아닌 기준가(=상한가/1.30) 기반 트리거
+  Position에 upper_limit 필드 추가, H0STCNT0 STCK_HGPR에서 수신
+  split 무관 전량매도 (A/B 분할 전에 체크)
+
+② 갭 체크 정확도 개선 (engine_simple.py on_preopen_tick)
+  prev_close.json 의존 제거 → KIS PRDY_VRSS + PRDY_VRSS_SIGN으로 기준가 역산
+  prev_close.json은 fallback만 담당
+
+③ SELL fill_price 추출 (engine_simple.py)
+  BUY에만 있던 실체결가 추출(avg_prvs/ccld_unpr)을 SELL(전량+분할)에도 적용
+  _extract_fill_price() 헬퍼로 BUY/SELL 공통화
+  SELL_FILL_PRICE 로그로 tick vs fill 차이 모니터링
+  daily_realized_pnl, 수수료, 알림 모두 fill_price 기준
+  EOD _reconcile_ledger_with_fills는 기존대로 최종 보정
+
+④ quote_multi NaN 방어 (quote_multi.py _get_first)
+  KIS API에서 "NaN" 문자열 반환 시 math.isfinite() 체크로 필터링
+  score=NaN 전파 방지
+
+⑤ 테마 스캐너 강화 (scanner_theme.py + engine_simple.py)
+  theme_snapshot.json 저장 (8:45~9:15 1회, data/logs/{date}/)
+  PREOPEN_DROP 로그 — signal_diag에 탈락 종목+사유(gap/ba) 기록
+  dailyanalysis 스킬 ENTRY_MODE 판별(theme/fastpath) 지원
+  046970: 미진입(pvol=0) → 상한가 +20.25% 놓침 ← 이번 패치로 해결
+
+================================================================================
+0331 — 테마 스코어링 강화 + PREOPEN 시장분위기 감지 + 의존관계 맵
+================================================================================
+
+배경: 3/31 실전 -27,511원. 약세장에 풀투입 → 5종목 전원 SL.
+  종목선택 적중률 60%(3/5 최대수익>1.5%)였지만 장 전체가 약세라 전부 하락.
+
+① 테마 스캐너 6축 스코어링 (scanner_theme.py)
+  기존: score = freq × avg_theme_chg (1축)
+  변경: 6축 독립 스코어링
+    - 테마 교차 빈도: 0~30pt
+    - 테마 상승률: 0~20pt
+    - 테마 컨빅션 (up/(up+down)): 0~25pt
+    - 전일등락률: -10~15pt — 과열 감점 없음 (45풀 단계, preopen이 최종 필터)
+    - 전일 거래대금: 0~10pt (log 스케일)
+    - KIS 거래량 부스트: 0 or +15pt — 테마+거래량 상위 교차 종목
+  환경변수: THEME_VOL_BOOST (기본 15)
+
+② 전일 데이터 캐시 (scanner_theme.py)
+  장전 8:45 크롤링 시 chg_pct/tr_value/up_down이 0인 문제 해결
+  - 장 마감 후 전체 120테마 구성종목 크롤링 → data/theme_prev_cache.json
+  - 장전 0-데이터 감지 시 캐시에서 fallback
+  트리거: main_real 15:30 자동 + daily_compact 수동
+
+③ 스캐너 score → preopen quality 합산 (engine_simple.py)
+  scanner_theme.get_last_scores() → preopen quality에 ×0.3 합산
+  환경변수: PREOPEN_SCANNER_WEIGHT (기본 0.3)
+
+④ 전일 거래대금 하드게이트 (engine_simple.py _rebuild_preopen_whitelist)
+  캐시 기반 전일 거래대금 < 30억 → preopen 탈락 (캐시 없어도 탈락)
+  환경변수: PREOPEN_TR_MIN (기본 3e9)
+
+⑤ 통과 종목 비례 투입 (engine_simple.py)
+  통과 5종목=100%, 3종목=60%, 2종목=40%, 1종목=20%
+  mood와 곱연산 → 이중 안전장치 (약세장 2종목 통과 = 자본의 27%만 투입)
+
+⑥ PREOPEN 시장분위기 감지 (engine_simple.py)
+  동시호가 pool 통과율 기반 mood (0.5~1.0)
+  검증: 3/31 rate=0.27 → mood=0.67
+
+⑦ daily_loss_limit 비활성화
+  기본값 3.0% → 100.0%. 9시 동시 5종목 진입이라 의미 없음
+
+⑧ 의존관계 맵 (memory/reference_codebase_map.md)
+  흐름별 "X 고치면 Y도 확인" 체크리스트
+
+================================================================================
+0401 — Surge-trigger 진입 구조 전환
+================================================================================
+
+배경: 4/1 실전 분석 — 테마 선정 종목 평균 -2.7%, midday_expand(거래량) 종목 평균 +6.9%.
+  "예측 기반 즉시매수" → "확인 기반 순차매수"로 전환.
+  과거 ws_dump 7일 분석: 10초/2% surge 조합이 최적 (승률 55%, 3분 +0.59%).
+
+① Surge-trigger 진입 (morning_fastpath.py 전면 개편)
+  기존: 9:00 whitelist 5종목 즉시매수
+  변경: 20종목 관찰 → 10초간 2% 급등 감지 → 즉시매수
+  - 롤링 윈도우: deque per sym, N초 전 가격 대비 변화율 계산
+  - 기존 필터(pvol, dayrise, gap, ntby, tick_rise) 제거 → surge 감지가 유일한 트리거
+  - score는 로깅용으로만 사용 (surge 크기 + ba 보너스)
+  환경변수: SURGE_WINDOW_SEC(10), SURGE_THRESHOLD_PCT(2.0)
+
+② 후보 풀 확대 (engine_simple.py + run_real_auto.cmd)
+  PREOPEN_WHITELIST_N: 5 → 20
+  20종목 × 2필드 = 40슬롯 (WS 50슬롯 제한 내)
+  preopen quality 스코어링은 동일 (상위 20개 선별)
+
+③ 균등 20% 배분 (engine_simple.py)
+  기존: score 기반 가변 배분 (7~25%) + mood/pass_ratio 스케일링
+  변경: 총자본의 20% 균등 (SURGE_ALLOC_PCT=0.20)
+  mood/pass_ratio 스케일링 제거
+
+④ 종목당 최대 2회 매수 (morning_fastpath.py)
+  _sym_entries 카운터 추가, SURGE_MAX_ENTRIES_PER_SYM=2
+  매도 후 재진입 허용 (pos에서 제거되면 다시 매수 가능)
+
+⑤ 진입 데드라인 확대
+  기존: 9:20 (FAST_PATH_END_HHMM=920)
+  변경: 12:00 (FAST_PATH_END_HHMM=1200)
+  TRADING_END_HHMM도 1200으로 동기화
+
+⑥ 일일 손실 한도 재활성화
+  기본: 100% (비활성)
+  변경: 3.5% (DAILY_LOSS_LIMIT_PCT=3.5)
+  최대 10거래(5회×2) 가능하므로 손실 누적 방지 필수
+
+================================================================================
+0404 — Dip-accumulation v3 전환 + 전일캐시 무결성
+================================================================================
+
+배경: 0401 surge-trigger(10초/2%급등) → dip-accumulation(눌림목+매수잔량) 전환.
+  급등 추격보다 눌림에서 잡는 전략. 종일 감시(~15:20).
+
+① Dip-accumulation 트리거 (morning_fastpath.py 전면 개편)
+  기존: 10초간 2% 급등 감지 → 매수
+  변경: 눌림목 + 매수잔량 축적 감지 → 매수
+  - 가격 링버퍼(_price_buf) + 호가 링버퍼(_bid_buf) 추가
+  - 호가: BIDP_RSQN1~3(매수1~3호가 잔량) + TOTAL_BIDP_RSQN(총매수잔량)
+  - 트리거 조건 (OR):
+    A) Deep dip: 10초간 가격 -0.30% 이하 (단독)
+    B) Dip+Bid: 10초간 가격 -0.10% 이하 + 총매수잔량 +8% 이상
+  환경변수: DIP_DEEP_PCT(-0.30), DIP_MOD_PCT(-0.10), DIP_BID_GROWTH_MIN(8.0)
+
+② 종일 감시 (run_real_auto.cmd)
+  FAST_PATH_END_HHMM: 1200 → 1520
+  TRADING_END_HHMM: 1200 → 1520 (동기화 필수 — on_trade가 먼저 막으면 fast_path 도달 불가)
+  SURGE_THRESHOLD_PCT 제거 (v3에서 미사용)
+
+③ 테마 스캐너 6축 스코어링 (scanner_theme.py)
+  기존: 빈도 × 평균테마상승률
+  변경: 6축 합산 (만점 115pt)
+    1. 테마 교차 빈도 (0~30pt) — freq×8-3
+    2. 테마 평균 상승률 (0~20pt) — avg_chg×3.0
+    3. 테마 컨빅션 (0~25pt) — 소속 테마 상승종목 비율
+    4. 전일 등락률 (-10~15pt) — 모멘텀 가점/약세 감점
+    5. 전일 거래대금 (0~10pt) — log10 스케일
+    6. KIS 거래량 상위 부스트 (0 or +15pt) — KIS 거래량 순위 교차
+
+④ 전일 캐시 무결성 (scanner_theme.py)
+  기존: 장전 0-데이터 감지 시에만 캐시 적용 (조건부)
+  변경: 무조건 캐시 로드 → 0인 필드만 전일 값으로 채움
+  캐시 없으면 즉석 크롤링 후 저장 (단, 장전엔 0 데이터 → daily_compact/EOD 갱신에 의존)
+  저장 시점: build_watchlist_theme() 장중 실행 시 + main_real.py EOD 15:30 + daily_compact
+
+⑤ 프리오픈 하드게이트 강화 (engine_simple._rebuild_preopen_whitelist)
+  추가: 전일 거래대금 < 30억 탈락 (PREOPEN_TR_MIN=3e9, 캐시 기반)
+  추가: 스캐너 스코어 합산 (PREOPEN_SCANNER_WEIGHT=0.3)
+  추가: 시장 MOOD — 동시호가 통과율 기반 배분 축소 (0.5~1.0)
+
+⑥ 엔진 개선 (engine_simple.py)
+  - 상한가 근접 전량 TP: LIMIT_UP_TP_PCT=27% (기준가 대비 +27% 도달 시)
+  - SELL fill_price: _extract_fill_price() 공통 함수화 (BUY/SELL/split_a_trail)
+  - 갭체크 PRDY_VRSS 역산: prev_close.json 의존 제거
+  - 일일 손실 한도: 3.0% → 3.5%
+
+⑦ 테마 스냅샷 저장 (scanner_theme.py)
+  장전 8:45~9:15에 하루 1회 data/logs/{date}/theme_snapshot.json 저장
+  선별 과정 디버그용 (전체 스코어, 테마 매핑, 탈락 사유)
+
+================================================================================
+0406 — v3 dip-accum 폐기 → v4 테마∩랭크 즉시매수
+================================================================================
+
+4/6 실전: 0건 거래 — 종일 먹통
+
+① 버그: scanner_theme.py _is_premarket_zeros NameError
+  0404 캐시 무조건적용 작업 시 함수 정의 삭제했으나 559줄 호출 잔존
+  → 8:45~8:54 매 스캔 44회 NameError → 종목 0개 → watchlist 비움
+  → H0STANC0 구독 0개 → PREOPEN whitelist 0개 → fast_path 종일 거부
+  수정: 559줄 조건문 제거 (무조건 save_prev_day_cache 호출)
+
+② v3 dip-accumulation 폐기 판정
+  4/6 MIDDAY_EXPAND 20종목 데이터로 시뮬레이션 실시:
+  - 트리거 18,075건 / 20종목 (deep=8,032 + dip+bid=10,043)
+  - 60초 후 양수 확률: deep 48%, dip+bid 41% → 예측력 0 (동전 던지기)
+  - 실전 시뮬 5건 진입: 승률 1/5, 총 -42,118원 (-2.11%)
+  - deep -0.30%는 급등주에서 정상 변동폭, 시그널이 아닌 노이즈
+  결론: 파라미터 조정으로 해결 불가, 전략 자체가 무효
+
+③ v4 전략: 테마 ∩ 랭크(거래량) 교집합 즉시매수
+
+  [main_real.py] _run_active_scan() 전면 변경
+    기존: ENTRY_MODE에 따라 한쪽만 실행 + shadow
+    변경: 테마 + 랭크 양쪽 실행 → 교집합 반환
+    테마 순서 유지, 교집합 비면 0종목 (매수 안 함)
+    양쪽 전체를 shadow 파일에 기록 (비교용)
+    _run_shadow_scan() 별도 호출 제거
+
+  [morning_fastpath.py] v4 즉시매수
+    dip_accum 감지 블록 제거 (7번 게이트)
+    whitelist 종목 첫 체결 시 바로 매수 (시그널 대기 없음)
+    종목당 1회, 세션 최대 5건
+
+  [run_real_auto.cmd] 파라미터 정리
+    TRADING_END_HHMM: 1520 → 910 (9시 직후 즉시매수)
+    FAST_PATH_END_HHMM: 1520 → 910
+    SURGE_MAX_ENTRIES_PER_SYM: 2 → 1
+    DIP_DEEP_PCT, DIP_MOD_PCT, DIP_BID_GROWTH_MIN 제거
+
+  교집합 근거:
+    테마 = 모멘텀 (네이버 테마 상승률)
+    랭크 = 유동성 (전일 거래대금/등락률)
+    겹침 = 테마 타면서 실제 거래도 되는 종목
+    과거 4일 교집합: 1, 2, 3, 12개 (평균 4.5개)
+
+흐름:
+  8:45 테마 45종목 + 랭크 스캔 → 교집합 → watchlist
+  8:50 H0STANC0 구독 (교집합 종목)
+  8:59 PREOPEN whitelist 확정
+  9:00 첫 체결 → 즉시매수 (종목당 1회, 최대 5건)
+  9:10 진입 마감
+  ~15:19 매도 관리 (trail/SL/TP/강제청산)

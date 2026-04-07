@@ -31,7 +31,7 @@ def check_ledger(path: str) -> Dict[str, object]:
     hints: List[str] = []
     by_symbol = defaultdict(int)
     open_ts: Dict[str, float] = {}
-    buy_ts: Dict[str, float] = {}
+    buy_ts: Dict[str, List[float]] = {}  # NEW-006: 큐 방식으로 동일 종목 2회 거래 hold_sec 정확도 개선
     buys = sells = 0
     full_sells = 0
     stop_loss_sells = 0
@@ -67,7 +67,8 @@ def check_ledger(path: str) -> Dict[str, object]:
                 by_symbol[sym] += qty
                 if by_symbol[sym] > 0 and sym not in open_ts:
                     open_ts[sym] = ts
-                buy_ts[sym] = ts
+                # NEW-006: 큐에 추가해 동일 종목 2회 거래 시 각각의 hold_sec 정확 계산
+                buy_ts.setdefault(sym, []).append(ts)
             else:
                 reason = row.get("reason", "")
                 if "partial_take" in reason:
@@ -77,8 +78,12 @@ def check_ledger(path: str) -> Dict[str, object]:
                     full_sells += 1
                     if "stop_loss" in reason:
                         stop_loss_sells += 1
-                if sym in buy_ts and ts > buy_ts[sym] and "partial_take" not in reason:
-                    hold_secs.append(ts - buy_ts[sym])
+                # NEW-006: 큐에서 FIFO로 참조 타임스탬프 추출
+                if "partial_take" not in reason:
+                    q = buy_ts.get(sym, [])
+                    ref_ts = q.pop(0) if q else None
+                    if ref_ts is not None and ts > ref_ts:
+                        hold_secs.append(ts - ref_ts)
                 by_symbol[sym] -= qty
                 if by_symbol[sym] <= 0:
                     open_ts.pop(sym, None)
@@ -94,7 +99,9 @@ def check_ledger(path: str) -> Dict[str, object]:
         else:
             open_age_sec[s] = -1.0  # sentinel: buy timestamp missing
     max_open_age_sec = max(open_age_sec.values(), default=0.0)
-    max_expect_open_sec = float(os.getenv("MAX_EXPECT_OPEN_SEC", "1200"))
+    # BUG-044: MAX_EXPECT_OPEN_SEC 기본값을 MAX_HOLD_SEC * 1.5로 동기화 (기존 하드코딩 1200 제거)
+    max_hold_sec = float(os.getenv("MAX_HOLD_SEC", "600"))
+    max_expect_open_sec = float(os.getenv("MAX_EXPECT_OPEN_SEC", str(max_hold_sec * 1.5)))
     if max_open_age_sec > max_expect_open_sec:
         issues.append(f"open position age exceeds threshold: {max_open_age_sec:.0f}s > {max_expect_open_sec:.0f}s")
 

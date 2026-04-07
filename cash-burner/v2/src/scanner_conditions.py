@@ -24,18 +24,25 @@ def run_condition(seq: str) -> List[str]:
     if USER_ID:
         params["user_id"] = USER_ID
     j = request("GET", PATH_RUN, TRID_RUN, params=params)
-    # when no results, KIS may return rt_cd=1; treat as empty
+    # BUG-041: output2/output1 통합 순회, 중복 루프 제거
     out = []
-    for item in (j.get("output2") or j.get("output1") or []):
-        for k in ("code", "stnd_iscd", "pdno", "mkSC_SHRN_ISCD", "MKSC_SHRN_ISCD"):
-            if k in item and item[k]:
-                out.append(str(item[k]).zfill(6))
-                break
-    # some docs use output2 as list of codes under "code"
-    if not out:
-        for item in (j.get("output2") or []):
-            if isinstance(item, dict):
-                for k,v in item.items():
+    sources = []
+    if j.get("output2"):
+        sources.append(j["output2"])
+    if j.get("output1"):
+        sources.append(j["output1"])
+    for src in sources:
+        for item in (src if isinstance(src, list) else [src]):
+            if not isinstance(item, dict):
+                continue
+            matched = False
+            for k in ("code", "stnd_iscd", "pdno", "mkSC_SHRN_ISCD", "MKSC_SHRN_ISCD"):
+                if k in item and item[k]:
+                    out.append(str(item[k]).zfill(6))
+                    matched = True
+                    break
+            if not matched:
+                for k, v in item.items():
                     if "code" in k.lower() and v:
                         out.append(str(v).zfill(6))
     return sorted(set(out))

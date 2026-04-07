@@ -1,6 +1,7 @@
 # src/kis_orders.py
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Tuple
 from kis_http import request, split_account, ACC_NO
 
@@ -111,7 +112,7 @@ def _pick_first(rows: list[Dict[str, Any]], keys: tuple[str, ...]) -> float | No
 
 
 def account_cash_snapshot() -> Dict[str, float]:
-    """계좌 기준 현금 관련 스냅샷 반환(로그/진단용)."""
+    """계좌 주문가능현금(ord_psbl_cash) 조회."""
     cano, prdt = split_account(ACC_NO)
     params = {
         "CANO": cano,
@@ -133,27 +134,13 @@ def account_cash_snapshot() -> Dict[str, float]:
             f"account_cash_parse_error: missing output2/output(dict), top_keys={sorted(j.keys())[:12]}"
         )
 
-    dep = _pick_first(rows, ("dnca_tot_amt", "DNCA_TOT_AMT"))
-    withdrawable = _pick_first(rows, (
-        "wdrw_psbl_amt", "WDRW_PSBL_AMT", "frcr_wdrw_psbl_amt", "FRCR_WDRW_PSBL_AMT"
-    ))
-    orderable = _pick_first(rows, (
-        "ord_psbl_cash", "ORD_PSBL_CASH", "ord_psbl_amt", "ORD_PSBL_AMT"
-    ))
-    d2_dep = _pick_first(rows, (
-        "prvs_rcdl_excc_amt", "PRVS_RCDL_EXCC_AMT", "nxdy_excc_amt", "NXDY_EXCC_AMT"
-    ))
-
-    out: Dict[str, float] = {}
-    if dep is not None:
-        out["deposit"] = dep
-    if withdrawable is not None:
-        out["withdrawable"] = withdrawable
-    if orderable is not None:
-        out["orderable"] = orderable
-    if d2_dep is not None:
-        out["d2_deposit"] = d2_dep
-    return out
+    orderable = _pick_first(rows, ("ord_psbl_cash", "ORD_PSBL_CASH"))
+    if orderable is None:
+        raise ValueError(
+            f"account_cash_parse_error: ord_psbl_cash not found, "
+            f"keys={sorted({k for r in rows for k in r.keys()})[:20]}"
+        )
+    return {"orderable": orderable}
 
 
 def _extract_account_cash_from_balance(payload: Dict[str, Any]) -> float:
@@ -205,8 +192,9 @@ def buyable_cash(symbol: str, ord_dvsn: str="01", price: str="0") -> float:
         "PDNO": symbol,
         "ORD_DVSN": ord_dvsn,
         "ORD_UNPR": str(price),
-        # KIS 문서 필수 파라미터. 누락 시 rt_cd/msg만 오고 output이 비는 케이스가 발생한다.
-        "CMA_EVLU_AMT_ICLD_YN": "Y",
+        # BUG-008: CMA 잔고 포함("Y")은 실제 주문가능금액보다 과다 산정됨 → "N"이 안전.
+        # CMA_EVLU_AMT_ICLD_YN env var로 재정의 가능.
+        "CMA_EVLU_AMT_ICLD_YN": os.getenv("KIS_CMA_EVLU_AMT_ICLD_YN", "N"),
         "OVRS_ICLD_YN": "N",
     }
     j = request("GET", PATH_BUYABLE, TRID_BUYABLE, params=params)
@@ -219,10 +207,24 @@ def buyable_cash(symbol: str, ord_dvsn: str="01", price: str="0") -> float:
         raise ValueError(f"{e}; rt_cd={rt_cd}; msg_cd={msg_cd}; msg={msg1[:160]}")
 
 
-def sellable_qty(symbol: str) -> int:
+def sellable_qty(symbol: str, ord_dvsn: str = "01", ord_unpr: str = "0") -> int:
+    # BUG-007: KIS TTTC8408R 필수 파라미터 추가 (ORD_DVSN, ORD_UNPR 누락 시 rt_cd="0" 이어도 output이 비어옴)
     cano, prdt = split_account(ACC_NO)
-    params = {"CANO": cano, "ACNT_PRDT_CD": prdt, "PDNO": symbol}
+    params = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": prdt,
+        "PDNO": symbol,
+        "ORD_DVSN": ord_dvsn,
+        "ORD_UNPR": str(ord_unpr),
+        "OVRS_EXCG_CD": "",
+        "TR_CRCY_CD": "",
+    }
     j = request("GET", PATH_SELLABLE, TRID_SELLABLE, params=params)
+    # BUG-007: rt_cd != "0" 이면 예외를 던져서 호출측이 결과를 신뢰하지 않도록 함
+    rt_cd = str(j.get("rt_cd", ""))
+    if rt_cd != "0":
+        msg1 = str(j.get("msg1", j.get("msg", "")))
+        raise ValueError(f"sellable_qty API error: rt_cd={rt_cd} msg={msg1[:160]}")
     out = j.get("output", {}) or j.get("output1", {}) or {}
     for k in ("ord_psbl_qty", "ORD_PSBL_QTY", "sell_psbl_qty"):
         n = _to_float(out.get(k))
@@ -232,7 +234,69 @@ def sellable_qty(symbol: str) -> int:
 
 
 
+def inquire_holdings() -> list[dict]:
+    """TTTC8434R 잔고조회 → output1 보유종목 리스트 반환"""
+    cano, prdt = split_account(ACC_NO)
+    params = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": prdt,
+        "AFHR_FLPR_YN": "N",
+        "OFL_YN": "",
+        "INQR_DVSN": "02",
+        "UNPR_DVSN": "01",
+        "FUND_STTL_ICLD_YN": "Y",
+        "FNCG_AMT_AUTO_RDPT_YN": "N",
+        "PRCS_DVSN": "00",
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": "",
+    }
+    j = request("GET", PATH_BALANCE, TRID_BALANCE, params=params)
+    if j.get("rt_cd") != "0":
+        raise RuntimeError(f"inquire_holdings failed rt_cd={j.get('rt_cd')} msg={j.get('msg1','')}")
+    output1 = j.get("output1") or []
+    if isinstance(output1, dict):
+        output1 = [output1]
+    return [row for row in output1 if isinstance(row, dict)]
+
+
+def inquire_daily_ccld(start_date: str = "", end_date: str = "") -> list[dict]:
+    """TTTC8001R 주식일별주문체결조회 — 당일 체결 내역 조회.
+    Returns list of dicts with keys: pdno, sll_buy_dvsn_cd, tot_ccld_qty, avg_prvs, ...
+    """
+    import time as _time
+    cano, prdt = split_account(ACC_NO)
+    today = _time.strftime("%Y%m%d")
+    if not start_date:
+        start_date = today
+    if not end_date:
+        end_date = today
+    params = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": prdt,
+        "INQR_STRT_DT": start_date,
+        "INQR_END_DT": end_date,
+        "SLL_BUY_DVSN_CD": "00",  # 00=전체, 01=매도, 02=매수
+        "INQR_DVSN": "00",        # 00=역순
+        "PDNO": "",
+        "CCLD_DVSN": "01",        # 01=체결만
+        "ORD_GNO_BRNO": "",
+        "ODNO": "",
+        "INQR_DVSN_3": "00",
+        "INQR_DVSN_1": "",
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": "",
+    }
+    j = request("GET", "/uapi/domestic-stock/v1/trading/inquire-daily-ccld", "TTTC8001R", params=params)
+    if j.get("rt_cd") != "0":
+        raise RuntimeError(f"inquire_daily_ccld failed rt_cd={j.get('rt_cd')} msg={j.get('msg1','')}")
+    output1 = j.get("output1") or []
+    if isinstance(output1, dict):
+        output1 = [output1]
+    return [row for row in output1 if isinstance(row, dict)]
+
+
 def order_cash(side: str, symbol: str, qty: int, ord_dvsn: str="01", ord_unpr: str="0") -> Dict[str,Any]:
+    # BUG-005: ord_dvsn "00"=지정가, "01"=시장가(기본). 호출부에서 반드시 명시적으로 전달할 것.
     cano, prdt = split_account(ACC_NO)
     tr_id = TRID_BUY if side.upper()=="BUY" else TRID_SELL
     body = {

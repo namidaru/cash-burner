@@ -1,3 +1,13 @@
 # Local Python artifacts
 __pycache__/
 *.py[cod]
+
+# 로그/데이터 — 소스 코드만 커밋
+cash-burner/v2/data/logs/
+cash-burner/v2/data/*.log
+cash-burner/v2/data/*.csv
+cash-burner/v2/data/*.json
+cash-burner/v2/data/*.txt
+cash-burner/v2/data/volume_profiles/
+cash-burner/v2/data/ws_dump*.log
+*.log.gz
