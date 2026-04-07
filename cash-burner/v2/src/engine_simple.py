@@ -1920,6 +1920,8 @@ class EngineSimple:
         _ba_min = float(os.getenv("PREOPEN_BA_MIN", "5.0"))
         _tr_min = float(os.getenv("PREOPEN_TR_MIN", "3e9"))  # 전일 거래대금 최소 30억
         dropped: list[str] = []
+        # 교집합 종목(watchlist): 하드게이트 바이패스 — 이미 테마+랭크 이중 검증 통과
+        _intersect = set(self.watch) if self.watch else set()
         for sym, d in self._preopen_data.items():
             if not sym or len(sym) != 6 or not sym.isdigit():
                 continue  # 오염 심볼 제거
@@ -1930,24 +1932,27 @@ class EngineSimple:
             slope = d.get("gap_slope", 0.0)
             pvol_pre = d.get("pvol_rate_pre", 0.0)
             ba_trend = d.get("ba_trend_3min", 1.0)
-            # 갭 마이너스 종목 제외 — 전일 대비 하락 출발은 모멘텀 매매 부적합
-            if gap_pct < 0.3:
-                dropped.append(f"{sym} gap={gap_pct:+.1f}%<0.3")
-                continue
-            # 고갭 종목 제외 — 이미 상한가 근접, 추가 상승 여력 없음
-            if gap_pct > _gap_cap:
-                dropped.append(f"{sym} gap={gap_pct:+.1f}%>{_gap_cap:.0f}")
-                continue
-            # 매수벽 약한 종목 제외 — 거래량/유동성 부족 가능성
-            if ba < _ba_min:
-                dropped.append(f"{sym} ba={ba:.1f}<{_ba_min:.0f}")
-                continue
-            # 전일 거래대금 하드게이트 — 캐시에 없거나 거래대금 부족이면 탈락
-            _tr_v = _prev_cache_stocks.get(sym, {}).get("tr_value", 0)
-            if _prev_cache_stocks:
-                if _tr_v < _tr_min:
-                    dropped.append(f"{sym} tr={_tr_v/1e8:.0f}억<{_tr_min/1e8:.0f}")
+            _is_intersect = sym in _intersect
+            # 교집합 종목은 하드게이트 바이패스 → 스코어링만 수행
+            if not _is_intersect:
+                # 갭 마이너스 종목 제외 — 전일 대비 하락 출발은 모멘텀 매매 부적합
+                if gap_pct < 0.3:
+                    dropped.append(f"{sym} gap={gap_pct:+.1f}%<0.3")
                     continue
+                # 고갭 종목 제외 — 이미 상한가 근접, 추가 상승 여력 없음
+                if gap_pct > _gap_cap:
+                    dropped.append(f"{sym} gap={gap_pct:+.1f}%>{_gap_cap:.0f}")
+                    continue
+                # 매수벽 약한 종목 제외 — 거래량/유동성 부족 가능성
+                if ba < _ba_min:
+                    dropped.append(f"{sym} ba={ba:.1f}<{_ba_min:.0f}")
+                    continue
+                # 전일 거래대금 하드게이트 — 캐시에 없거나 거래대금 부족이면 탈락
+                _tr_v = _prev_cache_stocks.get(sym, {}).get("tr_value", 0)
+                if _prev_cache_stocks:
+                    if _tr_v < _tr_min:
+                        dropped.append(f"{sym} tr={_tr_v/1e8:.0f}억<{_tr_min/1e8:.0f}")
+                        continue
             q = 0.0
             # ── 스캐너 스코어 보너스 — 테마빈도/거래대금/모멘텀 반영 ──
             _ss = _scanner_scores.get(sym, 0.0)
@@ -1980,7 +1985,8 @@ class EngineSimple:
                 q += min(15.0, (gap_pct / 10.0) * (ba / 10.0) * 3.0)
             # pvol_rate_pre: H0STANC0 동시호가에서 항상 0 — 장전이라 전일비교 불가
             # 10점 배정 제거 (유효 데이터만 사용)
-            scored.append((sym, q, f"ba={ba:.1f} ba_trend={ba_trend:.2f} slope={slope:.2f} gap={gap_pct:.1f}% scan={_ss:.0f}*{_scanner_weight}"))
+            _ix_tag = " INTERSECT" if _is_intersect else ""
+            scored.append((sym, q, f"ba={ba:.1f} ba_trend={ba_trend:.2f} slope={slope:.2f} gap={gap_pct:.1f}% scan={_ss:.0f}*{_scanner_weight}{_ix_tag}"))
         scored.sort(key=lambda x: -x[1])
         whitelist_syms = scored[:_whitelist_n]
         budget_syms = scored[:_budget_n]

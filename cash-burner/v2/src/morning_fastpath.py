@@ -257,7 +257,8 @@ class MorningFastPath:
             return False
 
         hhmm = int(time.strftime("%H%M", time.localtime(ts_epoch)))
-        if not (900 <= hhmm < self.end_hhmm()):
+        _start = _env_int("FAST_PATH_START_HHMM", 900)
+        if not (_start <= hhmm < self.end_hhmm()):
             return False
 
         # ── 항상 버퍼 업데이트 (감지 준비) ────────────────────────────────
