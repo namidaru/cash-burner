@@ -1096,3 +1096,86 @@ gate_block 분포:
 
 기록 의의: 2달간 의심했던 가설을 학술 표준 방법으로 명확히 종결.
 손실 작게 유지하면서 검증 완료 — 진짜 비용은 시간이지만 같은 의문 다시 안 함.
+
+================================================================================
+0409 후속 — 수급 데이터 첫 양의 시그널 발견 (단, 14:30 잠정치 한계)
+================================================================================
+
+배경: IC 테스트는 "기술적 가격/거래량 feature"만 죽임. 실제 사람이 쓰는
+"외인/기관 수급 데이터"는 미시험. 한국 retail 통념의 정직한 검증.
+
+① 외인/기관 데이터 수집 (test/fetch_investor_history.py)
+  KIS FHKST01010900 (inquire-investor) → 종목당 30일 한계
+  data/investor_cache.json: 592 syms × 30일 (2026.01.29~04.08)
+  필드: frgn_qty, orgn_qty, frgn_tr, orgn_tr, prsn_qty, close
+
+② 수급 IC 테스트 (test/investor_flow_ic.py)
+  25일 × ~592종목 = 14,737 (sym, day) 관측
+  → 일봉/분봉 모든 기술적 feature 통틀어 첫 양의 IC
+
+  feature              IC      t-stat  Q5-Q1 spread
+  frgn_1d_norm        +0.0386  +2.34   +0.330%/day  (★)
+  frgn_streak         +0.0366  +2.61   +0.331%/day  (★)
+  frgn_tr_1d          +0.0332  +1.81   +0.246%/day  (★)
+  orgn_1d_norm        -0.0204  -1.15   -0.062%/day  (음)
+  orgn_3d_norm        -0.0229  -1.38   -0.032%/day  (음)
+  frgn_5d (누적)       +0.0151  +0.98   +0.039%      (노이즈)
+
+  핵심:
+  - 외인 1일 spike → 다음날 진짜 alpha 있음 (marginal)
+  - 기관은 통념과 반대로 음의 IC
+  - 5일 누적은 약함 → 어제 sudden spike만 의미 있음
+
+③ Strategy backtest (test/frgn_strategy_backtest.py)
+  외인 top N → D+1 시가 매수 → D+1 종가 매도
+  → 모든 variant 손실 (-0.2~-3.0%/trade)
+  ← 사실은 25일 시장 자체가 intraday -0.5% 약세였음
+     (alpha vs absolute return 혼동 주의)
+
+④ Alpha 분해 (test/frgn_close_vs_open.py) — 결정적
+  외인 top5 시그널을 3구간으로 분해:
+
+  구간                   top5     baseline   alpha
+  overnight (close→open) +1.105%  +0.558%   +0.547%  ★ 가장 큰 부분
+  intraday  (open→close) -0.189%  -0.504%   +0.316%  ★ 시장 베타 차감 후
+  total     (close→close) +0.914% +0.049%   +0.866%  ★ 비용 후 +0.566%
+
+  진짜 alpha 위치:
+  - overnight (gap up): D close → D+1 open  →  +0.547% / trade
+  - intraday: 시장이 빠지는 날에도 외인 종목은 덜 빠짐 → +0.316%
+  - 합쳐서 +0.866% / trade (비용 차감 후 +0.57%)
+
+  → 일봉/분봉 통틀어 최초의 실현가능 양의 alpha
+  → 12m XS momentum, 122630 buy&hold에 이어 3번째 살아남은 신호
+
+⑤ 실전 적용 한계 (사용자 지적)
+  KIS 잠정치 갱신 시각:
+    외국인 09:30, 11:20, 13:20, 14:30
+    기관계 10:00, 11:20, 13:20, 14:30
+  "약 10분 차이 발생" → 14:30 잠정치 = 14:20까지 데이터
+  정규장 15:30 마감까지 70분 미반영
+  → 14:30 신호 ≠ 종가 신호일 가능성 큼
+  → 검증 없이 잠정치 기반 봇 돌리면 alpha 사라질 위험
+
+⑥ 검증 다음 단계 (미실행)
+  - 14:30 잠정치 ↔ 익일 확정치 비교 (며칠 누적 필요)
+  - 14:30 top5 ↔ 종가 top5 일치율 측정
+  - 일치율 80%+ → 14:30 사용 가능
+  - 일치율 50% 이하 → 다른 source 필요 (실시간 외인 ws, 프로그램매매 등)
+
+⑦ 새 백테스트 파일
+  test/fetch_investor_history.py — 외인/기관 데이터 수집기
+  test/investor_flow_ic.py — 수급 IC
+  test/frgn_strategy_backtest.py — top N 매수 strategy
+  test/frgn_close_vs_open.py — alpha를 overnight/intraday로 분해
+
+⑧ 살아남은 alpha 정리 (4월 9일 종합)
+  1. 12개월 cross-sectional momentum (sharpe 2.6, 월간 trade)
+  2. 122630 KODEX 레버리지 buy&hold (sharpe 1.65)
+  3. 외인 1일 spike → 다음날 (alpha +0.87%, 단 14:30 잠정치 한계 미해결)
+
+  통계적 사형 (재시도 금지):
+  - 분봉 momentum/breakout/거래량 추격 (IC -0.13~-0.16)
+  - 강세마감 추격 (IC -0.05)
+  - 단기 모든 가격 feature
+  - 기관 매수 추격 (IC 0 또는 음)
