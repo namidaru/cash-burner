@@ -1008,3 +1008,91 @@ gate_block 분포:
   strong_close_verify.py — survivorship 검증
   extend_cache_3y.py — 3년 데이터 수집
   leverage_regime_backtest.py — KOSPI MA regime → 122630
+
+================================================================================
+0409 — 통계적 사망선고: 분봉 추격 가설 IC 검증으로 기각
+================================================================================
+
+배경: 2달간 fast_path bot의 핵심 가설 = "분봉에서 오르는 종목 실시간 감지해서 추격".
+이 가설을 학계 표준 방법(Information Coefficient)으로 정직하게 시험.
+
+① 일봉 IC 테스트 (test/information_coefficient.py)
+  342일 × ~350종목 = 약 12만 (sym, day) cross-section
+  15개 일봉 feature × 3개 forward target
+
+  단기 feature 결과 (전부 노이즈 또는 음의 IC):
+    ret_1d        IC=-0.0297  (mean reversion)
+    ret_5d        IC=-0.0235  (mean reversion)
+    close_pos     IC=-0.0475  (강세마감 → 다음날 -0.21%/day 손해)
+    rng_pct       IC=-0.0588  (high vol → 다음날 손해, low-vol anomaly)
+    vol_ratio     IC=+0.0015  (노이즈)
+    tr_ratio      IC=+0.0017  (노이즈)
+    gap           IC=-0.005   (노이즈)
+
+  장기 feature:
+    ret_12m       IC=+0.014   t=+2.05  (★ 통계적 유의)
+    Q5-Q1 spread = +0.21%/day → cross-sectional momentum 살아있음
+
+  결론: 단기 selection alpha 없음. 12개월 모멘텀만 미세하게 양.
+
+② Cross-sectional momentum 발견 (test/xs_momentum.py)
+  KOSPI 종목 12-1 momentum, ETF 제외:
+    12m × top10 × hold1m: cagr +108%, mdd -23%, sharpe 1.64
+    12m × top20 × hold3m: cagr +127%, mdd -26%, sharpe 2.64 (BEST)
+    비용 0.5%/월 차감 후: cagr +97%, sharpe 1.53
+  → 122630 buy&hold(sharpe 1.65)를 처음으로 risk-adjusted로 이긴 전략
+  → 단 sample 작음 (14~16 monthly observations)
+
+③ 분봉 IC 테스트 (test/intraday_ic.py) — 결정적
+  data/volume_profiles 1분봉, 29일 × ~592종목
+  6,488 (date, minute) cross-section, 수십만 (sym, minute) 관측치
+  10개 분봉 feature × 3개 forward target (5/15/30분)
+
+  결과 (음의 IC가 우주의 법칙급 통계로 확인):
+    mom5      → fwd5  IC=-0.1454  t=-99.5   spread=-0.148%
+    mom10     → fwd5  IC=-0.1282  t=-83.8   spread=-0.126%
+    mom30     → fwd5  IC=-0.0926  t=-57.8   spread=-0.083%
+    accel     → fwd5  IC=-0.0868  t=-64.6   spread=-0.090%
+    range_pos → fwd5  IC=-0.1630  t=-171.2  spread=-0.151%  (★ 최강)
+    vwap_dist → fwd5  IC=-0.0621  t=-39.7   spread=-0.064%
+    mom5×vol  → fwd5  IC=-0.1328  t=-91.0   spread=-0.124%
+    vol_spike → fwd5  IC=+0.0282  t=+29.4   spread=+0.038% (살아있지만 cost에 죽음)
+    breakout  → fwd5  IC=+0.0402  t=+51.3   spread=-0.002% (signal 있지만 raw return 0)
+    tr_spike  → fwd5  IC=+0.0166  t=+17.0   spread=+0.020%
+
+④ 결론 — 한국 분봉시장의 진짜 구조
+  - momentum이 아니라 강력한 mean reversion 시장
+  - 직전 5분 강세 종목 = 다음 5분 평균 -0.15% 손해 (t=-99~-171)
+  - "추격" 전략은 통계적으로 +99% 패배 보장
+  - fade(mean reversion)에 alpha 있지만 +0.15%/5min ≤ 비용 0.15~0.3% → break-even
+  - 거래량/돌파/거래대금은 전부 cost에 죽는 noise
+  - 미국시장과 정반대 (US small cap은 intraday momentum 약하게 살아있음)
+  - 추정 원인: 한국 개미 비중 + 빠른 차익실현 문화
+
+⑤ 2달 fast_path bot의 통계적 정체
+  fast_path 진입조건: 강세마감 + 모멘텀 + 거래대금 + 돌파
+  → 위 IC 기준 4개 모두 음 또는 0
+  → 통계적 기댓값 -0.15%/5min × 매매빈도
+  → trail stop으로 작은 손실 견디다 4/8처럼 SL 클러스터로 손절
+  → 운 나빴던 게 아니라 우주의 법칙급 mean reversion에 정확히 역방향 베팅
+  → 2달간 손실 작았던 게 기적
+
+⑥ 살아있는 alpha (전체 9가지 검증 끝에 2개)
+  - 12개월 cross-sectional momentum (월/분기 rebalance) — sharpe 2.0~2.6
+  - 122630 KODEX 레버리지 buy & hold — sharpe 1.65, +622%/3.3y
+  - 그 외 모든 종목선택/타이밍 전략은 통계적 무효 또는 음
+
+⑦ 새 백테스트 파일
+  test/vol_target_leverage.py — 변동성 타겟팅 (raw 1.65 sharpe 안 깨지 못함)
+  test/mean_reversion_kospi.py — RSI2/Z-score (전부 buy&hold보다 낮음)
+  test/xs_momentum.py — 12m momentum (sharpe 2.64 발견)
+  test/information_coefficient.py — 일봉 IC
+  test/intraday_ic.py — 분봉 IC (가장 결정적)
+
+⑧ 다음 결정 (미정)
+  A. 12m momentum 월간 rebalance 시스템 (가장 검증된 alpha)
+  B. 122630 단순 holding (단순/검증/sharpe 1.65)
+  C. 봇 접기
+
+기록 의의: 2달간 의심했던 가설을 학술 표준 방법으로 명확히 종결.
+손실 작게 유지하면서 검증 완료 — 진짜 비용은 시간이지만 같은 의문 다시 안 함.
