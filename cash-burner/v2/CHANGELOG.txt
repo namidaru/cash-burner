@@ -948,3 +948,63 @@ gate_block 분포:
   9:02 fast_path 매수 개시 (종목당 1회, 최대 5건)
   9:10 진입 마감
   ~15:19 매도 관리
+
+================================================================================
+0408~0409 — 전략 재검증 백테스트 7종 + 3년 데이터 수집
+================================================================================
+
+배경: 4/8 미친불장에서도 5종목 전부 SL → 종목선택/타이밍 전략 자체에 의문.
+"진짜 edge가 있는가"를 6시간 backtest 마라톤으로 검증.
+
+① 검증한 전략 7종 (전부 실패)
+  1. v4 fast_path 즉시매수: 4/8 실전 전패 + 백테스트 -27.78%
+  2. dip 9:30+ (눌림목매수): 4/8 +7.88%, 4/7 -33% → 무작위
+  3. 거래량 추격 (F1 vol×3 breakout): +2.06% (≈0)
+  4. C 잠잠+거래대금 (대형주 swing): +54%지만 65% force exit, top5가 71% 기여
+  5. O4 어제 상승상위 overnight: +1376% but +30% gap (상한가 매수불가, 허수)
+  6. CLEAN overnight (±15% 클리핑): -97% after cost
+  7. strong_close 5d BULL swing: alpha +2.79% — top20 제외시 -1.37% (survivorship)
+
+② 데이터 인프라 구축
+  [test/extend_cache_3y.py] daily_ohlc_cache.json 65일 → 593일 (2023~2026.04)
+  592 syms × 8 windows × KIS FHKST03010100 (~6분)
+  → 처음으로 3.3년 walk-forward 검증 가능
+
+③ Survivorship bias 결정타 (test/strong_close_verify.py)
+  3.3년 1791 trades 재검증:
+    원본: alpha avg +0.67%, total +1202%
+    top20 종목 제외: alpha avg -1.00%, total -1791%
+    top10 outlier 제외시 avg=-0.09%
+  → "선택 edge"는 환상. 122630/000660/005930/069500/233740 같은 대형/레버리지 ETF가
+     우연히 picked 되면서 시장 베타를 긁어온 것
+
+④ 진짜 edge 발견 — 단 하나 (test/leverage_regime_backtest.py)
+  3.3년 593일 buy & hold:
+    122630 KODEX 레버리지: +622%  MDD -41%  (≈ 연 75%)
+    069500 KODEX200:        +223%  MDD -21%
+    252670 인버스2X:        -93%   MDD -94%
+  MA regime 필터 (5/10/20/60, long_only/long_short):
+    전부 buy & hold에 패배. MA5 long_only가 +215%로 가장 나음 (그래도 122630 -407%p)
+    long_short는 인버스2X 감쇠로 전부 음수
+  결론: 3.3년 한국 장기 bull + 2x leverage = 가장 강력한 alpha
+
+⑤ 핵심 인사이트
+  - 종목선택/타이밍 7종 전부 실패. 593일 표본에서도 동일.
+  - 유일하게 돈이 된 것은 "그냥 122630 들고 있기"
+  - 현 fast_path bot 구조는 alpha 없음 (선택 = beta 캡처)
+  - 선택지 3가지 미정:
+      A. 시스템 전면 교체 (122630 적립 + MA60 break protection)
+      B. fast_path 구조 유지하되 대상을 ETF 단일화
+      C. 분봉 2~3년치 받아 intraday edge 재탐색 (기대값 낮음)
+
+⑥ 백테스트 파일 (test/)
+  dip_backtest_20260408.py — 4/8+4/7 dip 검증
+  selection_strategy_backtest.py — 5종 선택규칙 × 29일
+  followup_backtest.py — 거래량 추격
+  strategy_c_breakdown.py — C 잠잠 분해
+  overnight_backtest.py — 갭 전략 (KIS daily chart 첫 활용)
+  overnight_breakdown.py — outlier 분해
+  swing_backtest.py — 7전략 × 6보유 × 3regime
+  strong_close_verify.py — survivorship 검증
+  extend_cache_3y.py — 3년 데이터 수집
+  leverage_regime_backtest.py — KOSPI MA regime → 122630
