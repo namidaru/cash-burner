@@ -1271,3 +1271,91 @@ frgn_close_vs_open.py의 "intraday alpha +0.316%"는 시장 baseline (-0.5%)을 
   - fast_path: 통계적 죽음 (intraday 추격 = mean reversion 반대)
   - 외인 cache 기반 D+1 봇: alpha 환상, MDD 살인
   - 남은 옵션: 월간 momentum 봇 or 122630 그냥 들고 있기
+
+================================================================================
+0409 후속4 — Long-Short 시뮬: alpha는 long이 아니라 SHORT 쪽에 있었다
+================================================================================
+
+가설: cc alpha가 진짜라면 long-short 시장중립으로 잡힐 것
+test/frgn_long_short.py — 외인 norm 상위 K (long) vs 하위 K (short)
+
+[oc (open->close, retail 실전)]
+  top_k    long alone   short_only    L-S spread   L-S sharpe   eq비용후
+  top3     -0.897%      +0.578%       -0.318%      -1.34        75.0
+  top5     -0.189%      +0.927%       +0.738%      +3.00        101.9
+  top10    -0.284%      +1.137%       +0.853%      +3.87        105.8
+  top20    -0.315%      +0.973%       +0.658%      +4.72        101.0
+
+핵심 발견:
+  * 외인 매수 종목 long -> 손실 (sharpe -0.94)
+  * 외인 매도 종목 short -> 강한 alpha (sharpe +3.19)
+  * "외인이 사는 종목이 다음날 오른다" 통념은 틀림
+  * "외인이 파는 종목이 다음날 더 빠진다"가 진짜 신호
+
+cc vs oc 분해:
+  cc long sharpe +3.97  <- overnight gap에 alpha 전부
+  oc long sharpe -0.94  <- 시가 진입 시 alpha 소멸
+  oc short sharpe +3.19 <- 시가에서 short해도 alpha 살아남음 (매도 압력 지속)
+
+-> 정보 누수 방향이 비대칭:
+  매수 정보 = 즉시 시가에 다 반영 (잡을 수 없음)
+  매도 정보 = 시가 후에도 압력 지속 (잡을 수 있음)
+
+문제: 한국 retail 공매도 제약
+  - 대주거래 거의 불가
+  - 직접 short 봇 운영 어려움
+
+활용 후보:
+  1) Negative screen — fast_path 매수 시 "외인 매도 큰 종목" 제외 (다음 검증)
+  2) Inverse ETF (114800) 결합 — sector level 헷지
+  3) "외인 매도 강한 날" 시장 진입 자체 회피
+
+검증할 것:
+  - fast_path universe에서 외인 매도 종목 제외 시 결과 변화
+  - 외인 1일 매도 강도와 다음날 시가-종가 수익률 IC (oc 기준)
+  - 표본 더 필요 (29일 -> 60~90일)
+
+================================================================================
+0409 후속5 — Negative Screen + Market Timing (인버스 ETF 결합)
+================================================================================
+
+사용자 지적: 한국 retail은 short 못 해도 인버스 ETF (114800, 252670 등) long 가능
+        -> 시장 short 효과 retail-feasible
+
+test/negative_screen_test.py:
+  외인 매도 종목 제외 시 baseline -0.47%/day -> -0.35%/day
+  Δ +0.12% (sharpe +0.74) — 약한 개선
+  단 baseline 자체가 음수 (29일 oc 시장 약세) -> 절대 alpha 아님
+
+test/market_timing_frgn.py:
+  외인 시장 전체 net flow -> 다음날 ETF 방향 예측
+  외인 tr_sum vs 069500 다음날 cc 상관: r = +0.374
+  외인 매수일 (5일) -> 069500 +3.46% cc / +0.09% oc
+  외인 매도일 (24일) -> 069500 -0.65% cc / -0.40% oc
+  S1 tr (long122630/long114800 회전):
+    cc sharpe +2.02 (이론치)
+    oc sharpe -0.49 (실전 죽음)
+
+또다시 동일 패턴: 모든 alpha는 cc에 있고 oc로 가면 사라짐
+-> overnight gap이 모든 정보 흡수, 시가 후 retail unrealizable
+
+종합 결론 (반복 확인):
+  "한국 시장 단기 alpha는 D close -> D+1 open gap에 결합되어 있다.
+   시가 후 retail 진입은 expected value 0 이하."
+
+  이건 microstructure 문제. 데이터 source 바꿔도 동일 장벽.
+
+우회 가능 경로 4가지:
+  1) 시간외/예상체결가/동시호가 직접 참여 (정규장 전 진입)
+  2) 월간 horizon (12m XS momentum, sharpe 2.6)
+  3) buy & hold (122630, sharpe 1.65)
+  4) 다른 microstructure (코스닥 종목 분리 — 미시험)
+
+표본 한계:
+  - 외인 매수일 5 vs 매도일 24 (지난 46일 편향)
+  - KIS inquire-investor 30일 cap -> 더 못 모음
+  - 60~90일 데이터 있으면 robust 검증 가능
+
+다음 시험:
+  - 코스닥 종목만 분리한 동일 분석
+  - 시간외 단일가 진입 시뮬 (예상체결가 데이터 필요)
