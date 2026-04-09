@@ -1227,3 +1227,47 @@ gate_block 분포:
   - "오르는 종목 추격" 전면 폐기 (통계적 자살)
   - "외인 매수 + 가격 하락" 종목 찾기로 전환 검토
   - 단, 30일 한계 + 14:30 잠정치 timing 미해결
+
+================================================================================
+0409 후속3 — S9 실전 시뮬레이션 (외인 alpha의 사망진단)
+================================================================================
+
+가설: combined_flow_signals.py에서 cc_alpha +0.93% → 실전(open→close)에서도 잡히나?
+test/s9_strategy_backtest.py — D+1 시가 매수 → D+hold 종가 매도
+
+  변형              n     avg-c     win%   eq     mdd
+  S9 top3 hold1     87   +0.062%   49.4%  91.7   -59%  ← 유일한 +
+  S9 top5 hold1    143   -0.080%   47.6%  72.7   -71%
+  S9 top10 hold1   263   -0.409%   44.5%  24.3   -89%
+  S9 top5 hold2    138   -0.138%   54.3%  51.7   -82%
+  S9 top5 hold3    133   -0.603%   45.9%  22.1   -94%
+  S1 top5 hold1    145   -0.489%   44.8%  36.1   -67%  대조군도 사망
+  S1 top10 hold1   290   -0.584%   45.5%  11.1   -89%
+
+핵심: cc(close→close) +0.93% 중 어디로 갔나?
+  - overnight (D close → D+1 open): +0.55% ← alpha의 71%가 여기
+  - intraday (D+1 open → D+1 close): +0.38%? — 이건 baseline 차감 alpha
+  - 절대 open→close 수익: +0.22% (raw) → -0.08% (비용 후)
+
+frgn_close_vs_open.py의 "intraday alpha +0.316%"는 시장 baseline (-0.5%)을 차감한
+상대 alpha. retail long-only는 baseline을 못 빼낸다.
+   → market-neutral (long+short) 만 가능. 단일 long으론 못 먹음.
+
+추가 잔혹한 사실:
+  - S9 top5 MDD -71%, 거래 불가능
+  - top3도 -59% → 1% 노출만 해도 자본 -1.5% 수준
+  - 47.6% 승률 = coin flip, edge 없음
+  - median -0.07% (분포 중심이 음수)
+
+함의:
+  ★ 외인 spike alpha = 환상이었음 (cc 기준 alpha는 진짜였지만 retail unrealizable)
+  ★ 살아남은 alpha는 이제 2개:
+    1. 12m XS momentum (월간 trade, retail-realizable, sharpe 2.6)
+    2. 122630 KODEX 레버리지 buy&hold (sharpe 1.65)
+  ★ 단기 (1일~5일) long-only 모든 시도 사망
+  ★ 데이트레이딩 차원의 alpha source 더 이상 시험할 데이터 없음
+
+봇 함의:
+  - fast_path: 통계적 죽음 (intraday 추격 = mean reversion 반대)
+  - 외인 cache 기반 D+1 봇: alpha 환상, MDD 살인
+  - 남은 옵션: 월간 momentum 봇 or 122630 그냥 들고 있기
