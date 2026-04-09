@@ -1410,3 +1410,72 @@ cc 모드 (이론치, overnight 포함):
   - "외인 강한 대형주 + 시장 hedge" 가설 생존
   - 이게 진짜라면 retail-feasible 단기 alpha 첫 후보
   - 검증을 위해 60일 데이터 추가 필요
+
+================================================================================
+0409 후속7 — Contrarian intraday: IC -0.16의 정반대 (E plan)
+================================================================================
+
+가설: 분봉 IC mom5/mom10 = -0.15 (t -99) → 정반대 방향이 alpha
+      가장 많이 빠진 종목 long, mean reversion 잡기
+
+test/contrarian_intraday.py (29일 1분봉, 597종목)
+
+매 15분 cross-section, 가장 빠진 K개 long, hold N분:
+  feature K  hold  avg-c    sharpe   eq
+  mom10   5  15    +0.142%  +3.98   106.1  ★ 첫 양의 oc sharpe
+  mom5    5  15    +0.082%  +2.96   105.9
+  mom5   10  15    +0.061%  +3.21   103.5
+  hold=5 모두 사망 (mean reversion 폭 < 비용)
+  range_pos 노이즈
+
+→ 환호: 5번의 backtest 끝에 첫 retail-feasible 일간 alpha
+→ fast_path와 정확히 정반대 로직이 살아남음
+
+test/contrarian_robust.py — 4가지 보정 스트레스 테스트:
+
+  시나리오                avg-c    sharpe   eq
+  baseline (cost0.3 lag0)  -0.17%  -1.38   97.7
+  + lag1                   +0.09%  +2.21  103.6  ← 신호 진짜
+  + cost0.5                -0.11%  -0.67   98.8  ← 비용↑로 사망
+  + tr 50억 필터            -0.20%  -1.68   97.1  ← 큰 종목 alpha 약함
+  + tr 100억 필터           -0.26%  -4.13   94.5
+  K=3 (cost0.5)            -0.05%  +0.63  101.2  ← marginal
+  K=10 (cost0.5)           -0.34%  -5.97   93.1
+
+핵심 4발견:
+
+① lag1 보정 후 sharpe ↑ (+1.05 → +2.21)
+   t close → t+1 open 사이 mean reversion이 빠르게 일어남
+   신호 자체는 진짜 (look-ahead 아님)
+
+② 비용 0.5%에서 거의 모든 변형 사망
+   한국 retail 실제 비용: 수수료 0.03 + 세금 0.18 + slippage 0.05~0.15
+   = 0.26~0.36% (best ~ 보수)
+   alpha가 비용 경계선에 정확히 걸쳐 있음
+
+③ 거래대금 필터 추가 → alpha 약화 (size-cost trade-off)
+   작은 종목 = mean reversion 강하지만 slippage 큼
+   큰 종목 = mean reversion 약함
+   → retail이 잡을 수 있는 sweet spot 거의 없음
+
+④ K=3이 K=5/10보다 양호
+   가장 강한 신호 1~3개만 robust
+
+정직한 결론:
+  분봉 contrarian alpha = 통계적으로는 진짜 (IC -0.16 t-99)
+  비용 후 expected value ≈ 0
+  sharpe 0~2 사이 (시나리오에 따라)
+  일평균 10거래 운영 부담 vs marginal 이익
+  → 봇 운영 가치 의심스러움
+
+5번 검증 종합 (4/9):
+  한국 retail 일간 alpha = microstructure + 비용 이중 장벽
+  - 정보가 시가/직후에 흡수됨
+  - 비용 0.3%↑로 작은 alpha 깎임
+  - 큰 종목에 alpha 없고 작은 종목에 비용 큼
+  → retail은 구조적으로 노이즈 거래자
+
+살아있는 retail-feasible alpha (4/9 종합 최종):
+  1. 12m XS momentum (월간, sharpe 1.5 비용후)
+  2. 122630 buy&hold (sharpe 1.65)
+  3. 분봉 contrarian K=5 hold=15 (sharpe 0~2, 비용 가정에 매우 민감)
